@@ -37,6 +37,13 @@ class WebViewExampleState extends State<WebViewExample> {
   String _selectedLanguage = 'sv';
   bool _isControllerReady = false;
   List<String> _bookmarks = [];
+  final ValueNotifier<String?> _dialogErrorNotifier = ValueNotifier(null);
+
+  @override
+  void dispose() {
+    _dialogErrorNotifier.dispose();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -251,8 +258,20 @@ class WebViewExampleState extends State<WebViewExample> {
   }
 
   void _openDialog2WithWebview(String url) {
+    final errorNotifier = ValueNotifier<String?>(null);
     final dialog2Controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(NavigationDelegate(
+        onPageStarted: (_) => errorNotifier.value = null,
+        onWebResourceError: (error) {
+          if (error.isForMainFrame ?? true) {
+            errorNotifier.value = '[${error.errorCode}] ${error.description}\n${error.url ?? ''}';
+          }
+        },
+        onHttpError: (error) {
+          errorNotifier.value = 'HTTP ${error.response?.statusCode}\n${error.request?.uri}';
+        },
+      ))
       ..loadRequest(Uri.parse(url));
 
     final screenWidth = MediaQuery.of(context).size.width;
@@ -272,7 +291,17 @@ class WebViewExampleState extends State<WebViewExample> {
                 alignment: Alignment.centerRight,
                 child: TextButton(onPressed: () => Navigator.of(context).pop(), child: Text('Close')),
               ),
-              Expanded(child: WebViewWidget(controller: dialog2Controller)),
+              Expanded(
+                child: ValueListenableBuilder<String?>(
+                  valueListenable: errorNotifier,
+                  builder: (_, error, __) => error != null
+                      ? _errorView(error, () {
+                          errorNotifier.value = null;
+                          dialog2Controller.loadRequest(Uri.parse(url));
+                        })
+                      : WebViewWidget(controller: dialog2Controller),
+                ),
+              ),
             ],
           ),
         ),
@@ -292,8 +321,19 @@ class WebViewExampleState extends State<WebViewExample> {
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setNavigationDelegate(
           NavigationDelegate(
+            onPageStarted: (_) => _dialogErrorNotifier.value = null,
+            onWebResourceError: (error) {
+              if (error.isForMainFrame ?? true) {
+                _dialogErrorNotifier.value = '[${error.errorCode}] ${error.description}\n${error.url ?? ''}';
+              }
+            },
+            onHttpError: (error) {
+              _dialogErrorNotifier.value = 'HTTP ${error.response?.statusCode}\n${error.request?.uri}';
+            },
             onNavigationRequest: (request) {
-              if (request.isMainFrame) {
+              final reqHost = Uri.tryParse(request.url)?.host;
+              final dialogHost = Uri.tryParse(_dialogUrl)?.host;
+              if (request.isMainFrame && reqHost != dialogHost) {
                 _openDialog2WithWebview(request.url);
                 return NavigationDecision.prevent;
               }
@@ -323,7 +363,17 @@ class WebViewExampleState extends State<WebViewExample> {
                 alignment: Alignment.centerRight,
                 child: TextButton(onPressed: () => Navigator.of(context).pop(), child: Text('Close')),
               ),
-              Expanded(child: WebViewWidget(controller: dialogController!)),
+              Expanded(
+                child: ValueListenableBuilder<String?>(
+                  valueListenable: _dialogErrorNotifier,
+                  builder: (_, error, __) => error != null
+                      ? _errorView(error, () {
+                          _dialogErrorNotifier.value = null;
+                          dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                        })
+                      : WebViewWidget(controller: dialogController!),
+                ),
+              ),
             ],
           ),
         ),
@@ -332,6 +382,40 @@ class WebViewExampleState extends State<WebViewExample> {
   }
 
   String jsCodeToFilterData(String text) => "window.dispatchEvent(new CustomEvent('filterData', { detail: '${text.replaceAll("'", "\\'")}' }));";
+
+  Widget _errorView(String message, VoidCallback onRetry) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.error_outline, size: 48, color: Colors.red),
+            SizedBox(height: 12),
+            Text('Failed to load page', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            SizedBox(height: 8),
+            Container(
+              padding: EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.grey.shade100,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: SelectableText(
+                message,
+                style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.red.shade800),
+              ),
+            ),
+            SizedBox(height: 16),
+            ElevatedButton.icon(
+              onPressed: onRetry,
+              icon: Icon(Icons.refresh),
+              label: Text('Retry'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
