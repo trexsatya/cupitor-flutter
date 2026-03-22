@@ -1,8 +1,11 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:pdfrx/pdfrx.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -56,6 +59,7 @@ class WebViewExampleState extends State<WebViewExample> {
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent('Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36')
         ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) => _openDialogWithWebview(msg.message.toString().replaceAll('"', '')))
+        ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
         ..setNavigationDelegate(
           NavigationDelegate(
             onPageStarted: (url) {
@@ -66,6 +70,7 @@ class WebViewExampleState extends State<WebViewExample> {
             onPageFinished: (url) {
               _injectJs();
               _injectAdBlocker();
+              _injectPdfDetector();
             },
           ),
         )
@@ -74,6 +79,75 @@ class WebViewExampleState extends State<WebViewExample> {
         _isControllerReady = true;
       });
     });
+  }
+
+  Future<void> _injectPdfDetector() {
+    const js = r'''
+      (function() {
+        let _pdfIdx = 0;
+        function checkEl(el) {
+          const src = el.src || el.data || '';
+          if (!src || el.dataset.pdfHandled) return;
+          if (/\.pdf(\?.*)?$/i.test(src) || el.type === 'application/pdf') {
+            el.dataset.pdfHandled = '1';
+            const id = 'pdf_flutter_' + (_pdfIdx++);
+            el.id = id;
+            PdfIframeDetector.postMessage(JSON.stringify({id: id, url: src}));
+          }
+        }
+        document.querySelectorAll('iframe, embed, object').forEach(checkEl);
+        new MutationObserver(mutations => {
+          mutations.forEach(m => m.addedNodes.forEach(node => {
+            if (node.nodeType !== 1) return;
+            if (['IFRAME','EMBED','OBJECT'].includes(node.tagName)) checkEl(node);
+            node.querySelectorAll && node.querySelectorAll('iframe, embed, object').forEach(checkEl);
+          }));
+        }).observe(document.body, {childList: true, subtree: true});
+      })();
+    ''';
+    return _controller.runJavaScript(js);
+  }
+
+  Future<void> _handlePdfIframe(String message) async {
+    try {
+      final data = jsonDecode(message) as Map<String, dynamic>;
+      final id = data['id'] as String;
+      final url = data['url'] as String;
+      final uri = Uri.tryParse(url);
+      if (uri == null) return;
+
+      final response = await http.get(uri, headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+      });
+      if (response.statusCode != 200) return;
+
+      final doc = await PdfDocument.openData(response.bodyBytes);
+      final buffer = StringBuffer('--- Page 1 ---\n\n');
+      for (int i = 0; i < doc.pages.length; i++) {
+        final pageText = await doc.pages[i].loadText();
+        buffer.write(pageText.fullText);
+        if (i < doc.pages.length - 1) {
+          buffer.write('\n\n--- Page ${i + 2} ---\n\n');
+        }
+      }
+      await doc.dispose();
+
+      // Use jsonEncode so all special characters are properly escaped as a JS string literal
+      final textJson = jsonEncode(buffer.toString());
+      final js = '''
+        (function() {
+          const el = document.getElementById('$id');
+          if (!el) return;
+          const div = document.createElement('div');
+          div.style.cssText = 'width:100%;height:100%;overflow:auto;padding:16px;box-sizing:border-box;font-family:serif;font-size:15px;line-height:1.7;white-space:pre-wrap;user-select:text;-webkit-user-select:text;';
+          div.textContent = $textJson;
+          el.parentNode.replaceChild(div, el);
+        })();
+      ''';
+      _controller.runJavaScript(js);
+    } catch (_) {
+      // PDF may be image-based, CORS-blocked, or otherwise inaccessible
+    }
   }
 
   Future<void> _injectJs() async {
@@ -264,12 +338,9 @@ class WebViewExampleState extends State<WebViewExample> {
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (_) => errorNotifier.value = null,
         onWebResourceError: (error) {
-          if (error.isForMainFrame ?? true) {
+          if (error.isForMainFrame == true) {
             errorNotifier.value = '[${error.errorCode}] ${error.description}\n${error.url ?? ''}';
           }
-        },
-        onHttpError: (error) {
-          errorNotifier.value = 'HTTP ${error.response?.statusCode}\n${error.request?.uri}';
         },
       ))
       ..loadRequest(Uri.parse(url));
@@ -323,12 +394,9 @@ class WebViewExampleState extends State<WebViewExample> {
           NavigationDelegate(
             onPageStarted: (_) => _dialogErrorNotifier.value = null,
             onWebResourceError: (error) {
-              if (error.isForMainFrame ?? true) {
+              if (error.isForMainFrame == true) {
                 _dialogErrorNotifier.value = '[${error.errorCode}] ${error.description}\n${error.url ?? ''}';
               }
-            },
-            onHttpError: (error) {
-              _dialogErrorNotifier.value = 'HTTP ${error.response?.statusCode}\n${error.request?.uri}';
             },
             onNavigationRequest: (request) {
               final reqHost = Uri.tryParse(request.url)?.host;
@@ -472,7 +540,20 @@ class WebViewExampleState extends State<WebViewExample> {
           IconButton(
             icon: Icon(Icons.open_in_new),
             onPressed: () async {
-              final text = await _controller.runJavaScriptReturningResult("window.getSelection().toString();");
+              const js = '''
+                (function getSelFromWindow(w) {
+                  try {
+                    const s = w.getSelection().toString().trim();
+                    if (s) return s;
+                    for (let i = 0; i < w.frames.length; i++) {
+                      const found = getSelFromWindow(w.frames[i]);
+                      if (found) return found;
+                    }
+                  } catch(e) {}
+                  return '';
+                })(window);
+              ''';
+              final text = await _controller.runJavaScriptReturningResult(js);
               _openDialogWithWebview(text.toString().replaceAll('"', ''));
             },
           ),

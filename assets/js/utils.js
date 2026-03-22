@@ -36,7 +36,7 @@
       console.log("Starting to wrap words in document body");
       wrapWordsInNode(document.body);
       console.log("Finished wrapping words in document body");
-    }, 2000);
+    }, 5000);
 
     if (!window.myCustomerListenerAttached) {
       document.addEventListener('click', (e) => {
