@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
@@ -73,6 +74,25 @@ class WebViewExampleState extends State<WebViewExample> {
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
         ..setNavigationDelegate(
           NavigationDelegate(
+            onNavigationRequest: (request) {
+              // On Android, prevent WebView from loading PDF URLs — it can't render
+              // them and may trigger a download intent instead. We show our own
+              // PdfViewer overlay instead.
+              if (Platform.isAndroid && request.isMainFrame && _looksLikePdfUrl(request.url)) {
+                final url = request.url;
+                setState(() {
+                  _urlController.text = url;
+                  _currentPdfUrl = url;
+                  _lastStartedUrl = url;
+                  _extractedPdfText = null;
+                  _isTextView = false;
+                  _isShowingOurHtml = false;
+                  _handledPdfUrls.clear();
+                });
+                return NavigationDecision.prevent;
+              }
+              return NavigationDecision.navigate;
+            },
             onPageStarted: (url) {
               if (_isShowingOurHtml) return; // our own HTML page, don't reset state
               _lastStartedUrl = url;
@@ -92,6 +112,11 @@ class WebViewExampleState extends State<WebViewExample> {
                   _handledPdfUrls.clear();
                 }
               });
+              // On Android, start PDF detection right here — onPageFinished may never
+              // fire if the WebView triggers a download intent for the content.
+              if (Platform.isAndroid && _currentPdfUrl == null) {
+                _checkForPdf(url);
+              }
             },
             onPageFinished: (url) {
               if (_isShowingOurHtml) {
@@ -120,21 +145,27 @@ class WebViewExampleState extends State<WebViewExample> {
     return path.toLowerCase().endsWith('.pdf');
   }
 
-  /// Checks the Content-Type of [url] via a HEAD request. If it is a PDF,
-  /// sets [_currentPdfUrl] so the toggle button appears. Otherwise injects
-  /// the PDF iframe detector (which must NOT run on native PDF pages).
-  Future<void> _detectPdfAndInject(String url) async {
-    if (_currentPdfUrl != null) return; // already identified as PDF by URL
+  /// Does a HEAD request to check if [url] serves PDF content.
+  /// Sets [_currentPdfUrl] if confirmed. Safe to call from both
+  /// onPageStarted and onPageFinished — the _lastStartedUrl guard
+  /// discards results that arrive after the user has navigated away.
+  Future<void> _checkForPdf(String url) async {
+    if (_currentPdfUrl != null) return;
     try {
       final response = await http.head(Uri.parse(url)).timeout(const Duration(seconds: 5));
       final ct = response.headers['content-type'] ?? '';
       if (ct.contains('application/pdf')) {
-        // Guard: bail if the user navigated away while the HEAD request was in flight
         if (!mounted || _lastStartedUrl != url) return;
         setState(() { _currentPdfUrl = url; });
-        return; // do NOT inject PDF iframe detector on native PDF pages
       }
     } catch (_) { /* best-effort; non-critical */ }
+  }
+
+  /// After page load, check if the page is a PDF and — if not — inject the
+  /// iframe PDF detector. (The detector must NOT run on native PDF pages.)
+  Future<void> _detectPdfAndInject(String url) async {
+    await _checkForPdf(url);
+    if (_currentPdfUrl != null) return; // it's a PDF — don't inject iframe detector
     if (!mounted || _lastStartedUrl != url) return;
     _injectPdfDetector();
   }
@@ -142,9 +173,13 @@ class WebViewExampleState extends State<WebViewExample> {
   Future<void> _togglePdfTextView() async {
     if (_currentPdfUrl == null) return;
     if (_isTextView) {
-      // Switch back to native PDF viewer
+      // Switch back to PDF view
       setState(() { _isTextView = false; _isShowingOurHtml = false; });
-      _controller.loadRequest(Uri.parse(_currentPdfUrl!));
+      // On Android we show a Flutter PdfViewer overlay — no need to reload WebView.
+      // On macOS/iOS WKWebView renders PDFs natively so we reload the URL.
+      if (!Platform.isAndroid) {
+        _controller.loadRequest(Uri.parse(_currentPdfUrl!));
+      }
       return;
     }
     // Extract text if not yet cached
@@ -747,7 +782,20 @@ class WebViewExampleState extends State<WebViewExample> {
           ),
         ],
       ),
-      body: WebViewWidget(controller: _controller),
+      body: Stack(
+        children: [
+          WebViewWidget(controller: _controller),
+          // On Android, WebView has no built-in PDF renderer.
+          // Overlay a Flutter PdfViewer widget when viewing a PDF in PDF mode.
+          if (Platform.isAndroid && _currentPdfUrl != null && !_isTextView)
+            Positioned.fill(
+              child: PdfViewer.uri(
+                Uri.parse(_currentPdfUrl!),
+                params: PdfViewerParams(backgroundColor: Colors.white),
+              ),
+            ),
+        ],
+      ),
     ),
     );
   }
