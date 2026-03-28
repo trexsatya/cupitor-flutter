@@ -50,6 +50,10 @@ class WebViewExampleState extends State<WebViewExample> {
   String? _currentPdfUrl;
   String? _extractedPdfText;
   String _lastStartedUrl = '';
+  // Tracks Android main-frame navigations to detect the second onNavigationRequest
+  // call that the download listener makes when WebView can't render a response
+  // (e.g. application/pdf). First call = normal navigation; second call = download trigger.
+  final Set<String> _androidPendingUrls = {};
   final ValueNotifier<String?> _dialogErrorNotifier = ValueNotifier(null);
 
   @override
@@ -74,13 +78,12 @@ class WebViewExampleState extends State<WebViewExample> {
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
         ..setNavigationDelegate(
           NavigationDelegate(
-            onNavigationRequest: (request) {
-              // On Android, prevent WebView from loading PDF URLs — it can't render
-              // them and may trigger a download intent instead. We show our own
-              // PdfViewer overlay instead.
-              if (Platform.isAndroid && request.isMainFrame && _looksLikePdfUrl(request.url)) {
-                final url = request.url;
-                setState(() {
+            onNavigationRequest: (request) async {
+              if (!request.isMainFrame) return NavigationDecision.navigate;
+              final url = request.url;
+              // Always intercept .pdf extension URLs on Android before WebView touches them.
+              if (Platform.isAndroid && _looksLikePdfUrl(url)) {
+                if (mounted) setState(() {
                   _urlController.text = url;
                   _currentPdfUrl = url;
                   _lastStartedUrl = url;
@@ -90,6 +93,39 @@ class WebViewExampleState extends State<WebViewExample> {
                   _handledPdfUrls.clear();
                 });
                 return NavigationDecision.prevent;
+              }
+              if (Platform.isAndroid) {
+                if (_androidPendingUrls.contains(url)) {
+                  // Second call for this URL = download listener fired = WebView
+                  // cannot render the content. Check if it is a PDF.
+                  _androidPendingUrls.remove(url);
+                  try {
+                    final response = await http
+                        .head(Uri.parse(url))
+                        .timeout(const Duration(seconds: 5));
+                    final ct = response.headers['content-type'] ?? '';
+                    if (ct.contains('application/pdf') && mounted) {
+                      setState(() {
+                        _urlController.text = url;
+                        _currentPdfUrl = url;
+                        _lastStartedUrl = url;
+                        _extractedPdfText = null;
+                        _isTextView = false;
+                        _isShowingOurHtml = false;
+                        _handledPdfUrls.clear();
+                      });
+                      return NavigationDecision.prevent;
+                    }
+                  } catch (_) { /* network error — let it proceed */ }
+                } else {
+                  // First call — allow, but remember so we catch the second call.
+                  _androidPendingUrls.add(url);
+                  // Auto-clean after 30 s so the set never grows unbounded.
+                  Future.delayed(
+                    const Duration(seconds: 30),
+                    () => _androidPendingUrls.remove(url),
+                  );
+                }
               }
               return NavigationDecision.navigate;
             },
