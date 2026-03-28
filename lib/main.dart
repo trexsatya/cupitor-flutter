@@ -40,10 +40,20 @@ class WebViewExampleState extends State<WebViewExample> {
   String _selectedLanguage = 'sv';
   bool _isControllerReady = false;
   List<String> _bookmarks = [];
+  String _currentDialogText = '';
+  String? _cachedRemoteSnippet;
+  final Set<String> _handledPdfUrls = {};
+  bool _isTextView = false;
+  bool _isShowingOurHtml = false;
+  bool _isExtractingPdf = false;
+  String? _currentPdfUrl;
+  String? _extractedPdfText;
+  String _lastStartedUrl = '';
   final ValueNotifier<String?> _dialogErrorNotifier = ValueNotifier(null);
 
   @override
   void dispose() {
+    _urlController.dispose();
     _dialogErrorNotifier.dispose();
     super.dispose();
   }
@@ -60,17 +70,41 @@ class WebViewExampleState extends State<WebViewExample> {
         ..setUserAgent('Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36')
         ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) => _openDialogWithWebview(msg.message.toString().replaceAll('"', '')))
         ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
+        ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
         ..setNavigationDelegate(
           NavigationDelegate(
             onPageStarted: (url) {
+              if (_isShowingOurHtml) return; // our own HTML page, don't reset state
+              _lastStartedUrl = url;
               setState(() {
                 _urlController.text = url;
+                if (_looksLikePdfUrl(url)) {
+                  if (_currentPdfUrl != url) {
+                    _currentPdfUrl = url;
+                    _extractedPdfText = null;
+                    _isTextView = false;
+                  }
+                } else {
+                  _currentPdfUrl = null;
+                  _extractedPdfText = null;
+                  _isTextView = false;
+                  _isShowingOurHtml = false;
+                  _handledPdfUrls.clear();
+                }
               });
             },
             onPageFinished: (url) {
+              if (_isShowingOurHtml) {
+                _injectJs(); // only need word-click JS on our own text page
+                return;
+              }
               _injectJs();
+              _injectRemoteSnippet();
               _injectAdBlocker();
-              _injectPdfDetector();
+              _injectSpaHook();
+              // Detect PDF by content-type (handles non-.pdf URLs like download links)
+              // and defer _injectPdfDetector so it never fires on native PDF pages.
+              _detectPdfAndInject(url);
             },
           ),
         )
@@ -81,28 +115,137 @@ class WebViewExampleState extends State<WebViewExample> {
     });
   }
 
+  bool _looksLikePdfUrl(String url) {
+    final path = Uri.tryParse(url)?.path ?? '';
+    return path.toLowerCase().endsWith('.pdf');
+  }
+
+  /// Checks the Content-Type of [url] via a HEAD request. If it is a PDF,
+  /// sets [_currentPdfUrl] so the toggle button appears. Otherwise injects
+  /// the PDF iframe detector (which must NOT run on native PDF pages).
+  Future<void> _detectPdfAndInject(String url) async {
+    if (_currentPdfUrl != null) return; // already identified as PDF by URL
+    try {
+      final response = await http.head(Uri.parse(url)).timeout(const Duration(seconds: 5));
+      final ct = response.headers['content-type'] ?? '';
+      if (ct.contains('application/pdf')) {
+        // Guard: bail if the user navigated away while the HEAD request was in flight
+        if (!mounted || _lastStartedUrl != url) return;
+        setState(() { _currentPdfUrl = url; });
+        return; // do NOT inject PDF iframe detector on native PDF pages
+      }
+    } catch (_) { /* best-effort; non-critical */ }
+    if (!mounted || _lastStartedUrl != url) return;
+    _injectPdfDetector();
+  }
+
+  Future<void> _togglePdfTextView() async {
+    if (_currentPdfUrl == null) return;
+    if (_isTextView) {
+      // Switch back to native PDF viewer
+      setState(() { _isTextView = false; _isShowingOurHtml = false; });
+      _controller.loadRequest(Uri.parse(_currentPdfUrl!));
+      return;
+    }
+    // Extract text if not yet cached
+    if (_extractedPdfText == null) {
+      setState(() => _isExtractingPdf = true);
+      try {
+        final response = await http.get(Uri.parse(_currentPdfUrl!), headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        }).timeout(const Duration(seconds: 20));
+        if (response.statusCode != 200) {
+          debugPrint('PDF fetch failed: HTTP ${response.statusCode}');
+          setState(() => _isExtractingPdf = false);
+          return;
+        }
+        final doc = await PdfDocument.openData(response.bodyBytes);
+        final buf = StringBuffer();
+        for (int i = 0; i < doc.pages.length; i++) {
+          if (i > 0) buf.write('\n\n--- Page ${i + 1} ---\n\n');
+          buf.write((await doc.pages[i].loadText()).fullText);
+        }
+        await doc.dispose();
+        _extractedPdfText = buf.toString().trim();
+      } catch (e) {
+        debugPrint('PDF extraction error: $e');
+        setState(() => _isExtractingPdf = false);
+        return;
+      }
+      setState(() => _isExtractingPdf = false);
+    }
+    if (_extractedPdfText == null || _extractedPdfText!.isEmpty) {
+      debugPrint('No extractable text in PDF (image-based?).');
+      return;
+    }
+    final escaped = _extractedPdfText!
+        .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    final html = '<!DOCTYPE html><html><head>'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<style>body{font-family:serif;font-size:15px;line-height:1.7;'
+        'padding:24px;margin:0;background:#fff;-webkit-user-select:text;user-select:text;}'
+        'pre{white-space:pre-wrap;word-wrap:break-word;font-family:inherit;}</style>'
+        '</head><body><pre>$escaped</pre></body></html>';
+    setState(() { _isTextView = true; _isShowingOurHtml = true; });
+    await _controller.loadHtmlString(html);
+    // onPageFinished will call _injectJs() for word-click support
+  }
+
+  Future<void> _injectSpaHook() {
+    const js = r'''
+      (function() {
+        if (window._spaHooked) return;
+        window._spaHooked = true;
+        function notify() {
+          SpaNavigationDetector.postMessage(window.location.href);
+        }
+        const _push = history.pushState.bind(history);
+        history.pushState = function(...args) { _push(...args); notify(); };
+        const _replace = history.replaceState.bind(history);
+        history.replaceState = function(...args) { _replace(...args); notify(); };
+        window.addEventListener('popstate', notify);
+        window.addEventListener('hashchange', notify);
+      })();
+    ''';
+    return _controller.runJavaScript(js);
+  }
+
+  void _onSpaNavigation(String url) async {
+    setState(() => _urlController.text = url);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('lastUrl', url);
+    _injectJs();
+    _injectRemoteSnippet();
+    _injectAdBlocker();
+    _injectPdfDetector();
+  }
+
   Future<void> _injectPdfDetector() {
     const js = r'''
       (function() {
-        let _pdfIdx = 0;
         function checkEl(el) {
           const src = el.src || el.data || '';
           if (!src || el.dataset.pdfHandled) return;
           if (/\.pdf(\?.*)?$/i.test(src) || el.type === 'application/pdf') {
             el.dataset.pdfHandled = '1';
-            const id = 'pdf_flutter_' + (_pdfIdx++);
+            // Resolve relative URLs against the current page
+            const abs = new URL(src, window.location.href).href;
+            const id = 'pdf_flutter_' + Math.random().toString(36).slice(2);
             el.id = id;
-            PdfIframeDetector.postMessage(JSON.stringify({id: id, url: src}));
+            PdfIframeDetector.postMessage(JSON.stringify({id: id, url: abs}));
           }
         }
         document.querySelectorAll('iframe, embed, object').forEach(checkEl);
-        new MutationObserver(mutations => {
-          mutations.forEach(m => m.addedNodes.forEach(node => {
-            if (node.nodeType !== 1) return;
-            if (['IFRAME','EMBED','OBJECT'].includes(node.tagName)) checkEl(node);
-            node.querySelectorAll && node.querySelectorAll('iframe, embed, object').forEach(checkEl);
-          }));
-        }).observe(document.body, {childList: true, subtree: true});
+        if (!window._pdfObserverAttached) {
+          window._pdfObserverAttached = true;
+          new MutationObserver(mutations => {
+            mutations.forEach(m => m.addedNodes.forEach(node => {
+              if (node.nodeType !== 1) return;
+              if (['IFRAME','EMBED','OBJECT'].includes(node.tagName)) checkEl(node);
+              node.querySelectorAll && node.querySelectorAll('iframe, embed, object').forEach(checkEl);
+            }));
+          }).observe(document.body, {childList: true, subtree: true});
+        }
       })();
     ''';
     return _controller.runJavaScript(js);
@@ -118,8 +261,11 @@ class WebViewExampleState extends State<WebViewExample> {
 
       final response = await http.get(uri, headers: {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-      });
-      if (response.statusCode != 200) return;
+      }).timeout(const Duration(seconds: 15));
+      if (response.statusCode != 200) {
+        debugPrint('PDF fetch failed: HTTP ${response.statusCode} for $url');
+        return;
+      }
 
       final doc = await PdfDocument.openData(response.bodyBytes);
       final buffer = StringBuffer('--- Page 1 ---\n\n');
@@ -145,8 +291,8 @@ class WebViewExampleState extends State<WebViewExample> {
         })();
       ''';
       _controller.runJavaScript(js);
-    } catch (_) {
-      // PDF may be image-based, CORS-blocked, or otherwise inaccessible
+    } catch (e) {
+      debugPrint('PDF handling error: $e');
     }
   }
 
@@ -155,9 +301,27 @@ class WebViewExampleState extends State<WebViewExample> {
     _controller.runJavaScript(jsCode);
   }
 
+  void _injectRemoteSnippet() {
+    http.get(
+      Uri.parse('https://raw.githubusercontent.com/trexsatya/trexsatya.github.io/refs/heads/gh-pages/db/js/snippet.js'),
+    ).timeout(const Duration(seconds: 5)).then((response) {
+      if (response.statusCode == 200) {
+        _cachedRemoteSnippet = response.body;
+        _controller.runJavaScript(_cachedRemoteSnippet!);
+      }
+    }).catchError((_) {
+      // Network unavailable, timeout, or server error — skip silently
+      if (_cachedRemoteSnippet != null) {
+        _controller.runJavaScript(_cachedRemoteSnippet!);
+      }
+    });
+  }
+
   Future<void> _injectAdBlocker() async {
     const css = '''
       (function() {
+        if (window._adBlockerInjected) return;
+        window._adBlockerInjected = true;
         const style = document.createElement('style');
         style.textContent = `
           /* Common ad containers */
@@ -272,6 +436,18 @@ class WebViewExampleState extends State<WebViewExample> {
                   children: [
                     Text('Bookmarks', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                     Spacer(),
+                    IconButton(
+                      icon: Icon(Icons.bookmark_add_outlined),
+                      tooltip: 'Add current page',
+                      onPressed: () async {
+                        final url = _urlController.text.trim();
+                        if (url.isEmpty || _bookmarks.contains(url)) return;
+                        setState(() => _bookmarks.insert(0, url));
+                        setModalState(() {});
+                        final prefs = await SharedPreferences.getInstance();
+                        await prefs.setStringList('bookmarks', _bookmarks);
+                      },
+                    ),
                     if (_bookmarks.isNotEmpty)
                       TextButton(
                         child: Text('Clear all'),
@@ -385,6 +561,7 @@ class WebViewExampleState extends State<WebViewExample> {
   }
 
   void _openDialogWithWebview(String text) {
+    _currentDialogText = text;
     if (dialogController != null) {
       dialogController?.runJavaScript(jsCodeToFilterData(text));
     } else {
@@ -408,7 +585,7 @@ class WebViewExampleState extends State<WebViewExample> {
               return NavigationDecision.navigate;
             },
             onPageFinished: (url) {
-              dialogController?.runJavaScript(jsCodeToFilterData(text));
+              dialogController?.runJavaScript(jsCodeToFilterData(_currentDialogText));
             },
           ),
         )
@@ -527,11 +704,18 @@ class WebViewExampleState extends State<WebViewExample> {
             icon: Icon(Icons.language, color: Colors.white),
             dropdownColor: Colors.white,
           ),
-          IconButton(
-            icon: Icon(Icons.bookmark_add_outlined),
-            onPressed: _addBookmark,
-            tooltip: 'Add bookmark',
-          ),
+          if (_currentPdfUrl != null)
+            _isExtractingPdf
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: SizedBox(width: 20, height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)),
+                )
+              : IconButton(
+                  icon: Icon(_isTextView ? Icons.picture_as_pdf : Icons.text_snippet_outlined),
+                  tooltip: _isTextView ? 'Switch to PDF view' : 'Switch to text view',
+                  onPressed: _togglePdfTextView,
+                ),
           IconButton(
             icon: Icon(Icons.bookmarks_outlined),
             onPressed: _showBookmarks,
@@ -553,8 +737,12 @@ class WebViewExampleState extends State<WebViewExample> {
                   return '';
                 })(window);
               ''';
-              final text = await _controller.runJavaScriptReturningResult(js);
-              _openDialogWithWebview(text.toString().replaceAll('"', ''));
+              String text = '';
+              try {
+                final result = await _controller.runJavaScriptReturningResult(js);
+                text = result.toString().replaceAll('"', '');
+              } catch (_) {}
+              _openDialogWithWebview(text);
             },
           ),
         ],

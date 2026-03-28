@@ -2,9 +2,13 @@
   function getWords(text) {
     if (typeof Intl !== 'undefined' && Intl.Segmenter) {
       const segmentor = new Intl.Segmenter([], {granularity: 'word'});
-      return Array.from(segmentor.segment(text), ({segment}) => segment);
+      // Return objects {text, isWord} so caller can decide what to wrap
+      return Array.from(segmentor.segment(text), ({segment, isWordLike}) =>
+        ({text: segment, isWord: !!isWordLike})
+      );
     } else {
-      return text.split(/(\s+|[.,!?;:"'()\-])/g).filter(Boolean);
+      return text.split(/(\s+|[.,!?;:"'()\-])/g).filter(Boolean)
+                 .map(s => ({text: s, isWord: /\w{3,}/.test(s)}));
     }
   }
 
@@ -14,8 +18,8 @@
       if (parent && parent.closest('a')) return;
       const words = getWords(node.textContent);
       const frag = document.createDocumentFragment();
-      words.forEach(word => {
-        if (word.trim().length <= 2) {
+      words.forEach(({text: word, isWord}) => {
+        if (!isWord || word.trim().length <= 2) {
           frag.appendChild(document.createTextNode(word));
         } else {
           const span = document.createElement('span');
@@ -26,17 +30,25 @@
         }
       });
       parent.replaceChild(frag, node);
-    } else if (node.nodeType === Node.ELEMENT_NODE && node.tagName.toLowerCase() !== 'a') {
+    } else if (node.nodeType === Node.ELEMENT_NODE
+      && node.tagName.toLowerCase() !== 'a'
+      && !node.classList.contains('clickable-word')) {
+      const tag = node.tagName.toLowerCase();
+      if (tag === 'script' || tag === 'style' || tag === 'noscript'
+          || tag === 'textarea' || tag === 'input' || tag === 'svg') return;
       Array.from(node.childNodes).forEach(wrapWordsInNode);
     }
   }
 
   function main() {
-    setTimeout(() => {
-      console.log("Starting to wrap words in document body");
-      wrapWordsInNode(document.body);
-      console.log("Finished wrapping words in document body");
-    }, 5000);
+    if (!window._wordWrapScheduled) {
+      window._wordWrapScheduled = true;
+      setTimeout(() => {
+        console.log("Starting to wrap words in document body");
+        wrapWordsInNode(document.body);
+        console.log("Finished wrapping words in document body");
+      }, 5000);
+    }
 
     if (!window.myCustomerListenerAttached) {
       document.addEventListener('click', (e) => {
