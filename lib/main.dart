@@ -248,7 +248,7 @@ class WebViewExampleState extends State<WebViewExample> {
             el.id = id;
             document.head.appendChild(el);
           }
-          el.textContent = 'html { filter: grayscale(1) contrast(1.1) brightness(0.82) !important; }';
+          el.textContent = 'html { filter: contrast(1.1) brightness(0.95) !important; }';
         } else {
           if (el) el.remove();
         }
@@ -989,10 +989,11 @@ class WebViewExampleState extends State<WebViewExample> {
         child: ColorFiltered(
         colorFilter: _isEinkMode
             ? const ColorFilter.matrix([
-                // Grayscale (luminance weights) scaled by 0.82 to dim whites to paper-grey
-                0.1743, 0.5865, 0.0592, 0, 0,
-                0.1743, 0.5865, 0.0592, 0, 0,
-                0.1743, 0.5865, 0.0592, 0, 0,
+                // Warm sepia — white maps to Kindle cream RGB(0.95, 0.91, 0.83)
+                // Uses luminance weights tinted across warm-shifted rows.
+                0.1913, 0.6437, 0.0650, 0, 0.05,  // R: warm boost
+                0.1850, 0.6222, 0.0628, 0, 0.04,  // G: neutral-warm
+                0.1722, 0.5793, 0.0585, 0, 0.02,  // B: blue reduced
                 0,      0,      0,      1, 0,
               ])
             : const ColorFilter.matrix([
