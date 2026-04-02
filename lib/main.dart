@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -50,6 +51,10 @@ class WebViewExampleState extends State<WebViewExample> {
   String? _currentPdfUrl;
   String? _extractedPdfText;
   String _lastStartedUrl = '';
+  bool _isEinkMode = true;
+  bool _showToolbar = false;
+  bool _showAppBar = true;
+  String? _githubToken;
   // Tracks Android main-frame navigations to detect the second onNavigationRequest
   // call that the download listener makes when WebView can't render a response
   // (e.g. application/pdf). First call = normal navigation; second call = download trigger.
@@ -70,6 +75,7 @@ class WebViewExampleState extends State<WebViewExample> {
       final savedUrl = prefs.getString('lastUrl') ?? _urlController.text;
       _urlController.text = savedUrl;
       _bookmarks = prefs.getStringList('bookmarks') ?? [];
+      _githubToken = prefs.getString('githubToken');
       _controller = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent('Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36')
@@ -163,6 +169,7 @@ class WebViewExampleState extends State<WebViewExample> {
               _injectRemoteSnippet();
               _injectAdBlocker();
               _injectSpaHook();
+              _injectEinkCss();
               // Detect PDF by content-type (handles non-.pdf URLs like download links)
               // and defer _injectPdfDetector so it never fires on native PDF pages.
               _detectPdfAndInject(url);
@@ -173,12 +180,81 @@ class WebViewExampleState extends State<WebViewExample> {
       setState(() {
         _isControllerReady = true;
       });
+      _revealAppBar(); // show on first launch, then auto-hide
     });
+  }
+
+  void _showTokenDialog() {
+    final ctrl = TextEditingController(text: _githubToken ?? '');
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('GitHub Token'),
+        content: TextField(
+          controller: ctrl,
+          obscureText: true,
+          decoration: InputDecoration(
+            hintText: 'ghp_...',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            child: Text('Clear'),
+            onPressed: () async {
+              setState(() => _githubToken = null);
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.remove('githubToken');
+              Navigator.of(ctx).pop();
+            },
+          ),
+          TextButton(
+            child: Text('Save'),
+            onPressed: () async {
+              final token = ctrl.text.trim();
+              setState(() => _githubToken = token.isEmpty ? null : token);
+              final prefs = await SharedPreferences.getInstance();
+              if (token.isEmpty) {
+                await prefs.remove('githubToken');
+              } else {
+                await prefs.setString('githubToken', token);
+              }
+              Navigator.of(ctx).pop();
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _revealAppBar() {
+    setState(() => _showAppBar = true);
   }
 
   bool _looksLikePdfUrl(String url) {
     final path = Uri.tryParse(url)?.path ?? '';
     return path.toLowerCase().endsWith('.pdf');
+  }
+
+  void _injectEinkCss() {
+    final enabled = _isEinkMode;
+    final js = '''
+      (function() {
+        const id = 'flutter_eink_style';
+        let el = document.getElementById(id);
+        if (${enabled ? 'true' : 'false'}) {
+          if (!el) {
+            el = document.createElement('style');
+            el.id = id;
+            document.head.appendChild(el);
+          }
+          el.textContent = 'html { filter: grayscale(1) contrast(1.1) brightness(0.82) !important; }';
+        } else {
+          if (el) el.remove();
+        }
+      })();
+    ''';
+    _controller.runJavaScript(js);
   }
 
   /// Does a HEAD request to check if [url] serves PDF content.
@@ -631,6 +707,67 @@ class WebViewExampleState extends State<WebViewExample> {
     return _dialogUrl + '?lang=' + (_languageParams[lang] ?? lang);
   }
 
+  /// Handles a GitHub API proxy request from the JS channel.
+  /// The message is JSON: { id, method, path, body? }
+  /// Flutter adds the Authorization header, makes the call, and posts the
+  /// response back via JS so the token is never exposed to the page.
+  Future<void> _handleGitHubProxyRequest(JavaScriptMessage msg) async {
+    Map<String, dynamic> req;
+    try {
+      req = jsonDecode(msg.message) as Map<String, dynamic>;
+    } catch (_) {
+      return;
+    }
+
+    final id = req['id'] as String? ?? '';
+    final method = (req['method'] as String? ?? 'GET').toUpperCase();
+    final path = req['path'] as String? ?? '';
+    final bodyStr = req['body'] as String?;
+    final url = 'https://api.github.com$path';
+    final token = _githubToken ?? '';
+
+    String responseBody;
+    int statusCode;
+    try {
+      final uri = Uri.parse(url);
+      final headers = <String, String>{
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        if (token.isNotEmpty) 'Authorization': 'Bearer $token',
+        if (bodyStr != null) 'Content-Type': 'application/json',
+      };
+      http.Response response;
+      switch (method) {
+        case 'PUT':
+          response = await http.put(uri, headers: headers, body: bodyStr).timeout(const Duration(seconds: 15));
+          break;
+        case 'POST':
+          response = await http.post(uri, headers: headers, body: bodyStr).timeout(const Duration(seconds: 15));
+          break;
+        default:
+          response = await http.get(uri, headers: headers).timeout(const Duration(seconds: 15));
+      }
+      responseBody = response.body;
+      statusCode = response.statusCode;
+    } catch (e) {
+      responseBody = jsonEncode({'message': e.toString()});
+      statusCode = 0;
+    }
+
+    // Escape the response to embed safely in a JS string template
+    final escaped = jsonEncode(responseBody); // produces a quoted, escaped JSON string
+    final js = '''
+      (function() {
+        const handler = window._ghProxyHandlers && window._ghProxyHandlers['$id'];
+        if (handler) {
+          delete window._ghProxyHandlers['$id'];
+          handler($statusCode, $escaped);
+        }
+      })();
+    ''';
+    dialogController?.runJavaScript(js);
+  }
+
   void _openDialogWithWebview(String text) {
     _currentDialogText = text;
     if (dialogController != null) {
@@ -638,6 +775,7 @@ class WebViewExampleState extends State<WebViewExample> {
     } else {
       dialogController ??= WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
+        ..addJavaScriptChannel('GitHubProxy', onMessageReceived: _handleGitHubProxyRequest)
         ..setNavigationDelegate(
           NavigationDelegate(
             onPageStarted: (_) => _dialogErrorNotifier.value = null,
@@ -697,7 +835,12 @@ class WebViewExampleState extends State<WebViewExample> {
     );
   }
 
-  String jsCodeToFilterData(String text) => "window.dispatchEvent(new CustomEvent('filterData', { detail: '${text.replaceAll("'", "\\'")}' }));";
+  String jsCodeToFilterData(String text) {
+    final escaped = text.replaceAll("'", "\\'");
+    // Token is intentionally NOT passed here — GitHub API calls are proxied
+    // through the GitHubProxy JavaScriptChannel so the token stays in Flutter.
+    return "window.dispatchEvent(new CustomEvent('filterData', { detail: { text: '$escaped' } }));";
+  }
 
   Widget _errorView(String message, VoidCallback onRetry) {
     return Center(
@@ -747,7 +890,7 @@ class WebViewExampleState extends State<WebViewExample> {
         }
       },
       child: Scaffold(
-      appBar: AppBar(
+      appBar: _showAppBar ? AppBar(
         title: TextField(
           controller: _urlController,
           decoration: InputDecoration(
@@ -760,20 +903,40 @@ class WebViewExampleState extends State<WebViewExample> {
           onSubmitted: (_) => _loadUrl(),
         ),
         actions: [
-          DropdownButton<String>(
-            value: _selectedLanguage,
-            items: _languages.map((lang) => DropdownMenuItem(value: lang, child: Text(lang))).toList(),
-            onChanged: (value) {
-              setState(() {
-                _selectedLanguage = value!;
-                if (dialogController != null) {
-                  dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
-                }
-              });
-            },
-            underline: SizedBox(),
-            icon: Icon(Icons.language, color: Colors.white),
-            dropdownColor: Colors.white,
+          if (_showToolbar) ...([
+            DropdownButton<String>(
+              value: _selectedLanguage,
+              items: _languages.map((lang) => DropdownMenuItem(value: lang, child: Text(lang))).toList(),
+              onChanged: (value) {
+                setState(() {
+                  _selectedLanguage = value!;
+                  if (dialogController != null) {
+                    dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                  }
+                });
+              },
+              underline: SizedBox(),
+              icon: Icon(Icons.language, color: Colors.white),
+              dropdownColor: Colors.white,
+            ),
+            IconButton(
+              icon: Icon(_isEinkMode ? Icons.invert_colors_off : Icons.invert_colors),
+              tooltip: _isEinkMode ? 'Disable E-ink mode' : 'Enable E-ink mode',
+              onPressed: () {
+                setState(() => _isEinkMode = !_isEinkMode);
+                _injectEinkCss();
+              },
+            ),
+            IconButton(
+              icon: Icon(_githubToken != null ? Icons.key : Icons.key_off_outlined),
+              tooltip: 'GitHub token',
+              onPressed: _showTokenDialog,
+            ),
+          ]),
+          IconButton(
+            icon: Icon(_showToolbar ? Icons.tune : Icons.tune_outlined),
+            tooltip: _showToolbar ? 'Hide toolbar' : 'Show toolbar',
+            onPressed: () => setState(() => _showToolbar = !_showToolbar),
           ),
           if (_currentPdfUrl != null)
             _isExtractingPdf
@@ -817,20 +980,54 @@ class WebViewExampleState extends State<WebViewExample> {
             },
           ),
         ],
-      ),
-      body: Stack(
-        children: [
-          WebViewWidget(controller: _controller),
-          // On Android, WebView has no built-in PDF renderer.
-          // Overlay a Flutter PdfViewer widget when viewing a PDF in PDF mode.
-          if (Platform.isAndroid && _currentPdfUrl != null && !_isTextView)
-            Positioned.fill(
-              child: PdfViewer.uri(
-                Uri.parse(_currentPdfUrl!),
-                params: PdfViewerParams(backgroundColor: Colors.white),
+      ) : null,
+      body: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (_) {
+          if (_showAppBar) setState(() => _showAppBar = false);
+        },
+        child: ColorFiltered(
+        colorFilter: _isEinkMode
+            ? const ColorFilter.matrix([
+                // Grayscale (luminance weights) scaled by 0.82 to dim whites to paper-grey
+                0.1743, 0.5865, 0.0592, 0, 0,
+                0.1743, 0.5865, 0.0592, 0, 0,
+                0.1743, 0.5865, 0.0592, 0, 0,
+                0,      0,      0,      1, 0,
+              ])
+            : const ColorFilter.matrix([
+                1, 0, 0, 0, 0,
+                0, 1, 0, 0, 0,
+                0, 0, 1, 0, 0,
+                0, 0, 0, 1, 0,
+              ]),
+        child: Stack(
+          children: [
+            WebViewWidget(controller: _controller),
+            // On Android, WebView has no built-in PDF renderer.
+            // Overlay a Flutter PdfViewer widget when viewing a PDF in PDF mode.
+            if (Platform.isAndroid && _currentPdfUrl != null && !_isTextView)
+              Positioned.fill(
+                child: PdfViewer.uri(
+                  Uri.parse(_currentPdfUrl!),
+                  params: PdfViewerParams(backgroundColor: Colors.white),
+                ),
+              ),
+            // Invisible strip at the top — swipe down on it to reveal the AppBar.
+            // Must be last in the Stack so it sits above the PDF overlay.
+            Positioned(
+              top: 0, left: 0, right: 0,
+              height: 28,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onVerticalDragUpdate: (details) {
+                  if (details.delta.dy > 2) _revealAppBar();
+                },
               ),
             ),
-        ],
+          ],
+        ),
+      ),
       ),
     ),
     );
