@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
@@ -49,12 +50,20 @@ class WebViewExampleState extends State<WebViewExample> {
   bool _isShowingOurHtml = false;
   bool _isExtractingPdf = false;
   String? _currentPdfUrl;
-  String? _extractedPdfText;
+  String? _extractedPdfHtml;
   String _lastStartedUrl = '';
   bool _isEinkMode = true;
   bool _showToolbar = false;
   bool _showAppBar = true;
   String? _githubToken;
+  int _pdfTextFontSize = 15;
+  bool _showFindBar = false;
+  final TextEditingController _findController = TextEditingController();
+  int? _pendingScrollToPage;
+  int? _pendingPdfPage;
+  PdfViewerController? _pdfViewerController;
+  double _pdfFitZoom = 0.0;
+  int _pdfZoomLevel = 0;
   // Tracks Android main-frame navigations to detect the second onNavigationRequest
   // call that the download listener makes when WebView can't render a response
   // (e.g. application/pdf). First call = normal navigation; second call = download trigger.
@@ -93,7 +102,7 @@ class WebViewExampleState extends State<WebViewExample> {
                   _urlController.text = url;
                   _currentPdfUrl = url;
                   _lastStartedUrl = url;
-                  _extractedPdfText = null;
+                  _extractedPdfHtml = null;
                   _isTextView = false;
                   _isShowingOurHtml = false;
                   _handledPdfUrls.clear();
@@ -115,7 +124,7 @@ class WebViewExampleState extends State<WebViewExample> {
                         _urlController.text = url;
                         _currentPdfUrl = url;
                         _lastStartedUrl = url;
-                        _extractedPdfText = null;
+                        _extractedPdfHtml = null;
                         _isTextView = false;
                         _isShowingOurHtml = false;
                         _handledPdfUrls.clear();
@@ -137,21 +146,31 @@ class WebViewExampleState extends State<WebViewExample> {
             },
             onPageStarted: (url) {
               if (_isShowingOurHtml) return; // our own HTML page, don't reset state
+              // Ignore the transient about:blank when switching text→PDF
+              if (_pendingPdfPage != null && url == 'about:blank') return;
               _lastStartedUrl = url;
               setState(() {
-                _urlController.text = url;
+                // Show the clean URL without #page=N fragment
+                _urlController.text = url.split('#').first;
                 if (_looksLikePdfUrl(url)) {
-                  if (_currentPdfUrl != url) {
-                    _currentPdfUrl = url;
-                    _extractedPdfText = null;
+                  // Strip fragment (#page=N) when comparing so reloading
+                  // the same PDF with a page anchor doesn't reset state.
+                  final baseUrl = url.split('#').first;
+                  final baseCurrentPdf = (_currentPdfUrl ?? '').split('#').first;
+                  if (baseCurrentPdf != baseUrl) {
+                    _currentPdfUrl = baseUrl;
+                    _extractedPdfHtml = null;
                     _isTextView = false;
                   }
                 } else {
                   _currentPdfUrl = null;
-                  _extractedPdfText = null;
+                  _extractedPdfHtml = null;
                   _isTextView = false;
                   _isShowingOurHtml = false;
                   _handledPdfUrls.clear();
+                  _pdfViewerController = null;
+                  _pdfFitZoom = 0.0;
+                  _pdfZoomLevel = 0;
                 }
               });
               // On Android, start PDF detection right here — onPageFinished may never
@@ -163,8 +182,17 @@ class WebViewExampleState extends State<WebViewExample> {
             onPageFinished: (url) {
               if (_isShowingOurHtml) {
                 _injectJs(); // only need word-click JS on our own text page
+                // Scroll to preserved page position if switching from PDF view
+                if (_pendingScrollToPage != null && _pendingScrollToPage! > 1) {
+                  final pg = _pendingScrollToPage!;
+                  _pendingScrollToPage = null;
+                  _controller.runJavaScript(
+                    'document.getElementById("pg-$pg")?.scrollIntoView({behavior:"instant"});'
+                  );
+                }
                 return;
               }
+              _pendingPdfPage = null; // clear after PDF loads
               _injectJs();
               _injectRemoteSnippet();
               _injectAdBlocker();
@@ -231,6 +259,39 @@ class WebViewExampleState extends State<WebViewExample> {
     setState(() => _showAppBar = true);
   }
 
+  /// For text view: adjusts the CSS --fs variable in the loaded HTML.
+  /// For native PDF view: steps through pdfrx zoom stops, but anchors to
+  /// fit-to-width so tapping the page never resets the level.
+  void _changePdfZoom(int delta) {
+    if (_isTextView) {
+      final newSize = (_pdfTextFontSize + delta).clamp(10, 32);
+      if (newSize == _pdfTextFontSize) return;
+      setState(() => _pdfTextFontSize = newSize);
+      _controller.runJavaScript(
+          "document.documentElement.style.setProperty('--fs','${newSize}px');");
+    } else if (Platform.isAndroid && _pdfViewerController != null) {
+      final newLevel = (_pdfZoomLevel + delta).clamp(-2, 8);
+      if (newLevel == _pdfZoomLevel) return;
+      _pdfZoomLevel = newLevel;
+      _applyPdfZoom();
+    }
+  }
+
+  void _applyPdfZoom() {
+    final ctrl = _pdfViewerController;
+    if (ctrl == null || _pdfFitZoom <= 0) return;
+    final vs = ctrl.viewSize;
+    if (vs == null) return;
+    final targetZoom = _pdfFitZoom * (1.0 + _pdfZoomLevel * 0.25).clamp(0.25, 4.0);
+    final cur = ctrl.currentZoom;
+    final t = ctrl.value.getTranslation();
+    ctrl.setZoom(
+      Offset((vs.width / 2 - t.x) / cur, (vs.height / 2 - t.y) / cur),
+      targetZoom,
+      duration: const Duration(milliseconds: 200),
+    );
+  }
+
   bool _looksLikePdfUrl(String url) {
     final path = Uri.tryParse(url)?.path ?? '';
     return path.toLowerCase().endsWith('.pdf');
@@ -285,17 +346,64 @@ class WebViewExampleState extends State<WebViewExample> {
   Future<void> _togglePdfTextView() async {
     if (_currentPdfUrl == null) return;
     if (_isTextView) {
-      // Switch back to PDF view
+      // --- Text → PDF: get visible page number from text view ---
+      int visiblePage = 1;
+      try {
+        final result = await _controller.runJavaScriptReturningResult('''
+          (function() {
+            var best = 1;
+            var els = document.querySelectorAll('.pg[id^="pg-"]');
+            for (var i = 0; i < els.length; i++) {
+              var r = els[i].getBoundingClientRect();
+              if (r.top <= window.innerHeight / 2) {
+                best = parseInt(els[i].id.replace('pg-', ''));
+              }
+            }
+            return best;
+          })();
+        ''');
+        visiblePage = int.tryParse(result.toString()) ?? 1;
+      } catch (_) {}
+
+      // Switch back to PDF view — reset viewport/zoom that text view set.
+      await _controller.runJavaScript(
+        'document.querySelector("meta[name=viewport]")?.remove();'
+        'document.body.style.cssText="";'
+        'document.documentElement.style.zoom="100%";'
+      );
       setState(() { _isTextView = false; _isShowingOurHtml = false; });
-      // On Android we show a Flutter PdfViewer overlay — no need to reload WebView.
-      // On macOS/iOS WKWebView renders PDFs natively so we reload the URL.
-      if (!Platform.isAndroid) {
-        _controller.loadRequest(Uri.parse(_currentPdfUrl!));
+      if (Platform.isAndroid) {
+        _pdfViewerController?.goToPage(pageNumber: visiblePage);
+      } else {
+        // On macOS/iOS WKWebView — need to load the PDF with #page=N.
+        // WKWebView ignores fragment changes on the same URL, so we load
+        // about:blank first to force a fresh navigation.
+        final base = _currentPdfUrl!.split('#').first;
+        final target = visiblePage > 1 ? '$base#page=$visiblePage' : base;
+        _pendingPdfPage = visiblePage;
+        await _controller.loadRequest(Uri.parse('about:blank'));
+        await Future.delayed(const Duration(milliseconds: 50));
+        _controller.loadRequest(Uri.parse(target));
       }
       return;
     }
-    // Extract text if not yet cached
-    if (_extractedPdfText == null) {
+
+    // --- PDF → Text: get current page number from PDF view ---
+    int currentPage = 1;
+    if (Platform.isAndroid) {
+      currentPage = _pdfViewerController?.pageNumber ?? 1;
+    } else {
+      // macOS/iOS WKWebView — try to get page from scroll position
+      try {
+        final result = await _controller.runJavaScriptReturningResult(
+          'Math.max(1, Math.round(window.scrollY / window.innerHeight) + 1)'
+        );
+        currentPage = int.tryParse(result.toString()) ?? 1;
+      } catch (_) {}
+    }
+
+    // Build or reuse cached rich HTML
+    if (_extractedPdfHtml == null) {
       setState(() => _isExtractingPdf = true);
       try {
         final response = await http.get(Uri.parse(_currentPdfUrl!), headers: {
@@ -307,13 +415,8 @@ class WebViewExampleState extends State<WebViewExample> {
           return;
         }
         final doc = await PdfDocument.openData(response.bodyBytes);
-        final buf = StringBuffer();
-        for (int i = 0; i < doc.pages.length; i++) {
-          if (i > 0) buf.write('\n\n--- Page ${i + 1} ---\n\n');
-          buf.write((await doc.pages[i].loadText()).fullText);
-        }
+        _extractedPdfHtml = await _buildPdfHtml(doc);
         await doc.dispose();
-        _extractedPdfText = buf.toString().trim();
       } catch (e) {
         debugPrint('PDF extraction error: $e');
         setState(() => _isExtractingPdf = false);
@@ -321,21 +424,351 @@ class WebViewExampleState extends State<WebViewExample> {
       }
       setState(() => _isExtractingPdf = false);
     }
-    if (_extractedPdfText == null || _extractedPdfText!.isEmpty) {
+    if (_extractedPdfHtml == null || _extractedPdfHtml!.isEmpty) {
       debugPrint('No extractable text in PDF (image-based?).');
       return;
     }
-    final escaped = _extractedPdfText!
-        .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-    final html = '<!DOCTYPE html><html><head>'
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        '<style>body{font-family:serif;font-size:15px;line-height:1.7;'
-        'padding:24px;margin:0;background:#fff;-webkit-user-select:text;user-select:text;}'
-        'pre{white-space:pre-wrap;word-wrap:break-word;font-family:inherit;}</style>'
-        '</head><body><pre>$escaped</pre></body></html>';
     setState(() { _isTextView = true; _isShowingOurHtml = true; });
-    await _controller.loadHtmlString(html);
-    // onPageFinished will call _injectJs() for word-click support
+    await _controller.loadHtmlString(_extractedPdfHtml!);
+    // After page loads, scroll to the page marker
+    _pendingScrollToPage = currentPage;
+    // onPageFinished will inject utils.js and scroll to the page marker
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rich PDF HTML builder (research-paper-aware)
+  // ---------------------------------------------------------------------------
+
+  Future<String> _buildPdfHtml(PdfDocument doc) async {
+    final buf = StringBuffer();
+    buf.write('<!DOCTYPE html><html><head>'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<style>'
+        ':root{--fs:${_pdfTextFontSize}px}'
+        'body{font-family:Georgia,serif;font-size:var(--fs);line-height:1.75;'
+        'padding:20px 28px;margin:0 auto;max-width:720px;background:#fff;'
+        '-webkit-user-select:text;user-select:text;}'
+        'p{margin:0 0 0.45em;}'
+        '.pg{text-align:center;color:#888;font-size:0.78em;'
+        'margin:1.4em 0 1em;letter-spacing:0.12em;}'
+        '.gap{display:block;border:1px dashed #bbb;border-radius:4px;'
+        'padding:8px 12px;margin:10px 0;color:#999;font-style:italic;'
+        'font-size:0.82em;text-align:center;background:#f8f8f8;}'
+        '.fn{border-top:1px solid #ccc;margin-top:14px;padding-top:8px;'
+        'font-size:0.80em;color:#444;line-height:1.5;}'
+        '.fn-lbl{color:#999;font-size:0.75em;letter-spacing:0.08em;margin-bottom:4px;}'
+        '</style></head><body>');
+    bool hasAnyText = false;
+    for (int pi = 0; pi < doc.pages.length; pi++) {
+      final page = doc.pages[pi];
+      final pt = await page.loadText();
+      final allFrags = pt.fragments.where((f) => f.text.trim().isNotEmpty).toList();
+      buf.write('<div class="pg" id="pg-${pi + 1}">— Page ${pi + 1} —</div>');
+      if (allFrags.isEmpty) continue;
+      hasAnyText = true;
+
+      // Compute per-fragment average char heights for font-size detection
+      final fragHeights = <double>[];
+      for (final f in allFrags) {
+        final rects = f.charRects.where((r) => r.height > 1).toList();
+        fragHeights.add(rects.isEmpty ? 0.0
+            : rects.map((r) => r.height).reduce((a, b) => a + b) / rects.length);
+      }
+
+      // Median char height ≈ body font size in PDF points
+      final nonZeroH = fragHeights.where((h) => h > 0).toList()..sort();
+      final medH = nonZeroH.isEmpty ? 10.0 : nonZeroH[nonZeroH.length ~/ 2];
+
+      // Detect footnotes by structure: cluster fragments into lines, then
+      // scan from bottom up looking for lines that start with a digit
+      // (e.g. "1 Some footnote text..." or "12 Another footnote").
+      // The footnote block is the contiguous run of such numbered lines
+      // at the bottom of the page (in the lower 40%).
+
+      // First, cluster ALL fragments into lines (same logic as _emitLines)
+      final sorted = [...allFrags]..sort((a, b) => b.bounds.top.compareTo(a.bounds.top));
+      final pageLines = <List<PdfPageTextFragment>>[];
+      {
+        var cur = <PdfPageTextFragment>[sorted.first];
+        double cySum = sorted.first.bounds.top;
+        int cyCount = 1;
+        final yt = medH * 0.6;
+        for (int i = 1; i < sorted.length; i++) {
+          final f = sorted[i];
+          if ((cySum / cyCount - f.bounds.top).abs() < yt) {
+            cur.add(f);
+            cySum += f.bounds.top;
+            cyCount++;
+          } else {
+            pageLines.add(cur);
+            cur = [f];
+            cySum = f.bounds.top;
+            cyCount = 1;
+          }
+        }
+        pageLines.add(cur);
+      }
+      // Sort fragments within each line left-to-right
+      for (final line in pageLines) {
+        line.sort((a, b) => a.bounds.left.compareTo(b.bounds.left));
+      }
+
+      // Scan from the last line upward; collect lines that belong to footnotes.
+      // A footnote-starting line begins with a digit. Continuation lines
+      // (that don't start with a digit) are included if they follow a
+      // footnote-starting line without a large gap.
+      final pageBottom = page.height * 0.45; // only look in lower 45%
+      final fnLineIndices = <int>{};
+      bool inFootnoteRegion = false;
+
+      // Pre-compute average char height per line
+      final lineAvgHeights = <int, double>{};
+      for (int li = 0; li < pageLines.length; li++) {
+        double h = 0; int c = 0;
+        for (final f in pageLines[li]) {
+          for (final r in f.charRects) {
+            if (r.height > 1) { h += r.height; c++; }
+          }
+        }
+        lineAvgHeights[li] = c > 0 ? h / c : medH;
+      }
+
+      for (int li = pageLines.length - 1; li >= 0; li--) {
+        final line = pageLines[li];
+        final lineTop = line.map((f) => f.bounds.top).reduce(math.max);
+        if (lineTop > pageBottom) break; // past the lower region
+
+        final lineText = line.map((f) => f.text).join(' ').trim();
+        if (lineText.isEmpty) continue;
+
+        // Skip lone page numbers (just digits, very short)
+        if (RegExp(r'^\d{1,4}$').hasMatch(lineText)) continue;
+
+        final avgLineH = lineAvgHeights[li] ?? medH;
+        final isSmallFont = avgLineH < medH * 0.93;
+
+        // "1. Text..." or "12. Text..." — numbered footnote pattern
+        final startsWithNum = RegExp(r'^\d+[\.\)]?\s').hasMatch(lineText);
+        if (startsWithNum && isSmallFont) {
+          // Strong: numbered + smaller font → footnote start
+          inFootnoteRegion = true;
+          fnLineIndices.add(li);
+        } else if (inFootnoteRegion && isSmallFont) {
+          // Continuation line (wrapped footnote text, same small font)
+          fnLineIndices.add(li);
+        } else if (inFootnoteRegion && !isSmallFont) {
+          // Hit normal-sized text — footnote region ends
+          break;
+        }
+      }
+
+      // Separate body and footnote fragments
+      final body = <PdfPageTextFragment>[];
+      final fn = <PdfPageTextFragment>[];
+      if (fnLineIndices.isNotEmpty) {
+        final fnFrags = <PdfPageTextFragment>{};
+        for (final li in fnLineIndices) {
+          fnFrags.addAll(pageLines[li]);
+        }
+        for (final f in allFrags) {
+          if (fnFrags.contains(f)) {
+            fn.add(f);
+          } else {
+            body.add(f);
+          }
+        }
+      } else {
+        body.addAll(allFrags);
+      }
+
+      // Sort top-to-bottom (largest y = top of page in PDF coords)
+      body.sort((a, b) => b.bounds.top.compareTo(a.bounds.top));
+      fn.sort((a, b) => b.bounds.top.compareTo(a.bounds.top));
+
+      _emitLines(buf, body, medH, isFootnote: false);
+      if (fn.isNotEmpty) {
+        buf.write('<div class="fn"><div class="fn-lbl">Footnotes</div>');
+        _emitLines(buf, fn, medH, isFootnote: true);
+        buf.write('</div>');
+      }
+    }
+    if (!hasAnyText) return '';
+    buf.write('</body></html>');
+    return buf.toString();
+  }
+
+  void _emitLines(StringBuffer buf, List<PdfPageTextFragment> frags,
+      double medH, {required bool isFootnote}) {
+    if (frags.isEmpty) return;
+
+    // --- Step 1: Cluster fragments into lines by y-position ---
+    // Use a running average for the cluster's y so drift doesn't accumulate.
+    final lines = <List<PdfPageTextFragment>>[];
+    var cur = <PdfPageTextFragment>[frags.first];
+    double clusterYSum = frags.first.bounds.top;
+    int clusterCount = 1;
+    final yThresh = medH * 0.6; // tighter threshold: 60% of median char height
+
+    for (int i = 1; i < frags.length; i++) {
+      final f = frags[i];
+      final clusterAvgY = clusterYSum / clusterCount;
+      if ((clusterAvgY - f.bounds.top).abs() < yThresh) {
+        cur.add(f);
+        clusterYSum += f.bounds.top;
+        clusterCount++;
+      } else {
+        lines.add(cur);
+        cur = [f];
+        clusterYSum = f.bounds.top;
+        clusterCount = 1;
+      }
+    }
+    lines.add(cur);
+
+    // --- Step 2: Compute line positions and typical spacing ---
+    // Pre-sort each line and compute top/bottom for gap analysis.
+    final lineTops = <double>[];
+    final lineBottoms = <double>[];
+    for (final line in lines) {
+      line.sort((a, b) => a.bounds.left.compareTo(b.bounds.left));
+      lineTops.add(line.map((f) => f.bounds.top).reduce(math.max));
+      lineBottoms.add(line.map((f) => f.bounds.bottom).reduce(math.min));
+    }
+
+    // Compute typical inter-line gap from the middle 80% of gaps
+    // (excludes heading gaps at top and section breaks)
+    final interGaps = <double>[];
+    for (int i = 1; i < lines.length; i++) {
+      final gap = lineBottoms[i - 1] - lineTops[i];
+      if (gap > 0) interGaps.add(gap);
+    }
+    interGaps.sort();
+    final medGap = interGaps.isEmpty ? medH * 1.5
+        : interGaps[interGaps.length ~/ 2];
+    // A gap is "large" if it exceeds both:
+    //   - 3× the median inter-line gap (adapts to the page's actual spacing)
+    //   - 2.5× the body font height (absolute floor)
+    final largeGapThresh = math.max(medGap * 3.0, medH * 2.5);
+
+    // --- Step 3: Render each line with gap-aware joining ---
+    for (int li = 0; li < lines.length; li++) {
+      final line = lines[li];
+
+      // Detect large vertical gaps → image/figure placeholder
+      // Skip last line (page number). Check that both flanking lines have
+      // substantial text so lone headers/page numbers don't trigger it.
+      if (!isFootnote && li > 0 && li < lines.length - 1
+          && lineBottoms[li - 1] - lineTops[li] > largeGapThresh) {
+        final prevText = lines[li - 1].map((f) => f.text).join(' ').trim();
+        final curText = line.map((f) => f.text).join(' ').trim();
+        if (prevText.length > 10 && curText.length > 10) {
+          buf.write('<span class="gap">[ Figure / Image / Diagram ]</span>');
+        }
+      }
+
+      // Compute average char width for space-detection threshold
+      double totalW = 0; int charCount = 0;
+      for (final f in line) {
+        for (final r in f.charRects) {
+          if (r.width > 0.5) { totalW += r.width; charCount++; }
+        }
+      }
+      final avgCharW = charCount > 0 ? totalW / charCount : medH * 0.5;
+
+      // Join fragments: use actual horizontal gap to decide spacing
+      final sb = StringBuffer();
+      for (int i = 0; i < line.length; i++) {
+        final frag = line[i];
+        if (i > 0) {
+          final prevRight = line[i - 1].bounds.right;
+          final curLeft = frag.bounds.left;
+          final gap = curLeft - prevRight;
+          // Gap wider than ~30% of avg char width → insert a space
+          if (gap > avgCharW * 0.3) {
+            sb.write(' ');
+          }
+          // Negative or tiny gap → fragments touch, no space needed
+        }
+        sb.write(_esc(frag.text));
+      }
+      final text = sb.toString();
+      if (text.trim().isNotEmpty) buf.write('<p>$text</p>');
+    }
+  }
+
+  String _esc(String s) =>
+      s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+
+  void _findInPage(String query, {bool forward = true}) {
+    if (query.isEmpty) {
+      _clearFindHighlights();
+      return;
+    }
+    final jsStr = jsonEncode(query);
+    _controller.runJavaScript('''
+      (function() {
+        // If query changed, rebuild highlights
+        if (window._findQuery !== $jsStr) {
+          // Clear old highlights
+          document.querySelectorAll('mark._fh').forEach(function(m) {
+            var p = m.parentNode;
+            p.replaceChild(document.createTextNode(m.textContent), m);
+            p.normalize();
+          });
+          window._findQuery = $jsStr;
+          window._findIdx = -1;
+          window._findMarks = [];
+          // Walk text nodes and wrap matches
+          var query = $jsStr.toLowerCase();
+          var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          var node, matches = [];
+          while (node = walker.nextNode()) {
+            var text = node.textContent.toLowerCase();
+            var idx = 0;
+            while ((idx = text.indexOf(query, idx)) !== -1) {
+              matches.push({node: node, start: idx, length: query.length});
+              idx += query.length;
+            }
+          }
+          // Apply marks in reverse so offsets stay valid
+          for (var i = matches.length - 1; i >= 0; i--) {
+            var m = matches[i];
+            var range = document.createRange();
+            range.setStart(m.node, m.start);
+            range.setEnd(m.node, m.start + m.length);
+            var mark = document.createElement('mark');
+            mark.className = '_fh';
+            mark.style.cssText = 'background:#ffeb3b;padding:0;margin:0;';
+            range.surroundContents(mark);
+          }
+          window._findMarks = Array.from(document.querySelectorAll('mark._fh'));
+        }
+        if (window._findMarks.length === 0) return;
+        // Navigate
+        var dir = ${forward ? '1' : '-1'};
+        window._findIdx = (window._findIdx + dir + window._findMarks.length) % window._findMarks.length;
+        // Reset all to yellow, highlight current in orange
+        window._findMarks.forEach(function(m) { m.style.background = '#ffeb3b'; });
+        var cur = window._findMarks[window._findIdx];
+        cur.style.background = '#ff9800';
+        cur.scrollIntoView({block: 'center', behavior: 'smooth'});
+      })();
+    ''');
+  }
+
+  void _clearFindHighlights() {
+    _controller.runJavaScript('''
+      (function() {
+        document.querySelectorAll('mark._fh').forEach(function(m) {
+          var p = m.parentNode;
+          p.replaceChild(document.createTextNode(m.textContent), m);
+          p.normalize();
+        });
+        window._findQuery = '';
+        window._findIdx = -1;
+        window._findMarks = [];
+      })();
+    ''');
   }
 
   Future<void> _injectSpaHook() {
@@ -932,13 +1365,25 @@ class WebViewExampleState extends State<WebViewExample> {
               tooltip: 'GitHub token',
               onPressed: _showTokenDialog,
             ),
+            if (_currentPdfUrl != null) ...([  // font/zoom controls
+              IconButton(
+                icon: const Icon(Icons.text_decrease),
+                tooltip: _isTextView ? 'Decrease font size' : 'Zoom out',
+                onPressed: () => _changePdfZoom(-1),
+              ),
+              IconButton(
+                icon: const Icon(Icons.text_increase),
+                tooltip: _isTextView ? 'Increase font size' : 'Zoom in',
+                onPressed: () => _changePdfZoom(1),
+              ),
+            ]),
           ]),
           IconButton(
             icon: Icon(_showToolbar ? Icons.tune : Icons.tune_outlined),
             tooltip: _showToolbar ? 'Hide toolbar' : 'Show toolbar',
             onPressed: () => setState(() => _showToolbar = !_showToolbar),
           ),
-          if (_currentPdfUrl != null)
+          if (_currentPdfUrl != null) ...([  // text view toggle always visible
             _isExtractingPdf
               ? Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -950,6 +1395,20 @@ class WebViewExampleState extends State<WebViewExample> {
                   tooltip: _isTextView ? 'Switch to PDF view' : 'Switch to text view',
                   onPressed: _togglePdfTextView,
                 ),
+          ]),
+          IconButton(
+            icon: Icon(_showFindBar ? Icons.search_off : Icons.search),
+            tooltip: _showFindBar ? 'Close find' : 'Find in page',
+            onPressed: () {
+              setState(() {
+                _showFindBar = !_showFindBar;
+                if (!_showFindBar) {
+                  _findController.clear();
+                  _clearFindHighlights();
+                }
+              });
+            },
+          ),
           IconButton(
             icon: Icon(Icons.bookmarks_outlined),
             onPressed: _showBookmarks,
@@ -1011,13 +1470,78 @@ class WebViewExampleState extends State<WebViewExample> {
               Positioned.fill(
                 child: PdfViewer.uri(
                   Uri.parse(_currentPdfUrl!),
-                  params: PdfViewerParams(backgroundColor: Colors.white),
+                  controller: _pdfViewerController ??= PdfViewerController(),
+                  params: PdfViewerParams(
+                    backgroundColor: Colors.white,
+                    calculateInitialZoom: (doc, ctrl, fitZoom, coverZoom) {
+                      _pdfFitZoom = fitZoom;
+                      return fitZoom * (1.0 + _pdfZoomLevel * 0.25).clamp(0.25, 4.0);
+                    },
+                    onViewSizeChanged: (viewSize, oldSize, ctrl) {
+                      if (_pdfFitZoom > 0) {
+                        WidgetsBinding.instance.addPostFrameCallback(
+                            (_) { if (mounted) _applyPdfZoom(); });
+                      }
+                    },
+                  ),
+                ),
+              ),
+            // Find-in-page bar
+            if (_showFindBar)
+              Positioned(
+                top: 0, left: 0, right: 0,
+                child: Material(
+                  elevation: 4,
+                  child: Container(
+                    color: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _findController,
+                            autofocus: true,
+                            decoration: const InputDecoration(
+                              hintText: 'Find in page...',
+                              isDense: true,
+                              contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                              border: OutlineInputBorder(),
+                            ),
+                            onSubmitted: (q) => _findInPage(q),
+                            textInputAction: TextInputAction.search,
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.keyboard_arrow_up, size: 20),
+                          tooltip: 'Previous',
+                          onPressed: () => _findInPage(_findController.text, forward: false),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.keyboard_arrow_down, size: 20),
+                          tooltip: 'Next',
+                          onPressed: () => _findInPage(_findController.text),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close, size: 20),
+                          tooltip: 'Close',
+                          onPressed: () {
+                            setState(() {
+                              _showFindBar = false;
+                              _findController.clear();
+                              _clearFindHighlights();
+                            });
+                            _revealAppBar();
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               ),
             // Invisible strip at the top — swipe down on it to reveal the AppBar.
-            // Must be last in the Stack so it sits above the PDF overlay.
+            // Sits below the find bar when it's open, otherwise at the very top.
             Positioned(
-              top: 0, left: 0, right: 0,
+              top: _showFindBar ? 48 : 0, left: 0, right: 0,
               height: 28,
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
