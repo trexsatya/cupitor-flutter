@@ -54,13 +54,18 @@ class WebViewExampleState extends State<WebViewExample> {
   String _lastStartedUrl = '';
   bool _isEinkMode = true;
   bool _showToolbar = false;
-  bool _showAppBar = true;
   String? _githubToken;
   int _pdfTextFontSize = 15;
   bool _showFindBar = false;
+  bool _urlBarFocused = false;
+  String _pdfSelectedText = '';
   final TextEditingController _findController = TextEditingController();
   int? _pendingScrollToPage;
   int? _pendingPdfPage;
+  // Scroll position cache: URL → scrollY or pdfPage (max 50 entries, persisted)
+  Map<String, double> _scrollPositions = {};
+  static const int _maxScrollEntries = 50;
+  String? _prevPageUrl; // URL of the page we're navigating away from
   PdfViewerController? _pdfViewerController;
   double _pdfFitZoom = 0.0;
   int _pdfZoomLevel = 0;
@@ -72,7 +77,11 @@ class WebViewExampleState extends State<WebViewExample> {
 
   @override
   void dispose() {
+    // Save scroll position of the current page before disposing
+    final url = _urlController.text.trim();
+    if (url.isNotEmpty) _saveScrollPosition(url);
     _urlController.dispose();
+    _findController.dispose();
     _dialogErrorNotifier.dispose();
     super.dispose();
   }
@@ -83,6 +92,14 @@ class WebViewExampleState extends State<WebViewExample> {
     SharedPreferences.getInstance().then((prefs) {
       final savedUrl = prefs.getString('lastUrl') ?? _urlController.text;
       _urlController.text = savedUrl;
+      // Load persisted scroll positions
+      final scrollJson = prefs.getString('scrollPositions');
+      if (scrollJson != null) {
+        try {
+          final decoded = jsonDecode(scrollJson) as Map<String, dynamic>;
+          _scrollPositions = decoded.map((k, v) => MapEntry(k, (v as num).toDouble()));
+        } catch (_) {}
+      }
       _bookmarks = prefs.getStringList('bookmarks') ?? [];
       _githubToken = prefs.getString('githubToken');
       _controller = WebViewController()
@@ -146,8 +163,9 @@ class WebViewExampleState extends State<WebViewExample> {
             },
             onPageStarted: (url) {
               if (_isShowingOurHtml) return; // our own HTML page, don't reset state
-              // Ignore the transient about:blank when switching text→PDF
-              if (_pendingPdfPage != null && url == 'about:blank') return;
+              // Save scroll position of the page we're leaving
+              if (_prevPageUrl != null) _saveScrollPosition(_prevPageUrl!);
+              _prevPageUrl = url.split('#').first;
               _lastStartedUrl = url;
               setState(() {
                 // Show the clean URL without #page=N fragment
@@ -201,6 +219,8 @@ class WebViewExampleState extends State<WebViewExample> {
               // Detect PDF by content-type (handles non-.pdf URLs like download links)
               // and defer _injectPdfDetector so it never fires on native PDF pages.
               _detectPdfAndInject(url);
+              // Restore scroll position for this URL
+              _restoreScrollPosition(url);
             },
           ),
         )
@@ -208,7 +228,6 @@ class WebViewExampleState extends State<WebViewExample> {
       setState(() {
         _isControllerReady = true;
       });
-      _revealAppBar(); // show on first launch, then auto-hide
     });
   }
 
@@ -255,8 +274,48 @@ class WebViewExampleState extends State<WebViewExample> {
     );
   }
 
-  void _revealAppBar() {
-    setState(() => _showAppBar = true);
+  /// Save current scroll position for the given URL.
+  Future<void> _saveScrollPosition(String url) async {
+    if (url.isEmpty || url == 'about:blank') return;
+    final baseUrl = url.split('#').first;
+    double pos = 0;
+    if (_currentPdfUrl != null && !_isTextView) {
+      // PDF view: save page number as scroll position
+      pos = (_pdfViewerController?.pageNumber ?? 1).toDouble();
+    } else {
+      // WebView (HTML or text view): save scrollY
+      try {
+        final result = await _controller.runJavaScriptReturningResult('window.scrollY');
+        pos = double.tryParse(result.toString()) ?? 0;
+      } catch (_) {}
+    }
+    if (pos <= 0) return;
+    _scrollPositions[baseUrl] = pos;
+    // Evict oldest entries if over limit
+    if (_scrollPositions.length > _maxScrollEntries) {
+      final keys = _scrollPositions.keys.toList();
+      for (int i = 0; i < keys.length - _maxScrollEntries; i++) {
+        _scrollPositions.remove(keys[i]);
+      }
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('scrollPositions', jsonEncode(_scrollPositions));
+  }
+
+  /// Restore scroll position for the given URL.
+  void _restoreScrollPosition(String url) {
+    final baseUrl = url.split('#').first;
+    final pos = _scrollPositions[baseUrl];
+    if (pos == null || pos <= 0) return;
+    if (_currentPdfUrl != null) {
+      // PDF view: restore page number
+      _pdfViewerController?.goToPage(pageNumber: pos.round());
+    } else {
+      // WebView: restore scrollY with a delay for layout to settle
+      _controller.runJavaScript(
+        'setTimeout(function(){window.scrollTo(0,$pos);},300);'
+      );
+    }
   }
 
   /// For text view: adjusts the CSS --fs variable in the loaded HTML.
@@ -269,7 +328,7 @@ class WebViewExampleState extends State<WebViewExample> {
       setState(() => _pdfTextFontSize = newSize);
       _controller.runJavaScript(
           "document.documentElement.style.setProperty('--fs','${newSize}px');");
-    } else if (Platform.isAndroid && _pdfViewerController != null) {
+    } else if (_pdfViewerController != null) {
       final newLevel = (_pdfZoomLevel + delta).clamp(-2, 8);
       if (newLevel == _pdfZoomLevel) return;
       _pdfZoomLevel = newLevel;
@@ -365,42 +424,14 @@ class WebViewExampleState extends State<WebViewExample> {
         visiblePage = int.tryParse(result.toString()) ?? 1;
       } catch (_) {}
 
-      // Switch back to PDF view — reset viewport/zoom that text view set.
-      await _controller.runJavaScript(
-        'document.querySelector("meta[name=viewport]")?.remove();'
-        'document.body.style.cssText="";'
-        'document.documentElement.style.zoom="100%";'
-      );
+      // Switch state — PdfViewer overlay reappears and navigates to page
       setState(() { _isTextView = false; _isShowingOurHtml = false; });
-      if (Platform.isAndroid) {
-        _pdfViewerController?.goToPage(pageNumber: visiblePage);
-      } else {
-        // On macOS/iOS WKWebView — need to load the PDF with #page=N.
-        // WKWebView ignores fragment changes on the same URL, so we load
-        // about:blank first to force a fresh navigation.
-        final base = _currentPdfUrl!.split('#').first;
-        final target = visiblePage > 1 ? '$base#page=$visiblePage' : base;
-        _pendingPdfPage = visiblePage;
-        await _controller.loadRequest(Uri.parse('about:blank'));
-        await Future.delayed(const Duration(milliseconds: 50));
-        _controller.loadRequest(Uri.parse(target));
-      }
+      _pdfViewerController?.goToPage(pageNumber: visiblePage);
       return;
     }
 
-    // --- PDF → Text: get current page number from PDF view ---
-    int currentPage = 1;
-    if (Platform.isAndroid) {
-      currentPage = _pdfViewerController?.pageNumber ?? 1;
-    } else {
-      // macOS/iOS WKWebView — try to get page from scroll position
-      try {
-        final result = await _controller.runJavaScriptReturningResult(
-          'Math.max(1, Math.round(window.scrollY / window.innerHeight) + 1)'
-        );
-        currentPage = int.tryParse(result.toString()) ?? 1;
-      } catch (_) {}
-    }
+    // --- PDF → Text: get current page from PdfViewer ---
+    int currentPage = _pdfViewerController?.pageNumber ?? 1;
 
     // Build or reuse cached rich HTML
     if (_extractedPdfHtml == null) {
@@ -1323,19 +1354,30 @@ class WebViewExampleState extends State<WebViewExample> {
         }
       },
       child: Scaffold(
-      appBar: _showAppBar ? AppBar(
-        title: TextField(
-          controller: _urlController,
-          decoration: InputDecoration(
-            hintText: 'Enter URL',
-            border: InputBorder.none,
-            suffixIcon: IconButton(icon: Icon(Icons.arrow_forward), onPressed: _loadUrl),
+      appBar: AppBar(
+        title: Focus(
+          onFocusChange: (focused) {
+            if (Platform.isAndroid) setState(() => _urlBarFocused = focused);
+          },
+          child: TextField(
+            controller: _urlController,
+            decoration: InputDecoration(
+              hintText: 'Enter URL',
+              border: InputBorder.none,
+              suffixIcon: IconButton(icon: Icon(Icons.arrow_forward), onPressed: () {
+                _loadUrl();
+                FocusManager.instance.primaryFocus?.unfocus();
+              }),
+            ),
+            keyboardType: TextInputType.url,
+            onTap: () => _urlController.selection = TextSelection(baseOffset: 0, extentOffset: _urlController.text.length),
+            onSubmitted: (_) {
+              _loadUrl();
+              FocusManager.instance.primaryFocus?.unfocus();
+            },
           ),
-          keyboardType: TextInputType.url,
-          onTap: () => _urlController.selection = TextSelection(baseOffset: 0, extentOffset: _urlController.text.length),
-          onSubmitted: (_) => _loadUrl(),
         ),
-        actions: [
+        actions: _urlBarFocused ? null : [
           if (_showToolbar) ...([
             DropdownButton<String>(
               value: _selectedLanguage,
@@ -1417,35 +1459,36 @@ class WebViewExampleState extends State<WebViewExample> {
           IconButton(
             icon: Icon(Icons.open_in_new),
             onPressed: () async {
-              const js = '''
-                (function getSelFromWindow(w) {
-                  try {
-                    const s = w.getSelection().toString().trim();
-                    if (s) return s;
-                    for (let i = 0; i < w.frames.length; i++) {
-                      const found = getSelFromWindow(w.frames[i]);
-                      if (found) return found;
-                    }
-                  } catch(e) {}
-                  return '';
-                })(window);
-              ''';
               String text = '';
-              try {
-                final result = await _controller.runJavaScriptReturningResult(js);
-                text = result.toString().replaceAll('"', '');
-              } catch (_) {}
+              if (_currentPdfUrl != null && !_isTextView
+                  && _pdfSelectedText.isNotEmpty) {
+                // PDF view: get selection from PdfViewer widget
+                text = _pdfSelectedText;
+              } else {
+                const js = '''
+                  (function getSelFromWindow(w) {
+                    try {
+                      const s = w.getSelection().toString().trim();
+                      if (s) return s;
+                      for (let i = 0; i < w.frames.length; i++) {
+                        const found = getSelFromWindow(w.frames[i]);
+                        if (found) return found;
+                      }
+                    } catch(e) {}
+                    return '';
+                  })(window);
+                ''';
+                try {
+                  final result = await _controller.runJavaScriptReturningResult(js);
+                  text = result.toString().replaceAll('"', '');
+                } catch (_) {}
+              }
               _openDialogWithWebview(text);
             },
           ),
         ],
-      ) : null,
-      body: Listener(
-        behavior: HitTestBehavior.translucent,
-        onPointerDown: (_) {
-          if (_showAppBar) setState(() => _showAppBar = false);
-        },
-        child: ColorFiltered(
+      ),
+      body: ColorFiltered(
         colorFilter: _isEinkMode
             ? const ColorFilter.matrix([
                 // Warm sepia — white maps to Kindle cream RGB(0.95, 0.91, 0.83)
@@ -1464,17 +1507,35 @@ class WebViewExampleState extends State<WebViewExample> {
         child: Stack(
           children: [
             WebViewWidget(controller: _controller),
-            // On Android, WebView has no built-in PDF renderer.
             // Overlay a Flutter PdfViewer widget when viewing a PDF in PDF mode.
-            if (Platform.isAndroid && _currentPdfUrl != null && !_isTextView)
+            if (_currentPdfUrl != null && !_isTextView)
               Positioned.fill(
                 child: PdfViewer.uri(
                   Uri.parse(_currentPdfUrl!),
                   controller: _pdfViewerController ??= PdfViewerController(),
                   params: PdfViewerParams(
+                    enableTextSelection: true,
+                    onTextSelectionChange: (selections) {
+                      final text = selections
+                          .map((s) => s.ranges.map((r) =>
+                            s.pageText.fullText.substring(r.start, r.end)
+                          ).join())
+                          .join(' ')
+                          .trim();
+                      _pdfSelectedText = text;
+                    },
                     backgroundColor: Colors.white,
                     calculateInitialZoom: (doc, ctrl, fitZoom, coverZoom) {
                       _pdfFitZoom = fitZoom;
+                      // Restore saved page position for this PDF
+                      if (_currentPdfUrl != null) {
+                        final saved = _scrollPositions[_currentPdfUrl!.split('#').first];
+                        if (saved != null && saved > 1) {
+                          Future.delayed(const Duration(milliseconds: 100), () {
+                            _pdfViewerController?.goToPage(pageNumber: saved.round());
+                          });
+                        }
+                      }
                       return fitZoom * (1.0 + _pdfZoomLevel * 0.25).clamp(0.25, 4.0);
                     },
                     onViewSizeChanged: (viewSize, oldSize, ctrl) {
@@ -1484,6 +1545,14 @@ class WebViewExampleState extends State<WebViewExample> {
                       }
                     },
                   ),
+                ),
+              ),
+            // Transparent overlay to unfocus URL bar when tapping the page
+            if (_urlBarFocused)
+              Positioned.fill(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
                 ),
               ),
             // Find-in-page bar
@@ -1530,7 +1599,6 @@ class WebViewExampleState extends State<WebViewExample> {
                               _findController.clear();
                               _clearFindHighlights();
                             });
-                            _revealAppBar();
                           },
                         ),
                       ],
@@ -1538,21 +1606,8 @@ class WebViewExampleState extends State<WebViewExample> {
                   ),
                 ),
               ),
-            // Invisible strip at the top — swipe down on it to reveal the AppBar.
-            // Sits below the find bar when it's open, otherwise at the very top.
-            Positioned(
-              top: _showFindBar ? 48 : 0, left: 0, right: 0,
-              height: 28,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onVerticalDragUpdate: (details) {
-                  if (details.delta.dy > 2) _revealAppBar();
-                },
-              ),
-            ),
           ],
         ),
-      ),
       ),
     ),
     );
