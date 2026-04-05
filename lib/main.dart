@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:pdfrx/pdfrx.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -33,7 +34,7 @@ class WebViewExample extends StatefulWidget {
   WebViewExampleState createState() => WebViewExampleState();
 }
 
-class WebViewExampleState extends State<WebViewExample> {
+class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObserver {
   late final WebViewController _controller;
   WebViewController? dialogController;
   final TextEditingController _urlController = TextEditingController(text: 'https://google.com');
@@ -77,6 +78,8 @@ class WebViewExampleState extends State<WebViewExample> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    WakelockPlus.disable();
     // Save scroll position of the current page before disposing
     final url = _urlController.text.trim();
     if (url.isNotEmpty) _saveScrollPosition(url);
@@ -87,8 +90,19 @@ class WebViewExampleState extends State<WebViewExample> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      WakelockPlus.enable();
+    } else if (state == AppLifecycleState.paused) {
+      WakelockPlus.disable();
+    }
+  }
+
+  @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    WakelockPlus.enable();
     SharedPreferences.getInstance().then((prefs) {
       final savedUrl = prefs.getString('lastUrl') ?? _urlController.text;
       _urlController.text = savedUrl;
@@ -1118,15 +1132,65 @@ class WebViewExampleState extends State<WebViewExample> {
     }
   }
 
+  /// Strip language-specific suffixes to get a stem for wiktionary search.
+  String _stemWord(String word, String lang) {
+    word = word.toLowerCase().trim();
+    List<String> suffixes;
+    switch (lang) {
+      case 'sv':
+        // Swedish: remove common inflectional suffixes (longest first)
+        suffixes = ['ighet', 'ande', 'arna', 'erna', 'ning', 'het', 'ade', 'ade', 'ing',
+                     'are', 'ast', 'ade', 'ar', 'or', 'er', 'en', 'et', 'na', 'de', 'te',
+                     'ad', 'at', 's', 't', 'a', 'e'];
+        break;
+      case 'es':
+        // Spanish
+        suffixes = ['iones', 'ción', 'ando', 'endo', 'ados', 'idas', 'ado', 'ido',
+                     'aba', 'ían', 'mente', 'es', 'os', 'as', 'an', 'en', 'ó', 's'];
+        break;
+      default:
+        suffixes = ['ing', 'tion', 'ed', 'ly', 'er', 'est', 's'];
+    }
+    for (final s in suffixes) {
+      if (word.endsWith(s) && word.length - s.length >= 2) {
+        return word.substring(0, word.length - s.length);
+      }
+    }
+    return word;
+  }
+
   void _openDialog2WithWebview(String url) {
     final errorNotifier = ValueNotifier<String?>(null);
-    final dialog2Controller = WebViewController()
+    bool hasRedirected = false;
+    late final WebViewController dialog2Controller;
+    dialog2Controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (_) => errorNotifier.value = null,
         onWebResourceError: (error) {
           if (error.isForMainFrame == true) {
             errorNotifier.value = '[${error.errorCode}] ${error.description}\n${error.url ?? ''}';
+          }
+        },
+        onPageFinished: (finishedUrl) {
+          // Detect wiktionary 404: /wiki/{word} page that doesn't exist
+          final uri = Uri.tryParse(finishedUrl);
+          if (!hasRedirected && uri != null
+              && uri.host.endsWith('.wiktionary.org')
+              && uri.path.startsWith('/wiki/')) {
+            // Check if the page has the "no article" indicator
+            dialog2Controller.runJavaScriptReturningResult(
+              'document.querySelector(".noarticletext") !== null'
+            ).then((result) {
+              if (result.toString() == 'true') {
+                hasRedirected = true;
+                final word = Uri.decodeComponent(uri.path.substring('/wiki/'.length));
+                final subdomain = uri.host.split('.').first;
+                final stem = _stemWord(word, _selectedLanguage);
+                final searchUrl = 'https://$subdomain.wiktionary.org/w/index.php?search=${Uri.encodeComponent(stem)}';
+                dialog2Controller.loadRequest(Uri.parse(searchUrl));
+              }
+            }).catchError((_) {});
           }
         },
       ))
