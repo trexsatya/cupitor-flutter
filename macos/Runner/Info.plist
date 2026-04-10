@@ -26,6 +26,10 @@
 	<string>$(PRODUCT_COPYRIGHT)</string>
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Microphone access is needed for voice input to look up words.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Speech recognition is used for voice word lookup.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

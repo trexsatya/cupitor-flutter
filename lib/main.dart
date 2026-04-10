@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:pdfrx/pdfrx.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -55,11 +56,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String _lastStartedUrl = '';
   bool _isEinkMode = true;
   bool _showToolbar = false;
+  bool _showAppBar = true;
   String? _githubToken;
   int _pdfTextFontSize = 15;
   bool _showFindBar = false;
   bool _urlBarFocused = false;
   String _pdfSelectedText = '';
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  bool _isListening = false;
   final TextEditingController _findController = TextEditingController();
   int? _pendingScrollToPage;
   int? _pendingPdfPage;
@@ -78,6 +82,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   @override
   void dispose() {
+    _appBarTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     // Save scroll position of the current page before disposing
@@ -1301,7 +1306,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (dialogController != null) {
       dialogController?.runJavaScript(jsCodeToFilterData(text));
     } else {
-      dialogController ??= WebViewController()
+      dialogController = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..addJavaScriptChannel('GitHubProxy', onMessageReceived: _handleGitHubProxyRequest)
         ..setNavigationDelegate(
@@ -1329,6 +1334,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
     }
 
+    // Always show the dialog (it may have been dismissed previously)
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
     showDialog(
@@ -1359,6 +1365,98 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  String _speechLocale() {
+    switch (_selectedLanguage) {
+      case 'sv': return 'sv-SE';
+      case 'es': return 'es-ES';
+      default: return 'en-US';
+    }
+  }
+
+  Future<void> _toggleVoiceInput() async {
+    if (_isListening) {
+      await _speech.stop();
+      setState(() => _isListening = false);
+      return;
+    }
+    try {
+      String lastWords = '';
+      final available = await _speech.initialize(
+        onStatus: (status) {
+          if (status == 'done' || status == 'notListening') {
+            if (mounted && _isListening) {
+              setState(() => _isListening = false);
+              if (lastWords.isNotEmpty) {
+                _openDialogWithWebview(lastWords);
+                lastWords = '';
+              }
+            }
+          }
+        },
+        onError: (error) {
+          debugPrint('Speech error: $error');
+          if (mounted) {
+            setState(() => _isListening = false);
+            // Fallback to text input if speech fails
+            _showVoiceInputFallback();
+          }
+        },
+      );
+      if (!available) {
+        _showVoiceInputFallback();
+        return;
+      }
+      setState(() => _isListening = true);
+      await _speech.listen(
+        localeId: _speechLocale(),
+        onResult: (result) {
+          lastWords = result.recognizedWords;
+          if (result.finalResult && lastWords.isNotEmpty) {
+            _speech.stop();
+            setState(() => _isListening = false);
+            if (mounted) {
+              _openDialogWithWebview(lastWords);
+              lastWords = '';  // prevent double dispatch from onStatus
+            }
+          }
+        },
+        listenFor: const Duration(seconds: 10),
+      );
+    } catch (e) {
+      debugPrint('Speech init error: $e');
+      if (mounted) setState(() => _isListening = false);
+    }
+  }
+
+  void _showVoiceInputFallback() {
+    final ctrl = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Enter word'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: InputDecoration(hintText: 'Type a word...', border: OutlineInputBorder()),
+          onSubmitted: (text) {
+            Navigator.of(ctx).pop();
+            if (text.trim().isNotEmpty) _openDialogWithWebview(text.trim());
+          },
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: Text('Cancel')),
+          TextButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              if (ctrl.text.trim().isNotEmpty) _openDialogWithWebview(ctrl.text.trim());
+            },
+            child: Text('Look up'),
+          ),
+        ],
       ),
     );
   }
@@ -1404,11 +1502,181 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     );
   }
 
+  Timer? _appBarTimer;
+  DateTime? _lastTapTime;
+
+  void _handleDoubleTapDetection() {
+    final now = DateTime.now();
+    if (_lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 400)) {
+      _lastTapTime = null;
+      if (_showAppBar) {
+        _appBarTimer?.cancel();
+        setState(() => _showAppBar = false);
+      } else {
+        _showAppBarWithTimer();
+      }
+    } else {
+      _lastTapTime = now;
+    }
+  }
+
+  void _showAppBarWithTimer() {
+    setState(() => _showAppBar = true);
+    _appBarTimer?.cancel();
+    if (Platform.isAndroid) {
+      _appBarTimer = Timer(const Duration(seconds: 10), () {
+        if (mounted) setState(() => _showAppBar = false);
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_isControllerReady) {
       return Scaffold(body: Center(child: CircularProgressIndicator()));
     }
+
+    final appBar = AppBar(
+      title: Focus(
+        onFocusChange: (focused) {
+          if (Platform.isAndroid) setState(() => _urlBarFocused = focused);
+          if (focused) { _appBarTimer?.cancel(); }
+        },
+        child: TextField(
+          controller: _urlController,
+          decoration: InputDecoration(
+            hintText: 'Enter URL',
+            border: InputBorder.none,
+            suffixIcon: IconButton(icon: Icon(Icons.arrow_forward), onPressed: () {
+              _loadUrl();
+              FocusManager.instance.primaryFocus?.unfocus();
+            }),
+          ),
+          keyboardType: TextInputType.url,
+          onTap: () => _urlController.selection = TextSelection(baseOffset: 0, extentOffset: _urlController.text.length),
+          onSubmitted: (_) {
+            _loadUrl();
+            FocusManager.instance.primaryFocus?.unfocus();
+          },
+        ),
+      ),
+      actions: _urlBarFocused ? null : [
+        if (_showToolbar) ...([
+          DropdownButton<String>(
+            value: _selectedLanguage,
+            items: _languages.map((lang) => DropdownMenuItem(value: lang, child: Text(lang))).toList(),
+            onChanged: (value) {
+              setState(() {
+                _selectedLanguage = value!;
+                if (dialogController != null) {
+                  dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                }
+              });
+            },
+            underline: SizedBox(),
+            icon: Icon(Icons.language, color: Colors.white),
+            dropdownColor: Colors.white,
+          ),
+          IconButton(
+            icon: Icon(_isEinkMode ? Icons.invert_colors_off : Icons.invert_colors),
+            tooltip: _isEinkMode ? 'Disable E-ink mode' : 'Enable E-ink mode',
+            onPressed: () {
+              setState(() => _isEinkMode = !_isEinkMode);
+              _injectEinkCss();
+            },
+          ),
+          IconButton(
+            icon: Icon(_githubToken != null ? Icons.key : Icons.key_off_outlined),
+            tooltip: 'GitHub token',
+            onPressed: _showTokenDialog,
+          ),
+          if (_currentPdfUrl != null) ...([
+            IconButton(
+              icon: const Icon(Icons.text_decrease),
+              tooltip: _isTextView ? 'Decrease font size' : 'Zoom out',
+              onPressed: () => _changePdfZoom(-1),
+            ),
+            IconButton(
+              icon: const Icon(Icons.text_increase),
+              tooltip: _isTextView ? 'Increase font size' : 'Zoom in',
+              onPressed: () => _changePdfZoom(1),
+            ),
+          ]),
+          IconButton(
+            icon: Icon(_isListening ? Icons.mic : Icons.mic_none),
+            tooltip: _isListening ? 'Stop listening' : 'Voice input',
+            color: _isListening ? Colors.red : null,
+            onPressed: _toggleVoiceInput,
+          ),
+        ]),
+        IconButton(
+          icon: Icon(_showToolbar ? Icons.tune : Icons.tune_outlined),
+          tooltip: _showToolbar ? 'Hide toolbar' : 'Show toolbar',
+          onPressed: () => setState(() => _showToolbar = !_showToolbar),
+        ),
+        if (_currentPdfUrl != null) ...([
+          _isExtractingPdf
+            ? Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: SizedBox(width: 20, height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)),
+              )
+            : IconButton(
+                icon: Icon(_isTextView ? Icons.picture_as_pdf : Icons.text_snippet_outlined),
+                tooltip: _isTextView ? 'Switch to PDF view' : 'Switch to text view',
+                onPressed: _togglePdfTextView,
+              ),
+        ]),
+        IconButton(
+          icon: Icon(_showFindBar ? Icons.search_off : Icons.search),
+          tooltip: _showFindBar ? 'Close find' : 'Find in page',
+          onPressed: () {
+            setState(() {
+              _showFindBar = !_showFindBar;
+              if (!_showFindBar) {
+                _findController.clear();
+                _clearFindHighlights();
+              }
+            });
+          },
+        ),
+        IconButton(
+          icon: Icon(Icons.bookmarks_outlined),
+          onPressed: _showBookmarks,
+          tooltip: 'Bookmarks',
+        ),
+        IconButton(
+          icon: Icon(Icons.open_in_new),
+          onPressed: () async {
+            String text = '';
+            if (_currentPdfUrl != null && !_isTextView
+                && _pdfSelectedText.isNotEmpty) {
+              text = _pdfSelectedText;
+            } else {
+              const js = '''
+                (function getSelFromWindow(w) {
+                  try {
+                    const s = w.getSelection().toString().trim();
+                    if (s) return s;
+                    for (let i = 0; i < w.frames.length; i++) {
+                      const found = getSelFromWindow(w.frames[i]);
+                      if (found) return found;
+                    }
+                  } catch(e) {}
+                  return '';
+                })(window);
+              ''';
+              try {
+                final result = await _controller.runJavaScriptReturningResult(js);
+                text = result.toString().replaceAll('"', '');
+              } catch (_) {}
+            }
+            _openDialogWithWebview(text);
+          },
+        ),
+      ],
+    );
+
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, result) async {
@@ -1418,197 +1686,74 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         }
       },
       child: Scaffold(
-      appBar: AppBar(
-        title: Focus(
-          onFocusChange: (focused) {
-            if (Platform.isAndroid) setState(() => _urlBarFocused = focused);
-          },
-          child: TextField(
-            controller: _urlController,
-            decoration: InputDecoration(
-              hintText: 'Enter URL',
-              border: InputBorder.none,
-              suffixIcon: IconButton(icon: Icon(Icons.arrow_forward), onPressed: () {
-                _loadUrl();
-                FocusManager.instance.primaryFocus?.unfocus();
-              }),
-            ),
-            keyboardType: TextInputType.url,
-            onTap: () => _urlController.selection = TextSelection(baseOffset: 0, extentOffset: _urlController.text.length),
-            onSubmitted: (_) {
-              _loadUrl();
-              FocusManager.instance.primaryFocus?.unfocus();
-            },
-          ),
-        ),
-        actions: _urlBarFocused ? null : [
-          if (_showToolbar) ...([
-            DropdownButton<String>(
-              value: _selectedLanguage,
-              items: _languages.map((lang) => DropdownMenuItem(value: lang, child: Text(lang))).toList(),
-              onChanged: (value) {
-                setState(() {
-                  _selectedLanguage = value!;
-                  if (dialogController != null) {
-                    dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
-                  }
-                });
-              },
-              underline: SizedBox(),
-              icon: Icon(Icons.language, color: Colors.white),
-              dropdownColor: Colors.white,
-            ),
-            IconButton(
-              icon: Icon(_isEinkMode ? Icons.invert_colors_off : Icons.invert_colors),
-              tooltip: _isEinkMode ? 'Disable E-ink mode' : 'Enable E-ink mode',
-              onPressed: () {
-                setState(() => _isEinkMode = !_isEinkMode);
-                _injectEinkCss();
-              },
-            ),
-            IconButton(
-              icon: Icon(_githubToken != null ? Icons.key : Icons.key_off_outlined),
-              tooltip: 'GitHub token',
-              onPressed: _showTokenDialog,
-            ),
-            if (_currentPdfUrl != null) ...([  // font/zoom controls
-              IconButton(
-                icon: const Icon(Icons.text_decrease),
-                tooltip: _isTextView ? 'Decrease font size' : 'Zoom out',
-                onPressed: () => _changePdfZoom(-1),
-              ),
-              IconButton(
-                icon: const Icon(Icons.text_increase),
-                tooltip: _isTextView ? 'Increase font size' : 'Zoom in',
-                onPressed: () => _changePdfZoom(1),
-              ),
-            ]),
-          ]),
-          IconButton(
-            icon: Icon(_showToolbar ? Icons.tune : Icons.tune_outlined),
-            tooltip: _showToolbar ? 'Hide toolbar' : 'Show toolbar',
-            onPressed: () => setState(() => _showToolbar = !_showToolbar),
-          ),
-          if (_currentPdfUrl != null) ...([  // text view toggle always visible
-            _isExtractingPdf
-              ? Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: SizedBox(width: 20, height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)),
-                )
-              : IconButton(
-                  icon: Icon(_isTextView ? Icons.picture_as_pdf : Icons.text_snippet_outlined),
-                  tooltip: _isTextView ? 'Switch to PDF view' : 'Switch to text view',
-                  onPressed: _togglePdfTextView,
-                ),
-          ]),
-          IconButton(
-            icon: Icon(_showFindBar ? Icons.search_off : Icons.search),
-            tooltip: _showFindBar ? 'Close find' : 'Find in page',
-            onPressed: () {
-              setState(() {
-                _showFindBar = !_showFindBar;
-                if (!_showFindBar) {
-                  _findController.clear();
-                  _clearFindHighlights();
-                }
-              });
-            },
-          ),
-          IconButton(
-            icon: Icon(Icons.bookmarks_outlined),
-            onPressed: _showBookmarks,
-            tooltip: 'Bookmarks',
-          ),
-          IconButton(
-            icon: Icon(Icons.open_in_new),
-            onPressed: () async {
-              String text = '';
-              if (_currentPdfUrl != null && !_isTextView
-                  && _pdfSelectedText.isNotEmpty) {
-                // PDF view: get selection from PdfViewer widget
-                text = _pdfSelectedText;
-              } else {
-                const js = '''
-                  (function getSelFromWindow(w) {
-                    try {
-                      const s = w.getSelection().toString().trim();
-                      if (s) return s;
-                      for (let i = 0; i < w.frames.length; i++) {
-                        const found = getSelFromWindow(w.frames[i]);
-                        if (found) return found;
-                      }
-                    } catch(e) {}
-                    return '';
-                  })(window);
-                ''';
-                try {
-                  final result = await _controller.runJavaScriptReturningResult(js);
-                  text = result.toString().replaceAll('"', '');
-                } catch (_) {}
-              }
-              _openDialogWithWebview(text);
-            },
-          ),
-        ],
-      ),
-      body: ColorFiltered(
-        colorFilter: _isEinkMode
-            ? const ColorFilter.matrix([
-                // Warm sepia — white maps to Kindle cream RGB(0.95, 0.91, 0.83)
-                // Uses luminance weights tinted across warm-shifted rows.
-                0.1913, 0.6437, 0.0650, 0, 0.05,  // R: warm boost
-                0.1850, 0.6222, 0.0628, 0, 0.04,  // G: neutral-warm
-                0.1722, 0.5793, 0.0585, 0, 0.02,  // B: blue reduced
-                0,      0,      0,      1, 0,
-              ])
-            : const ColorFilter.matrix([
-                1, 0, 0, 0, 0,
-                0, 1, 0, 0, 0,
-                0, 0, 1, 0, 0,
-                0, 0, 0, 1, 0,
-              ]),
-        child: Stack(
+        body: Stack(
           children: [
-            WebViewWidget(controller: _controller),
-            // Overlay a Flutter PdfViewer widget when viewing a PDF in PDF mode.
-            if (_currentPdfUrl != null && !_isTextView)
+            // Main content — fills entire screen
+            ColorFiltered(
+              colorFilter: _isEinkMode
+                  ? const ColorFilter.matrix([
+                      0.1913, 0.6437, 0.0650, 0, 0.05,
+                      0.1850, 0.6222, 0.0628, 0, 0.04,
+                      0.1722, 0.5793, 0.0585, 0, 0.02,
+                      0,      0,      0,      1, 0,
+                    ])
+                  : const ColorFilter.matrix([
+                      1, 0, 0, 0, 0,
+                      0, 1, 0, 0, 0,
+                      0, 0, 1, 0, 0,
+                      0, 0, 0, 1, 0,
+                    ]),
+              child: Stack(
+                children: [
+                  WebViewWidget(controller: _controller),
+                  if (_currentPdfUrl != null && !_isTextView)
+                    Positioned.fill(
+                      child: PdfViewer.uri(
+                        Uri.parse(_currentPdfUrl!),
+                        controller: _pdfViewerController ??= PdfViewerController(),
+                        params: PdfViewerParams(
+                          enableTextSelection: true,
+                          onTextSelectionChange: (selections) {
+                            final text = selections
+                                .map((s) => s.ranges.map((r) =>
+                                  s.pageText.fullText.substring(r.start, r.end)
+                                ).join())
+                                .join(' ')
+                                .trim();
+                            _pdfSelectedText = text;
+                            if (text.isNotEmpty) _showAppBarWithTimer();
+                          },
+                          backgroundColor: Colors.white,
+                          calculateInitialZoom: (doc, ctrl, fitZoom, coverZoom) {
+                            _pdfFitZoom = fitZoom;
+                            if (_currentPdfUrl != null) {
+                              final saved = _scrollPositions[_currentPdfUrl!.split('#').first];
+                              if (saved != null && saved > 1) {
+                                Future.delayed(const Duration(milliseconds: 100), () {
+                                  _pdfViewerController?.goToPage(pageNumber: saved.round());
+                                });
+                              }
+                            }
+                            return fitZoom * (1.0 + _pdfZoomLevel * 0.25).clamp(0.25, 4.0);
+                          },
+                          onViewSizeChanged: (viewSize, oldSize, ctrl) {
+                            if (_pdfFitZoom > 0) {
+                              WidgetsBinding.instance.addPostFrameCallback(
+                                  (_) { if (mounted) _applyPdfZoom(); });
+                            }
+                          },
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            // Double-tap detector (Android only — macOS keeps app bar always visible)
+            if (Platform.isAndroid)
               Positioned.fill(
-                child: PdfViewer.uri(
-                  Uri.parse(_currentPdfUrl!),
-                  controller: _pdfViewerController ??= PdfViewerController(),
-                  params: PdfViewerParams(
-                    enableTextSelection: true,
-                    onTextSelectionChange: (selections) {
-                      final text = selections
-                          .map((s) => s.ranges.map((r) =>
-                            s.pageText.fullText.substring(r.start, r.end)
-                          ).join())
-                          .join(' ')
-                          .trim();
-                      _pdfSelectedText = text;
-                    },
-                    backgroundColor: Colors.white,
-                    calculateInitialZoom: (doc, ctrl, fitZoom, coverZoom) {
-                      _pdfFitZoom = fitZoom;
-                      // Restore saved page position for this PDF
-                      if (_currentPdfUrl != null) {
-                        final saved = _scrollPositions[_currentPdfUrl!.split('#').first];
-                        if (saved != null && saved > 1) {
-                          Future.delayed(const Duration(milliseconds: 100), () {
-                            _pdfViewerController?.goToPage(pageNumber: saved.round());
-                          });
-                        }
-                      }
-                      return fitZoom * (1.0 + _pdfZoomLevel * 0.25).clamp(0.25, 4.0);
-                    },
-                    onViewSizeChanged: (viewSize, oldSize, ctrl) {
-                      if (_pdfFitZoom > 0) {
-                        WidgetsBinding.instance.addPostFrameCallback(
-                            (_) { if (mounted) _applyPdfZoom(); });
-                      }
-                    },
-                  ),
+                child: Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerDown: (_) => _handleDoubleTapDetection(),
                 ),
               ),
             // Transparent overlay to unfocus URL bar when tapping the page
@@ -1619,10 +1764,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
                 ),
               ),
+            // App bar overlay — always visible on macOS, toggled on Android
+            if (_showAppBar || !Platform.isAndroid)
+              Positioned(
+                top: 0, left: 0, right: 0,
+                child: SafeArea(
+                  bottom: false,
+                  child: appBar,
+                ),
+              ),
             // Find-in-page bar
             if (_showFindBar)
               Positioned(
-                top: 0, left: 0, right: 0,
+                top: _showAppBar ? kToolbarHeight + MediaQuery.of(context).padding.top : 0,
+                left: 0, right: 0,
                 child: Material(
                   elevation: 4,
                   child: Container(
@@ -1673,7 +1828,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           ],
         ),
       ),
-    ),
     );
   }
 }
