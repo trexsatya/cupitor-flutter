@@ -233,6 +233,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _injectJs();
               _injectRemoteSnippet();
               _injectAdBlocker();
+              _injectYouTubeAdBlocker();
               _injectSpaHook();
               _injectEinkCss();
               // Detect PDF by content-type (handles non-.pdf URLs like download links)
@@ -847,6 +848,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _injectJs();
     _injectRemoteSnippet();
     _injectAdBlocker();
+    _injectYouTubeAdBlocker();
     _injectPdfDetector();
   }
 
@@ -945,6 +947,65 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         _controller.runJavaScript(_cachedRemoteSnippet!);
       }
     });
+  }
+
+  void _injectYouTubeAdBlocker() {
+    const js = r'''
+      (function() {
+        if (!location.hostname.includes('youtube.com')) return;
+        if (window._ytAdBlockerInjected) return;
+        window._ytAdBlockerInjected = true;
+
+        // Hide overlay and banner ad elements
+        const style = document.createElement('style');
+        style.textContent = `
+          .ytp-ad-overlay-container,
+          .ytp-ad-player-overlay,
+          .ytp-ad-player-overlay-instream-info,
+          .ytp-ad-image-overlay,
+          .ytp-ad-text-overlay,
+          .ytp-ad-module,
+          .ytp-ad-action-interstitial,
+          ytd-action-companion-ad-renderer,
+          ytd-display-ad-renderer,
+          ytd-video-masthead-ad-renderer,
+          ytd-promoted-sparkles-web-renderer,
+          ytd-banner-promo-renderer,
+          ytd-ad-slot-renderer,
+          yt-mealbar-promo-renderer,
+          #masthead-ad,
+          #player-ads { display: none !important; }
+        `;
+        document.head.appendChild(style);
+
+        function skipAd() {
+          // Click skip button if visible
+          const skipBtn = document.querySelector(
+            '.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-slot button'
+          );
+          if (skipBtn) { skipBtn.click(); return; }
+
+          // Fast-forward through unskippable video ads
+          const player = document.querySelector('.html5-video-player');
+          if (player && player.classList.contains('ad-showing')) {
+            const video = document.querySelector('video');
+            if (video && video.duration && !isNaN(video.duration) && video.duration > 0) {
+              video.currentTime = video.duration;
+            }
+          }
+        }
+
+        // Poll every 300 ms for skip button / ad state
+        setInterval(skipAd, 300);
+
+        // Also react immediately to DOM mutations (e.g. skip button appearing)
+        new MutationObserver(skipAd).observe(document.body, {
+          childList: true, subtree: true,
+          attributes: true, attributeFilter: ['class']
+        });
+      })();
+    ''';
+    _controller.runJavaScript(js);
   }
 
   Future<void> _injectAdBlocker() async {
@@ -1303,6 +1364,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   void _openDialogWithWebview(String text) {
     _currentDialogText = text;
+    if (text.isNotEmpty) Clipboard.setData(ClipboardData(text: text));
     if (dialogController != null) {
       dialogController?.runJavaScript(jsCodeToFilterData(text));
     } else {
