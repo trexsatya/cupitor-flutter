@@ -82,6 +82,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   static const _adBlockChannel = MethodChannel('cupitor/adblock');
   // Hosts auto-detected by the native ad-blocker that haven't been confirmed yet.
   final List<String> _detectedAdHosts = [];
+  bool _adBlockEnabled = true;
 
   @override
   void dispose() {
@@ -1020,13 +1021,21 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     } catch (_) { return false; }
   }
 
-  /// Returns the full current ad-host list (built-in + custom).
+  /// Returns only custom (user-added + auto-detected) ad hosts.
   Future<List<String>> getAdHosts() async {
     if (!Platform.isAndroid) return [];
     try {
-      final list = await _adBlockChannel.invokeMethod<List>('getHosts');
+      final list = await _adBlockChannel.invokeMethod<List>('getCustomHosts');
       return list?.cast<String>() ?? [];
     } catch (_) { return []; }
+  }
+
+  Future<void> setAdBlockEnabled(bool enabled) async {
+    if (!Platform.isAndroid) return;
+    setState(() => _adBlockEnabled = enabled);
+    try {
+      await _adBlockChannel.invokeMethod<void>('setEnabled', {'enabled': enabled});
+    } catch (_) {}
   }
 
   void _injectYouTubeAdBlocker([WebViewController? ctrl]) {
@@ -1397,25 +1406,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   void _showAdHosts() {
+    List<String> hosts = [];
+    bool loading = true;
+    bool initDone = false;
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setModalState) {
-          List<String> hosts = [];
-          bool loaded = false;
-
           Future<void> loadHosts() async {
             final list = await getAdHosts();
             setModalState(() {
               hosts = list;
-              loaded = true;
+              loading = false;
             });
           }
 
-          if (!loaded) {
-            // Trigger load after first frame
-            WidgetsBinding.instance.addPostFrameCallback((_) => loadHosts());
+          if (!initDone) {
+            initDone = true;
+            loadHosts();
           }
 
           return DraggableScrollableSheet(
@@ -1433,6 +1443,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       SizedBox(width: 8),
                       Text('Ad Hosts', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                       Spacer(),
+                      Switch(
+                        value: _adBlockEnabled,
+                        onChanged: (val) async {
+                          await setAdBlockEnabled(val);
+                          setModalState(() {});
+                        },
+                      ),
                       IconButton(
                         icon: Icon(Icons.add_circle_outline),
                         tooltip: 'Add host',
@@ -1486,7 +1503,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 ),
                 const Divider(height: 1),
                 Expanded(
-                  child: !loaded
+                  child: loading
                       ? Center(child: CircularProgressIndicator())
                       : hosts.isEmpty
                           ? Center(child: Text('No ad hosts configured'))

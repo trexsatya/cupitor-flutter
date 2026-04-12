@@ -111,6 +111,9 @@ class MainActivity : FlutterActivity() {
     // Channel reference kept so AdBlockWebViewClient can send auto-detected events back to Dart.
     private var adBlockChannel: MethodChannel? = null
 
+    // Whether network-level ad blocking is active (toggled from Dart).
+    @Volatile var adBlockEnabled = true
+
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
         loadCustomHosts()
@@ -155,6 +158,12 @@ class MainActivity : FlutterActivity() {
                     result.success(removed)
                 }
                 "getHosts" -> result.success(adHosts.toList())
+                "getCustomHosts" -> result.success((adHosts - BUILTIN_AD_HOSTS).toList())
+                "setEnabled" -> {
+                    val enabled = call.argument<Boolean>("enabled") ?: true
+                    adBlockEnabled = enabled
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         }
@@ -301,6 +310,7 @@ class MainActivity : FlutterActivity() {
             view: WebView,
             request: WebResourceRequest
         ): WebResourceResponse? {
+            if (!adBlockEnabled) return delegate.shouldInterceptRequest(view, request)
             val urlStr = request.url.toString()
             if (isAdHost(urlStr)) return emptyResponse()
 
