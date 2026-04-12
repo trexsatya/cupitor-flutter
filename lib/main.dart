@@ -79,12 +79,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // (e.g. application/pdf). First call = normal navigation; second call = download trigger.
   final Set<String> _androidPendingUrls = {};
   final ValueNotifier<String?> _dialogErrorNotifier = ValueNotifier(null);
+  static const _adBlockChannel = MethodChannel('cupitor/adblock');
+  // Hosts auto-detected by the native ad-blocker that haven't been confirmed yet.
+  final List<String> _detectedAdHosts = [];
 
   @override
   void dispose() {
     _appBarTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
+    _adBlockChannel.setMethodCallHandler(null); // stop receiving callbacks
     // Save scroll position of the current page before disposing
     final url = _urlController.text.trim();
     if (url.isNotEmpty) _saveScrollPosition(url);
@@ -108,6 +112,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     WakelockPlus.enable();
+    // Listen for auto-detected ad hosts coming from the native layer
+    if (Platform.isAndroid) {
+      _adBlockChannel.setMethodCallHandler((call) async {
+        if (call.method == 'onHostDetected') {
+          final host = call.arguments['host'] as String?;
+          if (host != null && mounted) _showDetectedAdHostBanner(host);
+        }
+      });
+    }
     SharedPreferences.getInstance().then((prefs) {
       final savedUrl = prefs.getString('lastUrl') ?? _urlController.text;
       _urlController.text = savedUrl;
@@ -127,6 +140,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) => _openDialogWithWebview(msg.message.toString().replaceAll('"', '')))
         ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
+        ..addJavaScriptChannel('AdHostDetector', onMessageReceived: (msg) => _onJsAdHostDetected(msg.message))
         ..setNavigationDelegate(
           NavigationDelegate(
             onNavigationRequest: (request) async {
@@ -230,6 +244,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 return;
               }
               _pendingPdfPage = null; // clear after PDF loads
+              if (Platform.isAndroid) _attachAndroidAdBlocker();
               _injectJs();
               _injectRemoteSnippet();
               _injectAdBlocker();
@@ -949,14 +964,79 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     });
   }
 
-  void _injectYouTubeAdBlocker() {
+  /// Attaches the native Android ad-blocking WebViewClient via a platform
+  /// channel. Safe to call on every page load — the Kotlin side is idempotent.
+  /// Called when JS detects a 3rd-party host contacted during a confirmed ad.
+  void _onJsAdHostDetected(String host) {
+    if (!mounted) return;
+    _showDetectedAdHostBanner(host);
+  }
+
+  void _attachAndroidAdBlocker() {
+    _adBlockChannel.invokeMethod<void>('attach').catchError((_) {});
+  }
+
+  /// Shows a persistent SnackBar when the native layer auto-detects a new ad host.
+  /// The user can tap "Block" to confirm adding it, or "Dismiss" to ignore.
+  void _showDetectedAdHostBanner(String host) {
+    if (_detectedAdHosts.contains(host)) return; // already shown
+    _detectedAdHosts.add(host);
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.showSnackBar(
+      SnackBar(
+        duration: const Duration(seconds: 12),
+        content: Text('New ad host detected: $host'),
+        action: SnackBarAction(
+          label: 'Block it',
+          onPressed: () {
+            addAdHost(host);
+            messenger.showSnackBar(
+              SnackBar(
+                content: Text('$host added to blocklist'),
+                duration: const Duration(seconds: 2),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  /// Adds [host] to the runtime ad-host list and persists it.
+  Future<bool> addAdHost(String host) async {
+    if (!Platform.isAndroid) return false;
+    try {
+      final added = await _adBlockChannel.invokeMethod<bool>('addHost', {'host': host});
+      return added ?? false;
+    } catch (_) { return false; }
+  }
+
+  /// Removes [host] from the runtime ad-host list and persists the change.
+  Future<bool> removeAdHost(String host) async {
+    if (!Platform.isAndroid) return false;
+    try {
+      final removed = await _adBlockChannel.invokeMethod<bool>('removeHost', {'host': host});
+      return removed ?? false;
+    } catch (_) { return false; }
+  }
+
+  /// Returns the full current ad-host list (built-in + custom).
+  Future<List<String>> getAdHosts() async {
+    if (!Platform.isAndroid) return [];
+    try {
+      final list = await _adBlockChannel.invokeMethod<List>('getHosts');
+      return list?.cast<String>() ?? [];
+    } catch (_) { return []; }
+  }
+
+  void _injectYouTubeAdBlocker([WebViewController? ctrl]) {
     const js = r'''
       (function() {
         if (!location.hostname.includes('youtube.com')) return;
         if (window._ytAdBlockerInjected) return;
         window._ytAdBlockerInjected = true;
 
-        // Hide overlay and banner ad elements
+        // --- 1. Hide overlay / banner ad elements ---
         const style = document.createElement('style');
         style.textContent = `
           .ytp-ad-overlay-container,
@@ -966,6 +1046,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           .ytp-ad-text-overlay,
           .ytp-ad-module,
           .ytp-ad-action-interstitial,
+          .ytp-ad-skip-button-slot,
           ytd-action-companion-ad-renderer,
           ytd-display-ad-renderer,
           ytd-video-masthead-ad-renderer,
@@ -978,37 +1059,132 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         `;
         document.head.appendChild(style);
 
+        // --- 2. Core skip logic ---
         function skipAd() {
-          // Click skip button if visible
+          // Click any visible skip / close button
           const skipBtn = document.querySelector(
-            '.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-slot button'
+            '.ytp-skip-ad-button, .ytp-ad-skip-button, ' +
+            '.ytp-ad-skip-button-slot button, .ytp-ad-overlay-close-button'
           );
           if (skipBtn) { skipBtn.click(); return; }
 
-          // Fast-forward through unskippable video ads
+          // Fast-forward through non-skippable video ads
           const player = document.querySelector('.html5-video-player');
           if (player && player.classList.contains('ad-showing')) {
             const video = document.querySelector('video');
-            if (video && video.duration && !isNaN(video.duration) && video.duration > 0) {
+            if (video && isFinite(video.duration) && video.duration > 0) {
+              // Mute first so fast-forward doesn't blast audio
+              video.muted = true;
               video.currentTime = video.duration;
             }
           }
         }
 
-        // Poll every 300 ms for skip button / ad state
-        setInterval(skipAd, 300);
+        // --- 3. Immediate skip on video timeupdate (fires every ~250 ms or less) ---
+        function attachVideoListener() {
+          const video = document.querySelector('video');
+          if (!video || video._ytAdListenerAttached) return;
+          video._ytAdListenerAttached = true;
+          video.addEventListener('timeupdate', () => {
+            const player = document.querySelector('.html5-video-player');
+            if (player && player.classList.contains('ad-showing')) skipAd();
+          });
+        }
+        attachVideoListener();
 
-        // Also react immediately to DOM mutations (e.g. skip button appearing)
-        new MutationObserver(skipAd).observe(document.body, {
+        // --- 4. MutationObserver: fires the instant Skip button or ad-showing class appears ---
+        new MutationObserver((mutations) => {
+          for (const m of mutations) {
+            // Check for ad-showing class toggle on player
+            if (m.type === 'attributes' && m.attributeName === 'class') {
+              const el = m.target;
+              if (el.classList && el.classList.contains('ad-showing')) { skipAd(); return; }
+            }
+            // Check for skip-button node being added
+            if (m.type === 'childList') {
+              for (const node of m.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                if (node.matches && (
+                  node.matches('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-slot')
+                  || node.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button')
+                )) { skipAd(); return; }
+              }
+              // New video element added (e.g. after navigation)
+              attachVideoListener();
+            }
+          }
+        }).observe(document.documentElement, {
           childList: true, subtree: true,
           attributes: true, attributeFilter: ['class']
         });
+
+        // --- 5. Block YouTube's own ad-reporting and ad-stats endpoints ---
+        // This prevents the ad system receiving confirmation that the ad was viewed,
+        // which reduces the likelihood of a forced re-play.
+        const YT_AD_PATHS = [
+          '/api/stats/ads',
+          '/api/stats/qoe',
+          '/pagead/',
+          '/ptracking',
+          '/youtubei/v1/log_event',
+        ];
+        function isYtAdUrl(url) {
+          try {
+            const u = new URL(url, location.href);
+            if (!u.hostname.includes('youtube.com') &&
+                !u.hostname.includes('googlevideo.com')) return false;
+            return YT_AD_PATHS.some(p => u.pathname.startsWith(p));
+          } catch(_) { return false; }
+        }
+        // --- 5. Behavioral ad-host recorder ---
+        // When ad-showing is active, every 3rd-party hostname contacted is
+        // a confirmed ad-network host — detected by causality, not by name.
+        // We report each new one to Flutter via the AdHostDetector JS channel.
+        const _reportedHosts = new Set();
+        function isAdShowing() {
+          const p = document.querySelector('.html5-video-player');
+          return p && p.classList.contains('ad-showing');
+        }
+        function reportAdHost(url) {
+          if (!isAdShowing()) return;
+          try {
+            const host = new URL(url, location.href).hostname;
+            if (!host || host === location.hostname) return; // same-origin: skip
+            const key = host.split('.').slice(-2).join('.'); // registrable host
+            if (_reportedHosts.has(key)) return;
+            _reportedHosts.add(key);
+            if (typeof AdHostDetector !== 'undefined') AdHostDetector.postMessage(key);
+          } catch(_) {}
+        }
+        // Wrap fetch
+        const _origFetch2 = window.fetch;
+        window.fetch = function(input, init) {
+          const url = typeof input === 'string' ? input : (input && input.url) || '';
+          reportAdHost(url);
+          if (isYtAdUrl(url)) return Promise.resolve(new Response('{}', {status:200, headers:{'content-type':'application/json'}}));
+          return _origFetch2.apply(this, arguments);
+        };
+        // Wrap XHR
+        const _origOpen2 = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+          reportAdHost(url);
+          if (isYtAdUrl(url)) { this._ytAdBlocked = true; }
+          return _origOpen2.call(this, method, url, ...rest);
+        };
+        const _origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.send = function(body) {
+          if (this._ytAdBlocked) return;
+          return _origSend.call(this, body);
+        };
+
+        // Fallback poll — catches any edge case the observer misses
+        setInterval(skipAd, 500);
       })();
     ''';
-    _controller.runJavaScript(js);
+    (ctrl ?? _controller).runJavaScript(js);
   }
 
-  Future<void> _injectAdBlocker() async {
+  Future<void> _injectAdBlocker([WebViewController? ctrl]) async {
     const css = '''
       (function() {
         if (window._adBlockerInjected) return;
@@ -1075,7 +1251,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         };
       })();
     ''';
-    _controller.runJavaScript(css);
+    (ctrl ?? _controller).runJavaScript(css);
   }
 
   String _normalizeUrl(String input) {
@@ -1109,8 +1285,241 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     await prefs.setStringList('bookmarks', _bookmarks);
   }
 
-  void _showBookmarks() {
+  void _showToolsDrawer() {
     showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setModalState) => DraggableScrollableSheet(
+          initialChildSize: 0.5,
+          minChildSize: 0.3,
+          maxChildSize: 0.9,
+          expand: false,
+          builder: (_, scrollController) => Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(
+                  children: [
+                    Text('Tools', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    Spacer(),
+                    IconButton(
+                      icon: Icon(Icons.close),
+                      onPressed: () => Navigator.of(ctx).pop(),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: ListView(
+                  controller: scrollController,
+                  children: [
+                    SwitchListTile(
+                      secondary: Icon(_isEinkMode ? Icons.invert_colors_off : Icons.invert_colors),
+                      title: Text('E-ink mode'),
+                      subtitle: Text('High-contrast reading'),
+                      value: _isEinkMode,
+                      onChanged: (val) {
+                        setState(() => _isEinkMode = val);
+                        setModalState(() {});
+                        _injectEinkCss();
+                      },
+                    ),
+                    ListTile(
+                      leading: Icon(Icons.language),
+                      title: Text('Language'),
+                      trailing: DropdownButton<String>(
+                        value: _selectedLanguage,
+                        items: _languages
+                            .map((l) => DropdownMenuItem(value: l, child: Text(l)))
+                            .toList(),
+                        onChanged: (val) {
+                          setState(() {
+                            _selectedLanguage = val!;
+                            if (dialogController != null) {
+                              dialogController?.loadRequest(
+                                  Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                            }
+                          });
+                          setModalState(() {});
+                        },
+                        underline: SizedBox(),
+                      ),
+                    ),
+                    ListTile(
+                      leading: Icon(_githubToken != null ? Icons.key : Icons.key_off_outlined),
+                      title: Text('GitHub token'),
+                      subtitle: Text(_githubToken != null ? 'Token set' : 'Not configured'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showTokenDialog();
+                      },
+                    ),
+                    ListTile(
+                      leading: Icon(_isListening ? Icons.mic : Icons.mic_none,
+                          color: _isListening ? Colors.red : null),
+                      title: Text(_isListening ? 'Stop listening' : 'Voice input'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _toggleVoiceInput();
+                      },
+                    ),
+                    if (_currentPdfUrl != null) ...[
+                      ListTile(
+                        leading: Icon(Icons.text_decrease),
+                        title: Text('Zoom out'),
+                        onTap: () => _changePdfZoom(-1),
+                      ),
+                      ListTile(
+                        leading: Icon(Icons.text_increase),
+                        title: Text('Zoom in'),
+                        onTap: () => _changePdfZoom(1),
+                      ),
+                    ],
+                    ListTile(
+                      leading: Icon(Icons.security_outlined),
+                      title: Text('Ad hosts'),
+                      subtitle: Text('Manage blocked ad hosts'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showAdHosts();
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showAdHosts() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setModalState) {
+          List<String> hosts = [];
+          bool loaded = false;
+
+          Future<void> loadHosts() async {
+            final list = await getAdHosts();
+            setModalState(() {
+              hosts = list;
+              loaded = true;
+            });
+          }
+
+          if (!loaded) {
+            // Trigger load after first frame
+            WidgetsBinding.instance.addPostFrameCallback((_) => loadHosts());
+          }
+
+          return DraggableScrollableSheet(
+            initialChildSize: 0.6,
+            minChildSize: 0.3,
+            maxChildSize: 0.9,
+            expand: false,
+            builder: (_, scrollController) => Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  child: Row(
+                    children: [
+                      Icon(Icons.security_outlined),
+                      SizedBox(width: 8),
+                      Text('Ad Hosts', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                      Spacer(),
+                      IconButton(
+                        icon: Icon(Icons.add_circle_outline),
+                        tooltip: 'Add host',
+                        onPressed: () {
+                          final ctrl = TextEditingController();
+                          showDialog(
+                            context: ctx,
+                            builder: (dlgCtx) => AlertDialog(
+                              title: Text('Add ad host'),
+                              content: TextField(
+                                controller: ctrl,
+                                autofocus: true,
+                                decoration: InputDecoration(
+                                  hintText: 'e.g. ads.example.com',
+                                  border: OutlineInputBorder(),
+                                ),
+                                onSubmitted: (_) async {
+                                  final h = ctrl.text.trim().toLowerCase();
+                                  if (h.isEmpty) return;
+                                  Navigator.of(dlgCtx).pop();
+                                  await addAdHost(h);
+                                  loadHosts();
+                                },
+                              ),
+                              actions: [
+                                TextButton(
+                                  onPressed: () => Navigator.of(dlgCtx).pop(),
+                                  child: Text('Cancel'),
+                                ),
+                                TextButton(
+                                  onPressed: () async {
+                                    final h = ctrl.text.trim().toLowerCase();
+                                    if (h.isEmpty) return;
+                                    Navigator.of(dlgCtx).pop();
+                                    await addAdHost(h);
+                                    loadHosts();
+                                  },
+                                  child: Text('Add'),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                      IconButton(
+                        icon: Icon(Icons.close),
+                        onPressed: () => Navigator.of(ctx).pop(),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 1),
+                Expanded(
+                  child: !loaded
+                      ? Center(child: CircularProgressIndicator())
+                      : hosts.isEmpty
+                          ? Center(child: Text('No ad hosts configured'))
+                          : ListView.builder(
+                              controller: scrollController,
+                              itemCount: hosts.length,
+                              itemBuilder: (_, i) {
+                                final host = hosts[i];
+                                return ListTile(
+                                  leading: Icon(Icons.block, size: 20),
+                                  title: Text(host,
+                                      style: TextStyle(fontFamily: 'monospace', fontSize: 13)),
+                                  trailing: IconButton(
+                                    icon: Icon(Icons.delete_outline),
+                                    tooltip: 'Remove',
+                                    onPressed: () async {
+                                      await removeAdHost(host);
+                                      loadHosts();
+                                    },
+                                  ),
+                                );
+                              },
+                            ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showBookmarks() {    showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
@@ -1239,6 +1648,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           }
         },
         onPageFinished: (finishedUrl) {
+          _injectAdBlocker(dialog2Controller);
+          _injectYouTubeAdBlocker(dialog2Controller);
           // Detect wiktionary 404: /wiki/{word} page that doesn't exist
           final uri = Uri.tryParse(finishedUrl);
           if (!hasRedirected && uri != null
@@ -1389,6 +1800,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               return NavigationDecision.navigate;
             },
             onPageFinished: (url) {
+              _injectAdBlocker(dialogController);
+              _injectYouTubeAdBlocker(dialogController);
               dialogController?.runJavaScript(jsCodeToFilterData(_currentDialogText));
             },
           ),
@@ -1623,58 +2036,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ),
       ),
       actions: _urlBarFocused ? null : [
-        if (_showToolbar) ...([
-          DropdownButton<String>(
-            value: _selectedLanguage,
-            items: _languages.map((lang) => DropdownMenuItem(value: lang, child: Text(lang))).toList(),
-            onChanged: (value) {
-              setState(() {
-                _selectedLanguage = value!;
-                if (dialogController != null) {
-                  dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
-                }
-              });
-            },
-            underline: SizedBox(),
-            icon: Icon(Icons.language, color: Colors.white),
-            dropdownColor: Colors.white,
-          ),
-          IconButton(
-            icon: Icon(_isEinkMode ? Icons.invert_colors_off : Icons.invert_colors),
-            tooltip: _isEinkMode ? 'Disable E-ink mode' : 'Enable E-ink mode',
-            onPressed: () {
-              setState(() => _isEinkMode = !_isEinkMode);
-              _injectEinkCss();
-            },
-          ),
-          IconButton(
-            icon: Icon(_githubToken != null ? Icons.key : Icons.key_off_outlined),
-            tooltip: 'GitHub token',
-            onPressed: _showTokenDialog,
-          ),
-          if (_currentPdfUrl != null) ...([
-            IconButton(
-              icon: const Icon(Icons.text_decrease),
-              tooltip: _isTextView ? 'Decrease font size' : 'Zoom out',
-              onPressed: () => _changePdfZoom(-1),
-            ),
-            IconButton(
-              icon: const Icon(Icons.text_increase),
-              tooltip: _isTextView ? 'Increase font size' : 'Zoom in',
-              onPressed: () => _changePdfZoom(1),
-            ),
-          ]),
-          IconButton(
-            icon: Icon(_isListening ? Icons.mic : Icons.mic_none),
-            tooltip: _isListening ? 'Stop listening' : 'Voice input',
-            color: _isListening ? Colors.red : null,
-            onPressed: _toggleVoiceInput,
-          ),
-        ]),
         IconButton(
-          icon: Icon(_showToolbar ? Icons.tune : Icons.tune_outlined),
-          tooltip: _showToolbar ? 'Hide toolbar' : 'Show toolbar',
-          onPressed: () => setState(() => _showToolbar = !_showToolbar),
+          icon: Icon(Icons.tune_outlined),
+          tooltip: 'Tools',
+          onPressed: _showToolsDrawer,
         ),
         if (_currentPdfUrl != null) ...([
           _isExtractingPdf
