@@ -2125,6 +2125,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       canPop: false,
       onPopInvokedWithResult: (didPop, result) async {
         if (didPop) return;
+        if (_currentPdfUrl != null) {
+          // Dismiss PDF overlay — the WebView still holds the previous page
+          // since PDF navigation was prevented (NavigationDecision.prevent).
+          setState(() {
+            _currentPdfUrl = null;
+            _extractedPdfHtml = null;
+            _isTextView = false;
+            _isShowingOurHtml = false;
+          });
+          return;
+        }
         if (await _controller.canGoBack()) {
           await _controller.goBack();
         }
