@@ -45,6 +45,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String _selectedLanguage = 'sv';
   bool _isControllerReady = false;
   List<String> _bookmarks = [];
+  Map<String, String> _bookmarkNames = {};
+  int _pageZoomLevel = 0; // each step ≈ 15% on top of 1.0, clamped to [-4, 10]
+  // Minimize state for dialog webviews — when true, the dialog was dismissed via
+  // the Minimize button and can be restored from the main screen. The controllers
+  // stay alive so the page state (scroll, form input) survives.
+  bool _dialog1Minimized = false;
+  bool _dialog1EverMinimized = false; // Track if dialog1 has ever been minimized
+
+  // Multiple dialog2 instances - each link opens a new dialog
+  Map<String, WebViewController> _dialog2Controllers = {};
+  Map<String, ValueNotifier<String?>> _dialog2ErrorNotifiers = {};
+  Map<String, String> _dialog2Urls = {};
+  Set<String> _minimizedDialog2s = {};
+  Set<String> _everMinimizedDialog2s = {}; // Track dialogs that have ever been minimized
   String _currentDialogText = '';
   String? _cachedRemoteSnippet;
   final Set<String> _handledPdfUrls = {};
@@ -96,6 +110,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _urlController.dispose();
     _findController.dispose();
     _dialogErrorNotifier.dispose();
+    // Clean up all dialog controllers on app dispose
+    dialogController = null;
+    _dialog2Controllers.clear();
+    for (final notifier in _dialog2ErrorNotifiers.values) {
+      notifier.dispose();
+    }
+    _dialog2ErrorNotifiers.clear();
+    _dialog2Urls.clear();
+    _minimizedDialog2s.clear();
+    _everMinimizedDialog2s.clear(); // Clean up tracking state
     super.dispose();
   }
 
@@ -134,7 +158,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         } catch (_) {}
       }
       _bookmarks = prefs.getStringList('bookmarks') ?? [];
+      final namesJson = prefs.getString('bookmarkNames');
+      if (namesJson != null) {
+        try {
+          final decoded = jsonDecode(namesJson) as Map<String, dynamic>;
+          _bookmarkNames = decoded.map((k, v) => MapEntry(k, v.toString()));
+        } catch (_) {}
+      }
       _githubToken = prefs.getString('githubToken');
+      _pageZoomLevel = prefs.getInt('pageZoom') ?? 0;
       _controller = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent('Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36')
@@ -247,11 +279,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _pendingPdfPage = null; // clear after PDF loads
               if (Platform.isAndroid) _attachAndroidAdBlocker();
               _injectJs();
-              _injectRemoteSnippet();
+              //_injectRemoteSnippet();
               _injectAdBlocker();
               _injectYouTubeAdBlocker();
               _injectSpaHook();
               _injectEinkCss();
+              _injectPageZoom();
               // Detect PDF by content-type (handles non-.pdf URLs like download links)
               // and defer _injectPdfDetector so it never fires on native PDF pages.
               _detectPdfAndInject(url);
@@ -404,13 +437,55 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             el.id = id;
             document.head.appendChild(el);
           }
-          el.textContent = 'html { filter: contrast(1.1) brightness(0.95) !important; }';
+          // Applied to body (not html) — `filter` on the root element creates
+          // a new containing block for fixed-position descendants and can
+          // interfere with internal scroll containers on some sites.
+          el.textContent = 'body { filter: contrast(1.1) brightness(0.95) !important; }';
         } else {
           if (el) el.remove();
         }
       })();
     ''';
     _controller.runJavaScript(js);
+  }
+
+  void _injectPageZoom() {
+    // Only apply scaling when the user actually set a non-default level.
+    // Using transform: scale() instead of CSS zoom to avoid layout breakage.
+    // CSS zoom creates a new containing block and breaks many modern layouts,
+    // while transform: scale() preserves the original layout structure.
+    if (_pageZoomLevel == 0) {
+      _controller.runJavaScript('''
+        document.documentElement.style.removeProperty('transform');
+        document.documentElement.style.removeProperty('transform-origin');
+        document.body.style.removeProperty('width');
+        document.body.style.removeProperty('overflow-x');
+      ''');
+      return;
+    }
+    final scale = (1.0 + _pageZoomLevel * 0.15).clamp(0.5, 2.5);
+    _controller.runJavaScript('''
+      // Use transform: scale() which preserves layout flow
+      document.documentElement.style.transform = 'scale($scale)';
+      document.documentElement.style.transformOrigin = 'top left';
+      // Adjust body width to prevent horizontal scrollbar issues
+      if ($scale < 1.0) {
+        document.body.style.width = '${(100 / scale).toStringAsFixed(1)}%';
+        document.body.style.overflowX = 'hidden';
+      } else {
+        document.body.style.removeProperty('width');
+        document.body.style.removeProperty('overflow-x');
+      }
+    ''');
+  }
+
+  Future<void> _changePageZoom(int delta) async {
+    final next = (_pageZoomLevel + delta).clamp(-4, 10);
+    if (next == _pageZoomLevel) return;
+    setState(() => _pageZoomLevel = next);
+    _injectPageZoom();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('pageZoom', _pageZoomLevel);
   }
 
   /// Does a HEAD request to check if [url] serves PDF content.
@@ -1077,11 +1152,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           );
           if (skipBtn) { skipBtn.click(); return; }
 
-          // Fast-forward through non-skippable video ads
+          // Fast-forward through non-skippable video ads.
+          // Only seek when the video has enough data (readyState >= 3 = HAVE_FUTURE_DATA)
+          // to avoid triggering a buffering stall/loop.
           const player = document.querySelector('.html5-video-player');
           if (player && player.classList.contains('ad-showing')) {
             const video = document.querySelector('video');
-            if (video && isFinite(video.duration) && video.duration > 0) {
+            if (video && isFinite(video.duration) && video.duration > 0
+                && video.readyState >= 3 && !video.seeking) {
               // Mute first so fast-forward doesn't blast audio
               video.muted = true;
               video.currentTime = video.duration;
@@ -1128,14 +1206,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         });
 
         // --- 5. Block YouTube's own ad-reporting and ad-stats endpoints ---
-        // This prevents the ad system receiving confirmation that the ad was viewed,
-        // which reduces the likelihood of a forced re-play.
+        // Only block truly ad-specific paths. Do NOT block /api/stats/qoe or
+        // /youtubei/v1/log_event — these are used by the player for all events
+        // (not just ads) and blocking them causes the player to hang/freeze.
         const YT_AD_PATHS = [
           '/api/stats/ads',
-          '/api/stats/qoe',
           '/pagead/',
           '/ptracking',
-          '/youtubei/v1/log_event',
         ];
         function isYtAdUrl(url) {
           try {
@@ -1186,8 +1263,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           return _origSend.call(this, body);
         };
 
-        // Fallback poll — catches any edge case the observer misses
-        setInterval(skipAd, 500);
+        // Fallback poll — catches any edge case the observer misses.
+        // Self-terminates after 20 consecutive attempts with an ad still showing
+        // (meaning the skip approach isn't working) to avoid an infinite hammering
+        // loop that can freeze the dialog WebView.
+        let _skipStuckCount = 0;
+        const _skipPollId = setInterval(function() {
+          const player = document.querySelector('.html5-video-player');
+          if (!player || !player.classList.contains('ad-showing')) {
+            _skipStuckCount = 0; // ad gone — reset counter
+            return;
+          }
+          _skipStuckCount++;
+          if (_skipStuckCount > 20) {
+            // Ad has been stuck for >10 s and isn't skipping — stop trying to
+            // avoid freezing the WebView renderer.
+            clearInterval(_skipPollId);
+            return;
+          }
+          skipAd();
+        }, 500);
       })();
     ''';
     (ctrl ?? _controller).runJavaScript(js);
@@ -1289,9 +1384,52 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   Future<void> _removeBookmark(String url) async {
-    setState(() => _bookmarks.remove(url));
+    setState(() {
+      _bookmarks.remove(url);
+      _bookmarkNames.remove(url);
+    });
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList('bookmarks', _bookmarks);
+    await prefs.setString('bookmarkNames', jsonEncode(_bookmarkNames));
+  }
+
+  Future<void> _renameBookmark(String url, String name) async {
+    setState(() {
+      final trimmed = name.trim();
+      if (trimmed.isEmpty) {
+        _bookmarkNames.remove(url);
+      } else {
+        _bookmarkNames[url] = trimmed;
+      }
+    });
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('bookmarkNames', jsonEncode(_bookmarkNames));
+  }
+
+  Future<void> _showRenameBookmarkDialog(String url) async {
+    final controller = TextEditingController(text: _bookmarkNames[url] ?? '');
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Rename bookmark'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            hintText: 'Name (leave empty to reset)',
+          ),
+          onSubmitted: (v) => Navigator.of(ctx).pop(v),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (result != null) await _renameBookmark(url, result);
   }
 
   void _showToolsDrawer() {
@@ -1336,6 +1474,32 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       },
                     ),
                     ListTile(
+                      leading: Icon(Icons.format_size),
+                      title: Text('Page font size'),
+                      subtitle: Text('${(100 * (1.0 + _pageZoomLevel * 0.15)).round()}%'),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: Icon(Icons.text_decrease),
+                            tooltip: 'Decrease',
+                            onPressed: () async {
+                              await _changePageZoom(-1);
+                              setModalState(() {});
+                            },
+                          ),
+                          IconButton(
+                            icon: Icon(Icons.text_increase),
+                            tooltip: 'Increase',
+                            onPressed: () async {
+                              await _changePageZoom(1);
+                              setModalState(() {});
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                    ListTile(
                       leading: Icon(Icons.language),
                       title: Text('Language'),
                       trailing: DropdownButton<String>(
@@ -1372,6 +1536,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       onTap: () {
                         Navigator.of(ctx).pop();
                         _toggleVoiceInput();
+                      },
+                    ),
+                    ListTile(
+                      leading: Icon(Icons.code),
+                      title: Text('Inject remote snippet'),
+                      subtitle: Text('Run remote JavaScript on current page'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _injectRemoteSnippet();
                       },
                     ),
                     if (_currentPdfUrl != null) ...[
@@ -1569,10 +1742,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       TextButton(
                         child: Text('Clear all'),
                         onPressed: () async {
-                          setState(() => _bookmarks.clear());
+                          setState(() {
+                            _bookmarks.clear();
+                            _bookmarkNames.clear();
+                          });
                           setModalState(() {});
                           final prefs = await SharedPreferences.getInstance();
                           await prefs.setStringList('bookmarks', []);
+                          await prefs.setString('bookmarkNames', jsonEncode({}));
                         },
                       ),
                   ],
@@ -1587,20 +1764,37 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         itemCount: _bookmarks.length,
                         itemBuilder: (_, i) {
                           final url = _bookmarks[i];
+                          final name = _bookmarkNames[url];
                           return ListTile(
                             leading: Icon(Icons.bookmark),
-                            title: Text(url, maxLines: 1, overflow: TextOverflow.ellipsis),
+                            title: Text(name ?? url, maxLines: 1, overflow: TextOverflow.ellipsis),
+                            subtitle: name != null
+                                ? Text(url, maxLines: 1, overflow: TextOverflow.ellipsis)
+                                : null,
                             onTap: () {
                               Navigator.of(ctx).pop();
                               _urlController.text = url;
                               _loadUrl();
                             },
-                            trailing: IconButton(
-                              icon: Icon(Icons.delete_outline),
-                              onPressed: () async {
-                                await _removeBookmark(url);
-                                setModalState(() {});
-                              },
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  icon: Icon(Icons.edit_outlined),
+                                  tooltip: 'Rename',
+                                  onPressed: () async {
+                                    await _showRenameBookmarkDialog(url);
+                                    setModalState(() {});
+                                  },
+                                ),
+                                IconButton(
+                                  icon: Icon(Icons.delete_outline),
+                                  onPressed: () async {
+                                    await _removeBookmark(url);
+                                    setModalState(() {});
+                                  },
+                                ),
+                              ],
                             ),
                           );
                         },
@@ -1652,6 +1846,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   void _openDialog2WithWebview(String url) {
+    // Create unique dialog ID based on URL and timestamp
+    final dialogId = '${Uri.parse(url).host}_${DateTime.now().millisecondsSinceEpoch}';
+
     final errorNotifier = ValueNotifier<String?>(null);
     bool hasRedirected = false;
     late final WebViewController dialog2Controller;
@@ -1690,37 +1887,120 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       ))
       ..loadRequest(Uri.parse(url));
 
+    // Store the new dialog instance
+    _dialog2Controllers[dialogId] = dialog2Controller;
+    _dialog2ErrorNotifiers[dialogId] = errorNotifier;
+    _dialog2Urls[dialogId] = url;
+    _minimizedDialog2s.remove(dialogId); // Ensure it's not marked as minimized
+
+    _showDialog2(dialogId);
+  }
+
+  void _showDialog2(String dialogId) {
+    final controller = _dialog2Controllers[dialogId];
+    final errorNotifier = _dialog2ErrorNotifiers[dialogId];
+    final url = _dialog2Urls[dialogId];
+    if (controller == null || errorNotifier == null || url == null) return;
+
+    _minimizedDialog2s.remove(dialogId); // Mark as not minimized
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
 
+    // If dialog has been minimized before, tapping outside should minimize, not close
+    final hasBeenMinimized = _everMinimizedDialog2s.contains(dialogId);
+
     showDialog(
       context: context,
-      builder: (context) => Dialog(
-        insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: screenHeight * 0.025),
-        child: Container(
-          width: screenWidth * 0.98,
-          height: screenHeight * 0.95,
-          child: Column(
-            children: [
-              Container(
-                padding: EdgeInsets.all(8),
-                alignment: Alignment.centerRight,
-                child: TextButton(onPressed: () => Navigator.of(context).pop(), child: Text('Close')),
-              ),
-              Expanded(
-                child: ValueListenableBuilder<String?>(
-                  valueListenable: errorNotifier,
-                  builder: (_, error, __) => error != null
-                      ? _errorView(error, () {
-                          errorNotifier.value = null;
-                          dialog2Controller.loadRequest(Uri.parse(url));
-                        })
-                      : WebViewWidget(controller: dialog2Controller),
+      barrierDismissible: !hasBeenMinimized, // Prevent outside tap closing if ever minimized
+      builder: (ctx) => hasBeenMinimized
+        ? GestureDetector(
+            // Custom barrier tap handler - minimizes instead of closing
+            onTap: () {
+              _minimizedDialog2s.add(dialogId);
+              Navigator.of(ctx).pop();
+            },
+            child: Container(
+              color: Colors.transparent,
+              child: Center(
+                child: GestureDetector(
+                  onTap: () {}, // Prevent tap propagation from dialog content
+                  child: Dialog(
+                    insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: screenHeight * 0.025),
+                    child: _buildDialog2Content(ctx, dialogId, url, controller, errorNotifier, screenWidth, screenHeight),
+                  ),
                 ),
               ),
-            ],
+            ),
+          )
+        : Dialog(
+            insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: screenHeight * 0.025),
+            child: _buildDialog2Content(ctx, dialogId, url, controller, errorNotifier, screenWidth, screenHeight),
           ),
-        ),
+    ).then((_) {
+      // Dialog closed - but keep controller alive to avoid reloading.
+      // Only dispose error notifier if dialog was fully closed (not minimized).
+      if (!_minimizedDialog2s.contains(dialogId)) {
+        errorNotifier.dispose();
+        _dialog2Controllers.remove(dialogId);
+        _dialog2ErrorNotifiers.remove(dialogId);
+        _dialog2Urls.remove(dialogId);
+        _everMinimizedDialog2s.remove(dialogId); // Clean up tracking state
+      }
+    });
+  }
+
+  Widget _buildDialog2Content(BuildContext ctx, String dialogId, String url,
+      WebViewController controller, ValueNotifier<String?> errorNotifier,
+      double screenWidth, double screenHeight) {
+    return Container(
+      width: screenWidth * 0.98,
+      height: screenHeight * 0.95,
+      child: Column(
+        children: [
+          Container(
+            padding: EdgeInsets.all(8),
+            child: Row(
+              children: [
+                // Show dialog title with host name
+                Expanded(
+                  child: Text(
+                    Uri.tryParse(url)?.host ?? 'Dialog',
+                    style: TextStyle(fontWeight: FontWeight.w500),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                TextButton(
+                  onPressed: () {
+                    _minimizedDialog2s.add(dialogId);
+                    _everMinimizedDialog2s.add(dialogId); // Mark as ever minimized
+                    Navigator.of(ctx).pop();
+                  },
+                  child: Text('Minimize'),
+                ),
+                TextButton(
+                  onPressed: () {
+                    // Clear minimized state when manually closing
+                    _minimizedDialog2s.remove(dialogId);
+                    Navigator.of(ctx).pop();
+                  },
+                  child: Text('Close'),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ValueListenableBuilder<String?>(
+              valueListenable: errorNotifier,
+              builder: (_, error, __) => error != null
+                  ? _errorView(error, () {
+                      errorNotifier.value = null;
+                      controller.loadRequest(Uri.parse(url));
+                    })
+                  : WebViewWidget(controller: controller),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1827,36 +2107,96 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
 
     // Always show the dialog (it may have been dismissed previously)
+    _showDialog1();
+  }
+
+  void _showDialog1() {
+    if (dialogController == null) return;
+    setState(() => _dialog1Minimized = false);
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
+
+    // If dialog has been minimized before, tapping outside should minimize, not close
+    final hasBeenMinimized = _dialog1EverMinimized;
+
     showDialog(
       context: context,
-      builder: (context) => Dialog(
-        insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: screenHeight * 0.025),
-        child: Container(
-          width: screenWidth,
-          height: screenHeight * 0.95,
-          child: Column(
-            children: [
-              Container(
-                padding: EdgeInsets.all(8),
-                alignment: Alignment.centerRight,
-                child: TextButton(onPressed: () => Navigator.of(context).pop(), child: Text('Close')),
-              ),
-              Expanded(
-                child: ValueListenableBuilder<String?>(
-                  valueListenable: _dialogErrorNotifier,
-                  builder: (_, error, __) => error != null
-                      ? _errorView(error, () {
-                          _dialogErrorNotifier.value = null;
-                          dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
-                        })
-                      : WebViewWidget(controller: dialogController!),
+      barrierDismissible: !hasBeenMinimized, // Prevent outside tap closing if ever minimized
+      builder: (ctx) => hasBeenMinimized
+        ? GestureDetector(
+            // Custom barrier tap handler - minimizes instead of closing
+            onTap: () {
+              setState(() => _dialog1Minimized = true);
+              Navigator.of(ctx).pop();
+            },
+            child: Container(
+              color: Colors.transparent,
+              child: Center(
+                child: GestureDetector(
+                  onTap: () {}, // Prevent tap propagation from dialog content
+                  child: Dialog(
+                    insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: screenHeight * 0.025),
+                    child: _buildDialog1Content(ctx, screenWidth, screenHeight),
+                  ),
                 ),
               ),
-            ],
+            ),
+          )
+        : Dialog(
+            insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: screenHeight * 0.025),
+            child: _buildDialog1Content(ctx, screenWidth, screenHeight),
           ),
-        ),
+    ).then((_) {
+      // Dialog closed - but keep controller alive to avoid reloading.
+      // Controller will be cleaned up only when app is disposed or language changes.
+      // This prevents unnecessary reloads when reopening the dialog.
+    });
+  }
+
+  Widget _buildDialog1Content(BuildContext ctx, double screenWidth, double screenHeight) {
+    return Container(
+      width: screenWidth,
+      height: screenHeight * 0.95,
+      child: Column(
+        children: [
+          Container(
+            padding: EdgeInsets.all(8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(
+                  onPressed: () {
+                    setState(() {
+                      _dialog1Minimized = true;
+                      _dialog1EverMinimized = true; // Mark as ever minimized
+                    });
+                    Navigator.of(ctx).pop();
+                  },
+                  child: Text('Minimize'),
+                ),
+                TextButton(
+                  onPressed: () {
+                    // Clear minimized state when manually closing
+                    setState(() => _dialog1Minimized = false);
+                    Navigator.of(ctx).pop();
+                  },
+                  child: Text('Close'),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ValueListenableBuilder<String?>(
+              valueListenable: _dialogErrorNotifier,
+              builder: (_, error, __) => error != null
+                  ? _errorView(error, () {
+                      _dialogErrorNotifier.value = null;
+                      dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                    })
+                  : WebViewWidget(controller: dialogController!),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1873,8 +2213,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (_isListening) {
       await _speech.stop();
       setState(() => _isListening = false);
+      // Resume normal app bar timer behavior when voice input stops
+      if (_showAppBar && Platform.isAndroid) {
+        _showAppBarWithTimer();
+      }
       return;
     }
+    // Show app bar when starting voice input
+    _showAppBarWithTimer();
     try {
       String lastWords = '';
       final available = await _speech.initialize(
@@ -1882,6 +2228,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           if (status == 'done' || status == 'notListening') {
             if (mounted && _isListening) {
               setState(() => _isListening = false);
+              // Resume normal timer behavior when voice input stops
+              if (_showAppBar && Platform.isAndroid) {
+                _showAppBarWithTimer();
+              }
               if (lastWords.isNotEmpty) {
                 _openDialogWithWebview(lastWords);
                 lastWords = '';
@@ -1893,6 +2243,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           debugPrint('Speech error: $error');
           if (mounted) {
             setState(() => _isListening = false);
+            // Resume normal timer behavior on error
+            if (_showAppBar && Platform.isAndroid) {
+              _showAppBarWithTimer();
+            }
             // Fallback to text input if speech fails
             _showVoiceInputFallback();
           }
@@ -1910,6 +2264,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           if (result.finalResult && lastWords.isNotEmpty) {
             _speech.stop();
             setState(() => _isListening = false);
+            // Resume normal timer behavior when voice input completes
+            if (_showAppBar && Platform.isAndroid) {
+              _showAppBarWithTimer();
+            }
             if (mounted) {
               _openDialogWithWebview(lastWords);
               lastWords = '';  // prevent double dispatch from onStatus
@@ -1920,7 +2278,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       );
     } catch (e) {
       debugPrint('Speech init error: $e');
-      if (mounted) setState(() => _isListening = false);
+      if (mounted) {
+        setState(() => _isListening = false);
+        // Resume normal timer behavior on error
+        if (_showAppBar && Platform.isAndroid) {
+          _showAppBarWithTimer();
+        }
+      }
     }
   }
 
@@ -2015,7 +2379,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   void _showAppBarWithTimer() {
     setState(() => _showAppBar = true);
     _appBarTimer?.cancel();
-    if (Platform.isAndroid) {
+    // Don't auto-hide app bar when voice input is active
+    if (Platform.isAndroid && !_isListening) {
       _appBarTimer = Timer(const Duration(seconds: 10), () {
         if (mounted) setState(() => _showAppBar = false);
       });
@@ -2278,6 +2643,44 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       ],
                     ),
                   ),
+                ),
+              ),
+            // Restore buttons for minimized dialog webviews
+            if (_dialog1Minimized || _minimizedDialog2s.isNotEmpty)
+              Positioned(
+                right: 16,
+                bottom: 16,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    // Multiple dialog2 restore buttons
+                    ..._minimizedDialog2s.map((dialogId) {
+                      final url = _dialog2Urls[dialogId] ?? '';
+                      final host = Uri.tryParse(url)?.host ?? 'Dialog';
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: FloatingActionButton.extended(
+                          heroTag: 'restoreDialog2_$dialogId',
+                          tooltip: 'Restore: $host',
+                          onPressed: () => _showDialog2(dialogId),
+                          icon: const Icon(Icons.menu_book, size: 16),
+                          label: Text(
+                            host.length > 12 ? '${host.substring(0, 12)}...' : host,
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                    // Dialog1 restore button
+                    if (_dialog1Minimized)
+                      FloatingActionButton.small(
+                        heroTag: 'restoreDialog1',
+                        tooltip: 'Restore dialog',
+                        onPressed: _showDialog1,
+                        child: const Icon(Icons.translate),
+                      ),
+                  ],
                 ),
               ),
           ],
