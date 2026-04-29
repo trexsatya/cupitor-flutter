@@ -111,6 +111,13 @@ class MainActivity : FlutterActivity() {
     // Channel reference kept so AdBlockWebViewClient can send auto-detected events back to Dart.
     private var adBlockChannel: MethodChannel? = null
 
+    // Hosts already surfaced to Dart this page-load — prevents re-notifying for the same host.
+    // Accessed from both the intercept thread (background) and main thread, so backed by a
+    // concurrent set to avoid posting a Runnable for every flagged URL on a busy page.
+    // Cleared on each onPageStarted.
+    private val notifiedHosts: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+
     // Whether network-level ad blocking is active (toggled from Dart).
     @Volatile var adBlockEnabled = true
 
@@ -250,11 +257,11 @@ class MainActivity : FlutterActivity() {
             val host = uri.host?.lowercase() ?: return false
             if (!host.endsWith("youtube.com") && !host.endsWith("googlevideo.com")) return false
             val path = uri.path?.lowercase() ?: return false
+            // Do NOT block /api/stats/qoe or /youtubei/v1/log_event — those carry
+            // non-ad player events too, and blocking them freezes the player.
             return path.startsWith("/api/stats/ads")
                 || path.startsWith("/pagead/")
                 || path.startsWith("/ptracking")
-                || path.startsWith("/api/stats/qoe")
-                || path.startsWith("/youtubei/v1/log_event")
         }
 
         // Returns the eTLD+1-ish registrable host to use as the block key.
@@ -317,21 +324,20 @@ class MainActivity : FlutterActivity() {
             // Block YouTube ad-reporting endpoints (path-based, not host-based)
             if (matchYouTubeAdPath(request.url)) return emptyJsonResponse()
 
-            // Auto-detection: heuristically scan requests that passed the blocklist.
+            // Heuristic detection: surface candidate ad hosts to Dart so the user can
+            // *choose* to block them via the SnackBar. We do NOT block the request and
+            // do NOT add to the blocklist here — auto-blocking caused too many false
+            // positives. The user must explicitly confirm via "Block it".
             // shouldInterceptRequest runs on a background thread — use the cached
             // currentPageHost instead of calling view.url (main-thread only).
             val pageHost = currentPageHost
             val detected = detectAdHost(urlStr, pageHost)
-            if (detected != null) {
+            // Dedupe on this (background) thread so we only hop to main once per new host,
+            // even when a page fires hundreds of matching requests.
+            if (detected != null && notifiedHosts.add(detected)) {
                 view.post {
-                    val added = adHosts.add(detected)
-                    if (added) {
-                        persistCustomHosts()
-                        // Notify Dart so it can log/display newly detected hosts
-                        adBlockChannel?.invokeMethod("onHostDetected", mapOf("host" to detected))
-                    }
+                    adBlockChannel?.invokeMethod("onHostDetected", mapOf("host" to detected))
                 }
-                return emptyResponse()
             }
 
             return delegate.shouldInterceptRequest(view, request)
@@ -347,6 +353,7 @@ class MainActivity : FlutterActivity() {
 
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             currentPageHost = Uri.parse(url).host?.lowercase()
+            notifiedHosts.clear()
             delegate.onPageStarted(view, url, favicon)
         }
 

@@ -1144,6 +1144,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         document.head.appendChild(style);
 
         // --- 2. Core skip logic ---
+        // Track whether *we* muted the video so we can restore audio when the
+        // ad ends. Without this, the next non-ad video stays silently muted.
+        let _mutedByAdSkip = false;
+
         function skipAd() {
           // Click any visible skip / close button
           const skipBtn = document.querySelector(
@@ -1160,11 +1164,22 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             const video = document.querySelector('video');
             if (video && isFinite(video.duration) && video.duration > 0
                 && video.readyState >= 3 && !video.seeking) {
-              // Mute first so fast-forward doesn't blast audio
-              video.muted = true;
+              if (!video.muted) {
+                video.muted = true;
+                _mutedByAdSkip = true;
+              }
               video.currentTime = video.duration;
             }
           }
+        }
+
+        function restoreAudioAfterAd() {
+          if (!_mutedByAdSkip) return;
+          const player = document.querySelector('.html5-video-player');
+          if (player && player.classList.contains('ad-showing')) return;
+          const video = document.querySelector('video');
+          if (video) video.muted = false;
+          _mutedByAdSkip = false;
         }
 
         // --- 3. Immediate skip on video timeupdate (fires every ~250 ms or less) ---
@@ -1174,36 +1189,64 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           video._ytAdListenerAttached = true;
           video.addEventListener('timeupdate', () => {
             const player = document.querySelector('.html5-video-player');
-            if (player && player.classList.contains('ad-showing')) skipAd();
+            if (player && player.classList.contains('ad-showing')) {
+              skipAd();
+            } else {
+              restoreAudioAfterAd();
+            }
           });
         }
         attachVideoListener();
 
-        // --- 4. MutationObserver: fires the instant Skip button or ad-showing class appears ---
-        new MutationObserver((mutations) => {
-          for (const m of mutations) {
-            // Check for ad-showing class toggle on player
-            if (m.type === 'attributes' && m.attributeName === 'class') {
-              const el = m.target;
-              if (el.classList && el.classList.contains('ad-showing')) { skipAd(); return; }
-            }
-            // Check for skip-button node being added
-            if (m.type === 'childList') {
-              for (const node of m.addedNodes) {
-                if (node.nodeType !== 1) continue;
-                if (node.matches && (
-                  node.matches('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-slot')
-                  || node.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button')
-                )) { skipAd(); return; }
+        // --- 4. MutationObserver scoped to the player container ---
+        // Observing document.documentElement with subtree:true fires the callback
+        // on every YouTube UI tweak — hundreds per second during ad playback,
+        // enough to saturate the renderer thread and freeze the WebView. We
+        // bootstrap with a narrow observer just to find the player, then watch
+        // only the player itself.
+        function startPlayerObserver(player) {
+          if (player._ytAdObserverAttached) return;
+          player._ytAdObserverAttached = true;
+          new MutationObserver((mutations) => {
+            for (const m of mutations) {
+              if (m.type === 'attributes' && m.attributeName === 'class') {
+                // Only the player element itself carries ad-showing.
+                if (m.target === player) {
+                  if (player.classList.contains('ad-showing')) { skipAd(); return; }
+                  if (_mutedByAdSkip) restoreAudioAfterAd();
+                }
+              } else if (m.type === 'childList') {
+                for (const node of m.addedNodes) {
+                  if (node.nodeType !== 1) continue;
+                  if (node.matches && (
+                    node.matches('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-slot')
+                    || (node.querySelector && node.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button'))
+                  )) { skipAd(); return; }
+                }
+                // A fresh video element may have been inserted (SPA nav).
+                attachVideoListener();
               }
-              // New video element added (e.g. after navigation)
-              attachVideoListener();
             }
-          }
-        }).observe(document.documentElement, {
-          childList: true, subtree: true,
-          attributes: true, attributeFilter: ['class']
-        });
+          }).observe(player, {
+            childList: true, subtree: true,
+            attributes: true, attributeFilter: ['class']
+          });
+        }
+
+        const _existingPlayer = document.querySelector('.html5-video-player');
+        if (_existingPlayer) {
+          startPlayerObserver(_existingPlayer);
+        } else {
+          // Light bootstrap observer — disconnects as soon as the player appears.
+          const _bootstrap = new MutationObserver(() => {
+            const p = document.querySelector('.html5-video-player');
+            if (p) {
+              _bootstrap.disconnect();
+              startPlayerObserver(p);
+            }
+          });
+          _bootstrap.observe(document.documentElement, { childList: true, subtree: true });
+        }
 
         // --- 5. Block YouTube's own ad-reporting and ad-stats endpoints ---
         // Only block truly ad-specific paths. Do NOT block /api/stats/qoe or
@@ -1250,17 +1293,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           if (isYtAdUrl(url)) return Promise.resolve(new Response('{}', {status:200, headers:{'content-type':'application/json'}}));
           return _origFetch2.apply(this, arguments);
         };
-        // Wrap XHR
+        // Wrap XHR — redirect blocked URLs to a data: URL so the request
+        // completes cleanly with empty JSON. Dropping send() (the previous
+        // approach) left callers waiting for onload forever, which froze the
+        // YouTube player and any host page using XHR-based ad trackers.
         const _origOpen2 = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url, ...rest) {
           reportAdHost(url);
-          if (isYtAdUrl(url)) { this._ytAdBlocked = true; }
-          return _origOpen2.call(this, method, url, ...rest);
-        };
-        const _origSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.send = function(body) {
-          if (this._ytAdBlocked) return;
-          return _origSend.call(this, body);
+          const target = (typeof url === 'string' && isYtAdUrl(url))
+            ? 'data:application/json,{}' : url;
+          return _origOpen2.call(this, method, target, ...rest);
         };
 
         // Fallback poll — catches any edge case the observer misses.
@@ -1342,14 +1384,19 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           'ads.yahoo.com', 'taboola.com', 'outbrain.com', 'moatads.com',
           'adsafeprotected.com', 'scorecardresearch.com', 'pubads.g.doubleclick.net',
         ];
+        // Redirect blocked URLs to a harmless data: URL instead of swallowing
+        // open()/send(). Swallowing leaves the XHR in an invalid state and the
+        // caller waiting forever for onload/onreadystatechange — which hangs the
+        // whole WebView when scripts await ad-tracker XHRs synchronously.
         const _open = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-          if (adHosts.some(h => url.includes(h))) return;
-          return _open.call(this, method, url, ...rest);
+          const target = (typeof url === 'string' && adHosts.some(h => url.includes(h)))
+            ? 'data:text/plain,' : url;
+          return _open.call(this, method, target, ...rest);
         };
         const _fetch = window.fetch;
         window.fetch = function(input, init) {
-          const url = typeof input === 'string' ? input : input.url;
+          const url = typeof input === 'string' ? input : (input && input.url) || '';
           if (adHosts.some(h => url.includes(h))) return Promise.resolve(new Response('', { status: 200 }));
           return _fetch.call(this, input, init);
         };
@@ -1940,6 +1987,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // Dialog closed - but keep controller alive to avoid reloading.
       // Only dispose error notifier if dialog was fully closed (not minimized).
       if (!_minimizedDialog2s.contains(dialogId)) {
+        // Stop any media playback and tear down the dialog WebView's JS world.
+        // Without this the YouTube player keeps running (audio + the ad-blocker's
+        // MutationObserver/setInterval) after the widget is removed, which holds
+        // the renderer process busy and freezes the main WebView. Navigating to
+        // about:blank discards the document and stops everything in one shot.
+        _shutdownDialogWebView(controller);
         errorNotifier.dispose();
         _dialog2Controllers.remove(dialogId);
         _dialog2ErrorNotifiers.remove(dialogId);
@@ -1947,6 +2000,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         _everMinimizedDialog2s.remove(dialogId); // Clean up tracking state
       }
     });
+  }
+
+  /// Stops any audio/video and unloads the document on a dialog WebView so it
+  /// cannot keep working in the background after the dialog is dismissed.
+  /// Safe to call even if the platform view has already been detached.
+  void _shutdownDialogWebView(WebViewController controller) {
+    try {
+      controller.runJavaScript(
+        r'try{document.querySelectorAll("video,audio").forEach(function(v){try{v.pause();v.removeAttribute("src");v.load();}catch(e){}});}catch(e){}'
+      );
+    } catch (_) {}
+    try {
+      controller.loadRequest(Uri.parse('about:blank'));
+    } catch (_) {}
   }
 
   Widget _buildDialog2Content(BuildContext ctx, String dialogId, String url,
@@ -1982,6 +2049,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   onPressed: () {
                     // Clear minimized state when manually closing
                     _minimizedDialog2s.remove(dialogId);
+                    // Stop media + JS *before* popping while the platform view
+                    // is still attached — `.then` cleanup may run after detach.
+                    _shutdownDialogWebView(controller);
                     Navigator.of(ctx).pop();
                   },
                   child: Text('Close'),
