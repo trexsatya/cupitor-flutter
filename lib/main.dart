@@ -98,6 +98,28 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   final List<String> _detectedAdHosts = [];
   bool _adBlockEnabled = true;
 
+  // YouTube playback mode. Empty/null = native YouTube (with our JSON-prune
+  // ad-blocker). Otherwise the hostname of an Invidious/Piped front-end (e.g.
+  // "piped.video", "yewtu.be") to redirect youtube.com URLs to. Persisted
+  // under SharedPreferences key "youtubeFrontend".
+  String? _youtubeFrontend;
+
+  // Pretend to be Chrome — the default Android WebView UA contains "; wv)",
+  // which Google explicitly checks for and uses to refuse OAuth flows
+  // ("disallowed_useragent"). Without this, Sign-in-with-Google on sites like
+  // filmot.com fails. Applied to every WebViewController we create.
+  static const String _userAgent =
+      'Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36';
+
+  static const List<String> _youtubeFrontendInstances = [
+    'piped.video',
+    'yewtu.be',
+    'invidious.fdn.fr',
+    'invidious.privacydev.net',
+    'inv.nadeko.net',
+  ];
+
   @override
   void dispose() {
     _appBarTimer?.cancel();
@@ -129,6 +151,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       WakelockPlus.enable();
     } else if (state == AppLifecycleState.paused) {
       WakelockPlus.disable();
+      // Flush WebView cookies to disk so logins survive a force-kill that
+      // happens before the system's next periodic flush.
+      _flushCookies();
     }
   }
 
@@ -167,9 +192,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       }
       _githubToken = prefs.getString('githubToken');
       _pageZoomLevel = prefs.getInt('pageZoom') ?? 0;
+      final yf = prefs.getString('youtubeFrontend');
+      _youtubeFrontend = (yf != null && yf.isNotEmpty) ? yf : null;
       _controller = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
-        ..setUserAgent('Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36')
+        ..setUserAgent(_userAgent)
         ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) => _openDialogWithWebview(msg.message.toString().replaceAll('"', '')))
         ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
@@ -178,6 +205,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           NavigationDelegate(
             onNavigationRequest: (request) async {
               if (!request.isMainFrame) return NavigationDecision.navigate;
+              // Redirect YouTube → Invidious/Piped if the user has chosen a
+              // front-end. The rewritten URL re-enters this delegate but no
+              // longer matches the YouTube host check, so no infinite loop.
+              final rewritten = _rewriteYouTubeUrl(request.url);
+              if (rewritten != null) {
+                _controller.loadRequest(Uri.parse(rewritten));
+                return NavigationDecision.prevent;
+              }
               final url = request.url;
               // Always intercept .pdf extension URLs on Android before WebView touches them.
               if (Platform.isAndroid && _looksLikePdfUrl(url)) {
@@ -262,6 +297,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               if (Platform.isAndroid && _currentPdfUrl == null) {
                 _checkForPdf(url);
               }
+              // Inject the YT ad-blocker as early as possible so its property
+              // setter on window.ytInitialPlayerResponse can fire before
+              // YouTube's inline assignment script. The script is hostname-
+              // gated and idempotent, so it's safe to call on every navigation.
+              _injectYouTubeAdBlocker();
             },
             onPageFinished: (url) {
               if (_isShowingOurHtml) {
@@ -279,9 +319,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _pendingPdfPage = null; // clear after PDF loads
               if (Platform.isAndroid) _attachAndroidAdBlocker();
               _injectJs();
-              //_injectRemoteSnippet();
               _injectAdBlocker();
-              _injectYouTubeAdBlocker();
               _injectSpaHook();
               _injectEinkCss();
               _injectPageZoom();
@@ -290,10 +328,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _detectPdfAndInject(url);
               // Restore scroll position for this URL
               _restoreScrollPosition(url);
+              _injectRemoteSnippet();
             },
           ),
         )
         ..loadRequest(Uri.parse(savedUrl));
+      _enableThirdPartyCookies(_controller);
       setState(() {
         _isControllerReady = true;
       });
@@ -425,7 +465,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return path.toLowerCase().endsWith('.pdf');
   }
 
-  void _injectEinkCss() {
+  void _injectEinkCss([WebViewController? ctrl]) {
     final enabled = _isEinkMode;
     final js = '''
       (function() {
@@ -446,7 +486,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         }
       })();
     ''';
-    _controller.runJavaScript(js);
+    (ctrl ?? _controller).runJavaScript(js);
   }
 
   void _injectPageZoom() {
@@ -1052,6 +1092,60 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _adBlockChannel.invokeMethod<void>('attach').catchError((_) {});
   }
 
+  /// Enable third-party cookies on the underlying Android WebView. Many sign-in
+  /// flows (OAuth callbacks, Google / GitHub login redirects) set a cookie on
+  /// one host and read it back from another — those break unless third-party
+  /// cookies are explicitly enabled. Cookies themselves persist across dialog
+  /// open/close cycles by default because Android's CookieManager is shared
+  /// across all WebViews in the app.
+  void _enableThirdPartyCookies(WebViewController controller) {
+    if (!Platform.isAndroid) return;
+    try {
+      final cookieMgr = WebViewCookieManager().platform;
+      final platform = controller.platform;
+      if (cookieMgr is AndroidWebViewCookieManager
+          && platform is AndroidWebViewController) {
+        cookieMgr.setAcceptThirdPartyCookies(platform, true);
+      }
+    } catch (_) { /* best-effort — fall back to default cookie policy */ }
+  }
+
+  /// Tell Android's CookieManager to flush its in-memory cookie jar to disk.
+  /// WebView flushes periodically on its own, but a force-kill before the
+  /// next periodic flush loses recently-set cookies (logins). Called on app
+  /// pause so persistence is guaranteed.
+  Future<void> _flushCookies() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _adBlockChannel.invokeMethod<void>('flushCookies');
+    } catch (_) {}
+  }
+
+  /// If [_youtubeFrontend] is set and [url] points to YouTube, return the URL
+  /// rewritten to the chosen Invidious/Piped instance. Returns null otherwise.
+  String? _rewriteYouTubeUrl(String url) {
+    final frontend = _youtubeFrontend;
+    if (frontend == null || frontend.isEmpty) return null;
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.hasScheme) return null;
+    final host = uri.host.toLowerCase();
+    if (host == 'youtu.be') {
+      // Short-link: /VIDEO_ID → /watch?v=VIDEO_ID, preserve any other params.
+      if (uri.pathSegments.isEmpty) return null;
+      final id = uri.pathSegments.first;
+      final params = Map<String, String>.from(uri.queryParameters);
+      params['v'] = id;
+      return Uri(
+        scheme: 'https', host: frontend, path: '/watch', queryParameters: params,
+      ).toString();
+    }
+    final isYouTube = host == 'youtube.com'
+        || host == 'www.youtube.com'
+        || host == 'm.youtube.com';
+    if (!isYouTube) return null;
+    return uri.replace(scheme: 'https', host: frontend).toString();
+  }
+
   /// Shows a persistent SnackBar when the native layer auto-detects a new ad host.
   /// The user can tap "Block" to confirm adding it, or "Dismiss" to ignore.
   void _showDetectedAdHostBanner(String host) {
@@ -1113,6 +1207,21 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     } catch (_) {}
   }
 
+  /// Inject the YouTube ad-blocker. Designed to be safe to call from
+  /// onPageStarted (DOM may not exist yet) — DOM-dependent setup is deferred
+  /// until DOMContentLoaded.
+  ///
+  /// The core trick is the same as Brave / uBlock Origin's `json-prune`
+  /// scriptlet: YouTube's player decides when to splice ads into the stream
+  /// by reading specific fields on the player config blob. If those fields
+  /// are gone before the player reads them, no ads get inserted.
+  ///   * `window.ytInitialPlayerResponse` — set inline on first page load.
+  ///     We define a property setter that strips ad fields on assignment.
+  ///   * `/youtubei/v1/player` API responses — fetched for every video
+  ///     navigated to inside the SPA. We wrap fetch and prune the JSON.
+  ///
+  /// CSS hiding and the skip-button click observer are kept as defence in
+  /// depth (in case YouTube renames the ad fields and pruning breaks).
   void _injectYouTubeAdBlocker([WebViewController? ctrl]) {
     const js = r'''
       (function() {
@@ -1120,211 +1229,120 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         if (window._ytAdBlockerInjected) return;
         window._ytAdBlockerInjected = true;
 
-        // --- 1. Hide overlay / banner ad elements ---
-        const style = document.createElement('style');
-        style.textContent = `
-          .ytp-ad-overlay-container,
-          .ytp-ad-player-overlay,
-          .ytp-ad-player-overlay-instream-info,
-          .ytp-ad-image-overlay,
-          .ytp-ad-text-overlay,
-          .ytp-ad-module,
-          .ytp-ad-action-interstitial,
-          .ytp-ad-skip-button-slot,
-          ytd-action-companion-ad-renderer,
-          ytd-display-ad-renderer,
-          ytd-video-masthead-ad-renderer,
-          ytd-promoted-sparkles-web-renderer,
-          ytd-banner-promo-renderer,
-          ytd-ad-slot-renderer,
-          yt-mealbar-promo-renderer,
-          #masthead-ad,
-          #player-ads { display: none !important; }
-        `;
-        document.head.appendChild(style);
-
-        // --- 2. Core skip logic ---
-        // Track whether *we* muted the video so we can restore audio when the
-        // ad ends. Without this, the next non-ad video stays silently muted.
-        let _mutedByAdSkip = false;
-
-        function skipAd() {
-          // Click any visible skip / close button
-          const skipBtn = document.querySelector(
-            '.ytp-skip-ad-button, .ytp-ad-skip-button, ' +
-            '.ytp-ad-skip-button-slot button, .ytp-ad-overlay-close-button'
-          );
-          if (skipBtn) { skipBtn.click(); return; }
-
-          // Fast-forward through non-skippable video ads.
-          // Only seek when the video has enough data (readyState >= 3 = HAVE_FUTURE_DATA)
-          // to avoid triggering a buffering stall/loop.
-          const player = document.querySelector('.html5-video-player');
-          if (player && player.classList.contains('ad-showing')) {
-            const video = document.querySelector('video');
-            if (video && isFinite(video.duration) && video.duration > 0
-                && video.readyState >= 3 && !video.seeking) {
-              if (!video.muted) {
-                video.muted = true;
-                _mutedByAdSkip = true;
-              }
-              video.currentTime = video.duration;
-            }
+        // ---- 1. JSON pruning (the actual ad killer) ----
+        const AD_KEYS = ['playerAds', 'adPlacements', 'adSlots', 'adServingData'];
+        function prune(obj) {
+          if (!obj || typeof obj !== 'object') return;
+          for (const k of AD_KEYS) {
+            if (k in obj) try { delete obj[k]; } catch (_) {}
           }
         }
 
-        function restoreAudioAfterAd() {
-          if (!_mutedByAdSkip) return;
-          const player = document.querySelector('.html5-video-player');
-          if (player && player.classList.contains('ad-showing')) return;
-          const video = document.querySelector('video');
-          if (video) video.muted = false;
-          _mutedByAdSkip = false;
-        }
+        // Best-effort: prune anything already assigned by an inline <script>
+        // that ran before us (we sometimes lose the race since webview_flutter
+        // can't inject at document-start).
+        try { prune(window.ytInitialPlayerResponse); } catch (_) {}
 
-        // --- 3. Immediate skip on video timeupdate (fires every ~250 ms or less) ---
-        function attachVideoListener() {
-          const video = document.querySelector('video');
-          if (!video || video._ytAdListenerAttached) return;
-          video._ytAdListenerAttached = true;
-          video.addEventListener('timeupdate', () => {
-            const player = document.querySelector('.html5-video-player');
-            if (player && player.classList.contains('ad-showing')) {
-              skipAd();
-            } else {
-              restoreAudioAfterAd();
-            }
+        // Property setter for future assignments. The watch-page inline
+        // script assigns this; SPA navigations re-assign it after fetching.
+        try {
+          let _ipr = window.ytInitialPlayerResponse;
+          Object.defineProperty(window, 'ytInitialPlayerResponse', {
+            configurable: true,
+            set(v) { prune(v); _ipr = v; },
+            get() { return _ipr; },
           });
-        }
-        attachVideoListener();
+        } catch (_) { /* property may already be non-configurable */ }
 
-        // --- 4. MutationObserver scoped to the player container ---
-        // Observing document.documentElement with subtree:true fires the callback
-        // on every YouTube UI tweak — hundreds per second during ad playback,
-        // enough to saturate the renderer thread and freeze the WebView. We
-        // bootstrap with a narrow observer just to find the player, then watch
-        // only the player itself.
-        function startPlayerObserver(player) {
-          if (player._ytAdObserverAttached) return;
-          player._ytAdObserverAttached = true;
-          new MutationObserver((mutations) => {
-            for (const m of mutations) {
-              if (m.type === 'attributes' && m.attributeName === 'class') {
-                // Only the player element itself carries ad-showing.
-                if (m.target === player) {
-                  if (player.classList.contains('ad-showing')) { skipAd(); return; }
-                  if (_mutedByAdSkip) restoreAudioAfterAd();
-                }
-              } else if (m.type === 'childList') {
+        // Wrap fetch so /youtubei/v1/player responses (issued for every SPA
+        // video navigation) get the same treatment. This is the path that
+        // catches every video after the first one on a session.
+        const _origFetch = window.fetch;
+        window.fetch = async function(input, init) {
+          const url = typeof input === 'string' ? input : (input && input.url) || '';
+          const response = await _origFetch.call(this, input, init);
+          if (url.includes('/youtubei/v1/player')) {
+            try {
+              const text = await response.clone().text();
+              const json = JSON.parse(text);
+              prune(json);
+              return new Response(JSON.stringify(json), {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers,
+              });
+            } catch (_) { return response; }
+          }
+          return response;
+        };
+
+        // ---- 2. Defensive CSS + skip-button click observer ----
+        // Runs after DOMContentLoaded so we don't fail when injected at
+        // document-start (no document.head yet).
+        function setupDom() {
+          const style = document.createElement('style');
+          style.textContent = `
+            .ytp-ad-overlay-container,
+            .ytp-ad-player-overlay,
+            .ytp-ad-player-overlay-instream-info,
+            .ytp-ad-image-overlay,
+            .ytp-ad-text-overlay,
+            .ytp-ad-module,
+            .ytp-ad-action-interstitial,
+            .ytp-ad-skip-button-slot,
+            ytd-action-companion-ad-renderer,
+            ytd-display-ad-renderer,
+            ytd-video-masthead-ad-renderer,
+            ytd-promoted-sparkles-web-renderer,
+            ytd-banner-promo-renderer,
+            ytd-ad-slot-renderer,
+            yt-mealbar-promo-renderer,
+            #masthead-ad,
+            #player-ads { display: none !important; }
+          `;
+          (document.head || document.documentElement).appendChild(style);
+
+          function clickSkip() {
+            const btn = document.querySelector(
+              '.ytp-skip-ad-button, .ytp-ad-skip-button, ' +
+              '.ytp-ad-skip-button-slot button, .ytp-ad-overlay-close-button'
+            );
+            if (btn) btn.click();
+          }
+
+          function attach(player) {
+            if (player._ytAdObserverAttached) return;
+            player._ytAdObserverAttached = true;
+            new MutationObserver((mutations) => {
+              for (const m of mutations) {
+                if (m.type !== 'childList') continue;
                 for (const node of m.addedNodes) {
                   if (node.nodeType !== 1) continue;
-                  if (node.matches && (
-                    node.matches('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-slot')
-                    || (node.querySelector && node.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button'))
-                  )) { skipAd(); return; }
+                  if (node.matches && node.matches(
+                    '.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-slot'
+                  )) { clickSkip(); return; }
                 }
-                // A fresh video element may have been inserted (SPA nav).
-                attachVideoListener();
               }
-            }
-          }).observe(player, {
-            childList: true, subtree: true,
-            attributes: true, attributeFilter: ['class']
-          });
+            }).observe(player, { childList: true, subtree: true });
+          }
+
+          const existing = document.querySelector('.html5-video-player');
+          if (existing) {
+            attach(existing);
+          } else {
+            const bootstrap = new MutationObserver(() => {
+              const p = document.querySelector('.html5-video-player');
+              if (p) { bootstrap.disconnect(); attach(p); }
+            });
+            bootstrap.observe(document.documentElement, { childList: true, subtree: true });
+          }
         }
 
-        const _existingPlayer = document.querySelector('.html5-video-player');
-        if (_existingPlayer) {
-          startPlayerObserver(_existingPlayer);
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', setupDom, { once: true });
         } else {
-          // Light bootstrap observer — disconnects as soon as the player appears.
-          const _bootstrap = new MutationObserver(() => {
-            const p = document.querySelector('.html5-video-player');
-            if (p) {
-              _bootstrap.disconnect();
-              startPlayerObserver(p);
-            }
-          });
-          _bootstrap.observe(document.documentElement, { childList: true, subtree: true });
+          setupDom();
         }
-
-        // --- 5. Block YouTube's own ad-reporting and ad-stats endpoints ---
-        // Only block truly ad-specific paths. Do NOT block /api/stats/qoe or
-        // /youtubei/v1/log_event — these are used by the player for all events
-        // (not just ads) and blocking them causes the player to hang/freeze.
-        const YT_AD_PATHS = [
-          '/api/stats/ads',
-          '/pagead/',
-          '/ptracking',
-        ];
-        function isYtAdUrl(url) {
-          try {
-            const u = new URL(url, location.href);
-            if (!u.hostname.includes('youtube.com') &&
-                !u.hostname.includes('googlevideo.com')) return false;
-            return YT_AD_PATHS.some(p => u.pathname.startsWith(p));
-          } catch(_) { return false; }
-        }
-        // --- 5. Behavioral ad-host recorder ---
-        // When ad-showing is active, every 3rd-party hostname contacted is
-        // a confirmed ad-network host — detected by causality, not by name.
-        // We report each new one to Flutter via the AdHostDetector JS channel.
-        const _reportedHosts = new Set();
-        function isAdShowing() {
-          const p = document.querySelector('.html5-video-player');
-          return p && p.classList.contains('ad-showing');
-        }
-        function reportAdHost(url) {
-          if (!isAdShowing()) return;
-          try {
-            const host = new URL(url, location.href).hostname;
-            if (!host || host === location.hostname) return; // same-origin: skip
-            const key = host.split('.').slice(-2).join('.'); // registrable host
-            if (_reportedHosts.has(key)) return;
-            _reportedHosts.add(key);
-            if (typeof AdHostDetector !== 'undefined') AdHostDetector.postMessage(key);
-          } catch(_) {}
-        }
-        // Wrap fetch
-        const _origFetch2 = window.fetch;
-        window.fetch = function(input, init) {
-          const url = typeof input === 'string' ? input : (input && input.url) || '';
-          reportAdHost(url);
-          if (isYtAdUrl(url)) return Promise.resolve(new Response('{}', {status:200, headers:{'content-type':'application/json'}}));
-          return _origFetch2.apply(this, arguments);
-        };
-        // Wrap XHR — redirect blocked URLs to a data: URL so the request
-        // completes cleanly with empty JSON. Dropping send() (the previous
-        // approach) left callers waiting for onload forever, which froze the
-        // YouTube player and any host page using XHR-based ad trackers.
-        const _origOpen2 = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-          reportAdHost(url);
-          const target = (typeof url === 'string' && isYtAdUrl(url))
-            ? 'data:application/json,{}' : url;
-          return _origOpen2.call(this, method, target, ...rest);
-        };
-
-        // Fallback poll — catches any edge case the observer misses.
-        // Self-terminates after 20 consecutive attempts with an ad still showing
-        // (meaning the skip approach isn't working) to avoid an infinite hammering
-        // loop that can freeze the dialog WebView.
-        let _skipStuckCount = 0;
-        const _skipPollId = setInterval(function() {
-          const player = document.querySelector('.html5-video-player');
-          if (!player || !player.classList.contains('ad-showing')) {
-            _skipStuckCount = 0; // ad gone — reset counter
-            return;
-          }
-          _skipStuckCount++;
-          if (_skipStuckCount > 20) {
-            // Ad has been stuck for >10 s and isn't skipping — stop trying to
-            // avoid freezing the WebView renderer.
-            clearInterval(_skipPollId);
-            return;
-          }
-          skipAd();
-        }, 500);
       })();
     ''';
     (ctrl ?? _controller).runJavaScript(js);
@@ -1518,6 +1536,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         setState(() => _isEinkMode = val);
                         setModalState(() {});
                         _injectEinkCss();
+                        if (dialogController != null) _injectEinkCss(dialogController);
+                        for (final c in _dialog2Controllers.values) {
+                          _injectEinkCss(c);
+                        }
                       },
                     ),
                     ListTile(
@@ -1615,6 +1637,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         _showAdHosts();
                       },
                     ),
+                    ListTile(
+                      leading: Icon(Icons.smart_display_outlined),
+                      title: Text('YouTube playback'),
+                      subtitle: Text(_youtubeFrontend == null
+                          ? 'Native YouTube (with ad blocker)'
+                          : 'Via ${_youtubeFrontend!}'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showYoutubeFrontendPicker();
+                      },
+                    ),
                   ],
                 ),
               ),
@@ -1623,6 +1656,62 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ),
       ),
     );
+  }
+
+  void _showYoutubeFrontendPicker() {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            Padding(
+              padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text(
+                'YouTube playback',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+            Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 12),
+              child: Text(
+                'Native uses youtube.com with our JSON-prune ad blocker. Front-ends serve YouTube content with no ads at all but may go offline; pick a fallback if your usual one stops working.',
+                style: TextStyle(fontSize: 13, color: Colors.grey[600]),
+              ),
+            ),
+            RadioListTile<String?>(
+              title: Text('Native YouTube'),
+              subtitle: Text('Real youtube.com, our ad blocker strips ads'),
+              value: null,
+              groupValue: _youtubeFrontend,
+              onChanged: (v) async {
+                Navigator.of(ctx).pop();
+                await _setYoutubeFrontend(v);
+              },
+            ),
+            ..._youtubeFrontendInstances.map((host) => RadioListTile<String?>(
+                  title: Text(host),
+                  value: host,
+                  groupValue: _youtubeFrontend,
+                  onChanged: (v) async {
+                    Navigator.of(ctx).pop();
+                    await _setYoutubeFrontend(v);
+                  },
+                )),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _setYoutubeFrontend(String? value) async {
+    setState(() => _youtubeFrontend = value);
+    final prefs = await SharedPreferences.getInstance();
+    if (value == null) {
+      await prefs.remove('youtubeFrontend');
+    } else {
+      await prefs.setString('youtubeFrontend', value);
+    }
   }
 
   void _showAdHosts() {
@@ -1893,6 +1982,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   void _openDialog2WithWebview(String url) {
+    // Pre-rewrite YouTube URLs to the chosen front-end. Cheap to call when no
+    // front-end is configured (returns null).
+    url = _rewriteYouTubeUrl(url) ?? url;
     // Create unique dialog ID based on URL and timestamp
     final dialogId = '${Uri.parse(url).host}_${DateTime.now().millisecondsSinceEpoch}';
 
@@ -1901,8 +1993,21 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     late final WebViewController dialog2Controller;
     dialog2Controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setUserAgent(_userAgent)
       ..setNavigationDelegate(NavigationDelegate(
-        onPageStarted: (_) => errorNotifier.value = null,
+        onNavigationRequest: (request) {
+          if (!request.isMainFrame) return NavigationDecision.navigate;
+          final rewritten = _rewriteYouTubeUrl(request.url);
+          if (rewritten != null) {
+            dialog2Controller.loadRequest(Uri.parse(rewritten));
+            return NavigationDecision.prevent;
+          }
+          return NavigationDecision.navigate;
+        },
+        onPageStarted: (_) {
+          errorNotifier.value = null;
+          _injectYouTubeAdBlocker(dialog2Controller);
+        },
         onWebResourceError: (error) {
           if (error.isForMainFrame == true) {
             errorNotifier.value = '[${error.errorCode}] ${error.description}\n${error.url ?? ''}';
@@ -1910,7 +2015,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         },
         onPageFinished: (finishedUrl) {
           _injectAdBlocker(dialog2Controller);
-          _injectYouTubeAdBlocker(dialog2Controller);
+          _injectEinkCss(dialog2Controller);
           // Detect wiktionary 404: /wiki/{word} page that doesn't exist
           final uri = Uri.tryParse(finishedUrl);
           if (!hasRedirected && uri != null
@@ -1933,6 +2038,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         },
       ))
       ..loadRequest(Uri.parse(url));
+    _enableThirdPartyCookies(dialog2Controller);
 
     // Store the new dialog instance
     _dialog2Controllers[dialogId] = dialog2Controller;
@@ -2148,19 +2254,32 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     } else {
       dialogController = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
+        ..setUserAgent(_userAgent)
         ..addJavaScriptChannel('GitHubProxy', onMessageReceived: _handleGitHubProxyRequest)
         ..setNavigationDelegate(
           NavigationDelegate(
-            onPageStarted: (_) => _dialogErrorNotifier.value = null,
+            onPageStarted: (url) {
+              _dialogErrorNotifier.value = null;
+              _injectYouTubeAdBlocker(dialogController);
+            },
             onWebResourceError: (error) {
               if (error.isForMainFrame == true) {
                 _dialogErrorNotifier.value = '[${error.errorCode}] ${error.description}\n${error.url ?? ''}';
               }
             },
             onNavigationRequest: (request) {
+              if (!request.isMainFrame) return NavigationDecision.navigate;
+              final rewritten = _rewriteYouTubeUrl(request.url);
+              if (rewritten != null) {
+                // YouTube link clicked inside the lookup dialog — open it on
+                // the chosen front-end in dialog2 (different host from
+                // _dialogUrl so it falls through to the dialog2 branch below).
+                _openDialog2WithWebview(rewritten);
+                return NavigationDecision.prevent;
+              }
               final reqHost = Uri.tryParse(request.url)?.host;
               final dialogHost = Uri.tryParse(_dialogUrl)?.host;
-              if (request.isMainFrame && reqHost != dialogHost) {
+              if (reqHost != dialogHost) {
                 _openDialog2WithWebview(request.url);
                 return NavigationDecision.prevent;
               }
@@ -2168,12 +2287,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             },
             onPageFinished: (url) {
               _injectAdBlocker(dialogController);
-              _injectYouTubeAdBlocker(dialogController);
+              _injectEinkCss(dialogController);
               dialogController?.runJavaScript(jsCodeToFilterData(_currentDialogText));
             },
           ),
         )
         ..loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+      _enableThirdPartyCookies(dialogController!);
     }
 
     // Always show the dialog (it may have been dismissed previously)
@@ -2234,6 +2354,24 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
+                IconButton(
+                  tooltip: 'Reload (use if dialog appears stuck)',
+                  icon: Icon(Icons.refresh),
+                  onPressed: () {
+                    // Force-recreate the dialog WebView. We keep dialogController
+                    // alive across closes for fast re-opens, but if the shared
+                    // WebView renderer process gets wedged (e.g. by a heavy page
+                    // loaded in dialog2), this controller's view becomes stuck
+                    // and reopening shows the same wedge. This button is the
+                    // escape hatch.
+                    final old = dialogController;
+                    dialogController = null;
+                    if (old != null) _shutdownDialogWebView(old);
+                    setState(() => _dialog1Minimized = false);
+                    Navigator.of(ctx).pop();
+                    _openDialogWithWebview(_currentDialogText);
+                  },
+                ),
                 TextButton(
                   onPressed: () {
                     setState(() {
@@ -2545,8 +2683,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   return '';
                 })(window);
               ''';
+              // Timeout the JS call: if the main WebView's renderer is wedged
+              // (e.g. after a heavy page in a dialog jammed the shared renderer
+              // process), runJavaScriptReturningResult never resolves and the
+              // await blocks here forever — meaning open_in_new appears to do
+              // nothing. Falling back to empty text lets the dialog still open
+              // so the user can use the Reload button to recover.
               try {
-                final result = await _controller.runJavaScriptReturningResult(js);
+                final result = await _controller
+                    .runJavaScriptReturningResult(js)
+                    .timeout(const Duration(seconds: 2));
                 text = result.toString().replaceAll('"', '');
               } catch (_) {}
             }

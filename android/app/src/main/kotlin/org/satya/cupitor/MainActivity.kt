@@ -171,6 +171,15 @@ class MainActivity : FlutterActivity() {
                     adBlockEnabled = enabled
                     result.success(null)
                 }
+                "flushCookies" -> {
+                    // WebView cookies are flushed periodically; force a flush here
+                    // (called on app pause) so logins survive a force-kill before
+                    // the next periodic write.
+                    try {
+                        android.webkit.CookieManager.getInstance().flush()
+                    } catch (_: Exception) { /* best-effort */ }
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         }
