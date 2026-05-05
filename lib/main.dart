@@ -69,6 +69,28 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String? _extractedPdfHtml;
   String _lastStartedUrl = '';
   bool _isEinkMode = true;
+  // Mirrors _isEinkMode for widgets that live outside the State's rebuild scope
+  // — namely the WebViews inside `showDialog`-built dialog routes, which the
+  // parent's setState() does not reach. Updated alongside _isEinkMode in the
+  // Tools-drawer toggle.
+  final ValueNotifier<bool> _einkModeNotifier = ValueNotifier(true);
+  static const ColorFilter _einkColorFilter = ColorFilter.matrix([
+    0.1913, 0.6437, 0.0650, 0, 0.05,
+    0.1850, 0.6222, 0.0628, 0, 0.04,
+    0.1722, 0.5793, 0.0585, 0, 0.02,
+    0,      0,      0,      1, 0,
+  ]);
+  static const ColorFilter _identityColorFilter = ColorFilter.matrix([
+    1, 0, 0, 0, 0,
+    0, 1, 0, 0, 0,
+    0, 0, 1, 0, 0,
+    0, 0, 0, 1, 0,
+  ]);
+  // In-memory buffer for console output captured from the injected remote
+  // snippet. Lives until the app process exits — no persistence.
+  final List<String> _snippetLogs = [];
+  final ValueNotifier<int> _snippetLogVersion = ValueNotifier(0);
+  static const int _kSnippetLogCap = 500;
   bool _showToolbar = false;
   bool _showAppBar = true;
   String? _githubToken;
@@ -132,6 +154,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _urlController.dispose();
     _findController.dispose();
     _dialogErrorNotifier.dispose();
+    _einkModeNotifier.dispose();
+    _snippetLogVersion.dispose();
     // Clean up all dialog controllers on app dispose
     dialogController = null;
     _dialog2Controllers.clear();
@@ -201,6 +225,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
         ..addJavaScriptChannel('AdHostDetector', onMessageReceived: (msg) => _onJsAdHostDetected(msg.message))
+        ..addJavaScriptChannel('SnippetLogChannel', onMessageReceived: (msg) {
+          final raw = msg.message;
+          final pipe = raw.indexOf('|');
+          if (pipe < 0) {
+            _appendSnippetLog('log', raw);
+          } else {
+            _appendSnippetLog(raw.substring(0, pipe), raw.substring(pipe + 1));
+          }
+        })
         ..setNavigationDelegate(
           NavigationDelegate(
             onNavigationRequest: (request) async {
@@ -1070,14 +1103,81 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     ).timeout(const Duration(seconds: 5)).then((response) {
       if (response.statusCode == 200) {
         _cachedRemoteSnippet = response.body;
-        _controller.runJavaScript(_cachedRemoteSnippet!);
+        _controller.runJavaScript(_wrapSnippetWithLogShim(_cachedRemoteSnippet!));
       }
     }).catchError((_) {
       // Network unavailable, timeout, or server error — skip silently
       if (_cachedRemoteSnippet != null) {
-        _controller.runJavaScript(_cachedRemoteSnippet!);
+        _controller.runJavaScript(_wrapSnippetWithLogShim(_cachedRemoteSnippet!));
       }
     });
+  }
+
+  // Wraps the remote snippet in an outer IIFE that shadows `console` with a
+  // forwarder to SnippetLogChannel. Closure scope means only code inside this
+  // wrapper sees the shim — page scripts continue to use the global console.
+  String _wrapSnippetWithLogShim(String snippet) => '''
+(function() {
+  function _ser(args) {
+    return Array.from(args).map(function(a) {
+      if (typeof a === 'string') return a;
+      try { return JSON.stringify(a); } catch (e) { return String(a); }
+    }).join(' ');
+  }
+  function _s(level) {
+    return function() {
+      try { SnippetLogChannel.postMessage(level + '|' + _ser(arguments)); } catch (e) {}
+    };
+  }
+  var console = { log: _s('log'), info: _s('info'), warn: _s('warn'), error: _s('error'), debug: _s('debug') };
+  $snippet
+})();
+''';
+
+  void _appendSnippetLog(String level, String msg) {
+    final ts = DateTime.now().toIso8601String().substring(11, 19);
+    _snippetLogs.add('[$ts] [$level] $msg');
+    if (_snippetLogs.length > _kSnippetLogCap) {
+      _snippetLogs.removeRange(0, _snippetLogs.length - _kSnippetLogCap);
+    }
+    _snippetLogVersion.value++;
+  }
+
+  void _showSnippetLogs() {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => Scaffold(
+        appBar: AppBar(
+          title: const Text('Snippet logs'),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.delete_outline),
+              tooltip: 'Clear',
+              onPressed: () {
+                _snippetLogs.clear();
+                _snippetLogVersion.value++;
+              },
+            ),
+          ],
+        ),
+        body: SafeArea(
+          child: ValueListenableBuilder<int>(
+            valueListenable: _snippetLogVersion,
+            builder: (_, __, ___) => _snippetLogs.isEmpty
+                ? const Center(child: Text('No logs yet'))
+                : SingleChildScrollView(
+                    padding: const EdgeInsets.all(12),
+                    child: SelectableText(
+                      _snippetLogs.join('\n'),
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+          ),
+        ),
+      ),
+    ));
   }
 
   /// Attaches the native Android ad-blocking WebViewClient via a platform
@@ -1534,6 +1634,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       value: _isEinkMode,
                       onChanged: (val) {
                         setState(() => _isEinkMode = val);
+                        _einkModeNotifier.value = val;
                         setModalState(() {});
                         _injectEinkCss();
                         if (dialogController != null) _injectEinkCss(dialogController);
@@ -1614,6 +1715,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       onTap: () {
                         Navigator.of(ctx).pop();
                         _injectRemoteSnippet();
+                      },
+                    ),
+                    ListTile(
+                      leading: Icon(Icons.terminal),
+                      title: Text('View snippet logs'),
+                      subtitle: Text('${_snippetLogs.length} entries'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showSnippetLogs();
                       },
                     ),
                     if (_currentPdfUrl != null) ...[
@@ -2173,7 +2283,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       errorNotifier.value = null;
                       controller.loadRequest(Uri.parse(url));
                     })
-                  : WebViewWidget(controller: controller),
+                  : ValueListenableBuilder<bool>(
+                      valueListenable: _einkModeNotifier,
+                      builder: (_, eink, child) => ColorFiltered(
+                        colorFilter: eink ? _einkColorFilter : _identityColorFilter,
+                        child: child,
+                      ),
+                      child: WebViewWidget(controller: controller),
+                    ),
             ),
           ),
         ],
@@ -2401,7 +2518,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       _dialogErrorNotifier.value = null;
                       dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
                     })
-                  : WebViewWidget(controller: dialogController!),
+                  : ValueListenableBuilder<bool>(
+                      valueListenable: _einkModeNotifier,
+                      builder: (_, eink, child) => ColorFiltered(
+                        colorFilter: eink ? _einkColorFilter : _identityColorFilter,
+                        child: child,
+                      ),
+                      child: WebViewWidget(controller: dialogController!),
+                    ),
             ),
           ),
         ],
@@ -2726,19 +2850,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           children: [
             // Main content — fills entire screen
             ColorFiltered(
-              colorFilter: _isEinkMode
-                  ? const ColorFilter.matrix([
-                      0.1913, 0.6437, 0.0650, 0, 0.05,
-                      0.1850, 0.6222, 0.0628, 0, 0.04,
-                      0.1722, 0.5793, 0.0585, 0, 0.02,
-                      0,      0,      0,      1, 0,
-                    ])
-                  : const ColorFilter.matrix([
-                      1, 0, 0, 0, 0,
-                      0, 1, 0, 0, 0,
-                      0, 0, 1, 0, 0,
-                      0, 0, 0, 1, 0,
-                    ]),
+              colorFilter: _isEinkMode ? _einkColorFilter : _identityColorFilter,
               child: Stack(
                 children: [
                   WebViewWidget(controller: _controller),
