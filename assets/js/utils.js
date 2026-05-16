@@ -6,20 +6,6 @@
   const MAX_QUEUE_PER_FLUSH = 1500;   // bound collection work; rest picked up on next flush
   const YIELD_FALLBACK_MS = 16;       // ≈ one frame; leaves room for scroll/paint
 
-  // Streaming-output sites (chatgpt, claude, gemini, …) re-render their reply DOM
-  // token-by-token. Wrapping each word in a <span> mid-stream breaks markdown
-  // rendering and code highlighting — so word-click is disabled on these hosts.
-  const SKIP_HOSTNAMES = [
-    'chatgpt.com', 'chat.openai.com',
-    'claude.ai',
-    'gemini.google.com', 'bard.google.com',
-    'perplexity.ai',
-    'you.com',
-    'copilot.microsoft.com',
-  ];
-  const _host = (typeof location !== 'undefined' && location.hostname || '').toLowerCase();
-  if (SKIP_HOSTNAMES.some(h => _host === h || _host.endsWith('.' + h))) return;
-
   const SKIP_TAGS = new Set([
     'A', 'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'INPUT', 'SVG',
     'CANVAS', 'CODE', 'PRE'

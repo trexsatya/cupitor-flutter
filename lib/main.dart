@@ -52,6 +52,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // stay alive so the page state (scroll, form input) survives.
   bool _dialog1Minimized = false;
   bool _dialog1EverMinimized = false; // Track if dialog1 has ever been minimized
+  // Is dialog1 currently presented on the Navigator stack? Used to suppress
+  // duplicate showDialog pushes from re-entrant calls — e.g. voice input
+  // fired from inside the open dialog already updates the live WebView via
+  // runJavaScript, so it must not also push a fresh dialog route on top.
+  bool _dialog1Visible = false;
 
   // Multiple dialog2 instances - each link opens a new dialog
   Map<String, WebViewController> _dialog2Controllers = {};
@@ -100,6 +105,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String _pdfSelectedText = '';
   final stt.SpeechToText _speech = stt.SpeechToText();
   bool _isListening = false;
+  // Mirror of _isListening for widgets in showDialog routes (which the outer
+  // setState() doesn't reach).
+  final ValueNotifier<bool> _isListeningNotifier = ValueNotifier(false);
   final TextEditingController _findController = TextEditingController();
   int? _pendingScrollToPage;
   int? _pendingPdfPage;
@@ -125,6 +133,31 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // "piped.video", "yewtu.be") to redirect youtube.com URLs to. Persisted
   // under SharedPreferences key "youtubeFrontend".
   String? _youtubeFrontend;
+
+  // Filmot: persistent channel blacklist (results from these YouTube channels
+  // are hidden on filmot.com pages). Edited per-page from the dialog.
+  Set<String> _filmotChannelBlacklist = {};
+  // When true, blacklist is suppressed in-session only — not persisted.
+  bool _filmotBlacklistDisabled = false;
+  // Persisted list of saved videos. Each entry: {url, title, channel, savedAt}.
+  List<Map<String, String>> _savedVideos = [];
+  // Channels observed on the currently-loaded filmot page (in-memory only).
+  // Keyed by dialog id so multiple filmot dialogs don't clobber each other.
+  final Map<String, Set<String>> _filmotChannelsSeen = {};
+  // Persistent videoId → channelName cache. Populated by oEmbed lookups, used
+  // to apply the channel blacklist to Filmot search results (whose HTML does
+  // not include the channel name).
+  Map<String, String> _videoChannelCache = {};
+  // In-flight oEmbed lookups (by id) so duplicate batches don't double-fetch.
+  final Set<String> _videoChannelInflight = {};
+
+  // Floating minimized-dialog chips. They live on the root Overlay so they
+  // appear above any open showDialog route (the default bottom-right column
+  // is hidden behind a dialog's barrier and inaccessible while a dialog is
+  // showing). Each chip remembers its drag position keyed by dialog id.
+  OverlayEntry? _floatingChipsEntry;
+  final Map<String, Offset> _chipPositions = {};
+  final ValueNotifier<int> _minimizedVersion = ValueNotifier(0);
 
   // Pretend to be Chrome — the default Android WebView UA contains "; wv)",
   // which Google explicitly checks for and uses to refuse OAuth flows
@@ -166,6 +199,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _dialog2Urls.clear();
     _minimizedDialog2s.clear();
     _everMinimizedDialog2s.clear(); // Clean up tracking state
+    _floatingChipsEntry?.remove();
+    _floatingChipsEntry = null;
+    _minimizedVersion.dispose();
+    _isListeningNotifier.dispose();
     super.dispose();
   }
 
@@ -218,6 +255,24 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _pageZoomLevel = prefs.getInt('pageZoom') ?? 0;
       final yf = prefs.getString('youtubeFrontend');
       _youtubeFrontend = (yf != null && yf.isNotEmpty) ? yf : null;
+      _filmotChannelBlacklist = (prefs.getStringList('filmotChannelBlacklist') ?? []).toSet();
+      final savedJson = prefs.getString('savedVideos');
+      if (savedJson != null) {
+        try {
+          final decoded = jsonDecode(savedJson) as List<dynamic>;
+          _savedVideos = decoded.map((e) {
+            final m = (e as Map<String, dynamic>);
+            return m.map((k, v) => MapEntry(k, (v ?? '').toString()));
+          }).toList();
+        } catch (_) {}
+      }
+      final vcJson = prefs.getString('videoChannelCache');
+      if (vcJson != null) {
+        try {
+          final decoded = jsonDecode(vcJson) as Map<String, dynamic>;
+          _videoChannelCache = decoded.map((k, v) => MapEntry(k, v.toString()));
+        } catch (_) {}
+      }
       _controller = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(_userAgent)
@@ -225,6 +280,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
         ..addJavaScriptChannel('AdHostDetector', onMessageReceived: (msg) => _onJsAdHostDetected(msg.message))
+        ..addJavaScriptChannel('SelectionChannel', onMessageReceived: (_) {
+          if (Platform.isAndroid && !_showAppBar) _showAppBarWithTimer();
+        })
         ..addJavaScriptChannel('SnippetLogChannel', onMessageReceived: (msg) {
           final raw = msg.message;
           final pipe = raw.indexOf('|');
@@ -354,8 +412,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _injectJs();
               _injectAdBlocker();
               _injectSpaHook();
-              _injectEinkCss();
               _injectPageZoom();
+              _injectSelectionWatcher();
               // Detect PDF by content-type (handles non-.pdf URLs like download links)
               // and defer _injectPdfDetector so it never fires on native PDF pages.
               _detectPdfAndInject(url);
@@ -498,28 +556,33 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return path.toLowerCase().endsWith('.pdf');
   }
 
-  void _injectEinkCss([WebViewController? ctrl]) {
-    final enabled = _isEinkMode;
-    final js = '''
-      (function() {
-        const id = 'flutter_eink_style';
-        let el = document.getElementById(id);
-        if (${enabled ? 'true' : 'false'}) {
-          if (!el) {
-            el = document.createElement('style');
-            el.id = id;
-            document.head.appendChild(el);
-          }
-          // Applied to body (not html) — `filter` on the root element creates
-          // a new containing block for fixed-position descendants and can
-          // interfere with internal scroll containers on some sites.
-          el.textContent = 'body { filter: contrast(1.1) brightness(0.95) !important; }';
-        } else {
-          if (el) el.remove();
-        }
+  /// Watches the page for non-empty text selections and pings Flutter when one
+  /// appears, so we can pop the app bar back into view. Debounced so that the
+  /// channel doesn't fire for every cursor tick during a drag-select.
+  void _injectSelectionWatcher() {
+    _controller.runJavaScript(r'''
+      (function(){
+        if (window.__cupSelectionWatcher) return;
+        window.__cupSelectionWatcher = true;
+        var lastNonEmpty = '';
+        var timer = null;
+        document.addEventListener('selectionchange', function(){
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(function(){
+            try {
+              var s = (window.getSelection ? window.getSelection().toString() : '') || '';
+              s = s.trim();
+              if (s && s !== lastNonEmpty) {
+                lastNonEmpty = s;
+                try { SelectionChannel.postMessage('1'); } catch(e) {}
+              } else if (!s) {
+                lastNonEmpty = '';
+              }
+            } catch(e) {}
+          }, 150);
+        });
       })();
-    ''';
-    (ctrl ?? _controller).runJavaScript(js);
+    ''');
   }
 
   void _injectPageZoom() {
@@ -1636,11 +1699,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         setState(() => _isEinkMode = val);
                         _einkModeNotifier.value = val;
                         setModalState(() {});
-                        _injectEinkCss();
-                        if (dialogController != null) _injectEinkCss(dialogController);
-                        for (final c in _dialog2Controllers.values) {
-                          _injectEinkCss(c);
-                        }
                       },
                     ),
                     ListTile(
@@ -2100,10 +2158,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
     final errorNotifier = ValueNotifier<String?>(null);
     bool hasRedirected = false;
+    final String dialogIdForBridge = dialogId;
     late final WebViewController dialog2Controller;
     dialog2Controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setUserAgent(_userAgent)
+      ..addJavaScriptChannel('FilmotBridge', onMessageReceived: (msg) => _handleFilmotMessage(dialogIdForBridge, msg.message))
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (request) {
           if (!request.isMainFrame) return NavigationDecision.navigate;
@@ -2125,7 +2185,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         },
         onPageFinished: (finishedUrl) {
           _injectAdBlocker(dialog2Controller);
-          _injectEinkCss(dialog2Controller);
+          if (_isFilmotUrl(finishedUrl)) {
+            _injectFilmotHelper(dialog2Controller);
+          }
           // Detect wiktionary 404: /wiki/{word} page that doesn't exist
           final uri = Uri.tryParse(finishedUrl);
           if (!hasRedirected && uri != null
@@ -2166,6 +2228,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (controller == null || errorNotifier == null || url == null) return;
 
     _minimizedDialog2s.remove(dialogId); // Mark as not minimized
+    _bumpMinimizedVersion();
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
 
@@ -2181,6 +2244,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             onTap: () {
               _minimizedDialog2s.add(dialogId);
               Navigator.of(ctx).pop();
+              _bumpMinimizedVersion();
             },
             child: Container(
               color: Colors.transparent,
@@ -2188,7 +2252,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 child: GestureDetector(
                   onTap: () {}, // Prevent tap propagation from dialog content
                   child: Dialog(
-                    insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: screenHeight * 0.025),
+                    insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: 0),
                     child: _buildDialog2Content(ctx, dialogId, url, controller, errorNotifier, screenWidth, screenHeight),
                   ),
                 ),
@@ -2196,7 +2260,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             ),
           )
         : Dialog(
-            insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: screenHeight * 0.025),
+            insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: 0),
             child: _buildDialog2Content(ctx, dialogId, url, controller, errorNotifier, screenWidth, screenHeight),
           ),
     ).then((_) {
@@ -2214,7 +2278,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         _dialog2ErrorNotifiers.remove(dialogId);
         _dialog2Urls.remove(dialogId);
         _everMinimizedDialog2s.remove(dialogId); // Clean up tracking state
+        _filmotChannelsSeen.remove(dialogId);
+        _chipPositions.remove(dialogId);
       }
+      _bumpMinimizedVersion();
     });
   }
 
@@ -2237,13 +2304,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       double screenWidth, double screenHeight) {
     return Container(
       width: screenWidth * 0.98,
-      height: screenHeight * 0.95,
+      height: screenHeight,
       child: Column(
         children: [
           Container(
             padding: EdgeInsets.all(8),
             child: Row(
               children: [
+                IconButton(
+                  tooltip: 'Back',
+                  icon: const Icon(Icons.arrow_back, size: 20),
+                  onPressed: () async {
+                    if (await controller.canGoBack()) {
+                      await controller.goBack();
+                    } else if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('No previous page'), duration: Duration(seconds: 1)),
+                      );
+                    }
+                  },
+                ),
                 // Show dialog title with host name
                 Expanded(
                   child: Text(
@@ -2253,11 +2333,29 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
+                if (_isFilmotUrl(url)) ...[
+                  IconButton(
+                    tooltip: 'Channel blacklist (tap to edit / temporarily disable)',
+                    icon: Icon(Icons.block, size: 20),
+                    onPressed: () => _showFilmotChannelsDialog(ctx, dialogId, controller),
+                  ),
+                  IconButton(
+                    tooltip: 'Saved videos',
+                    icon: Icon(Icons.bookmark_outline, size: 20),
+                    onPressed: () => _showSavedVideosDialog(ctx),
+                  ),
+                  IconButton(
+                    tooltip: 'Save current video URL',
+                    icon: Icon(Icons.save_alt, size: 20),
+                    onPressed: () => _saveCurrentFilmotVideo(controller),
+                  ),
+                ],
                 TextButton(
                   onPressed: () {
                     _minimizedDialog2s.add(dialogId);
                     _everMinimizedDialog2s.add(dialogId); // Mark as ever minimized
                     Navigator.of(ctx).pop();
+                    _bumpMinimizedVersion();
                   },
                   child: Text('Minimize'),
                 ),
@@ -2269,6 +2367,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     // is still attached — `.then` cleanup may run after detach.
                     _shutdownDialogWebView(controller);
                     Navigator.of(ctx).pop();
+                    _bumpMinimizedVersion();
                   },
                   child: Text('Close'),
                 ),
@@ -2297,6 +2396,842 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       ),
     );
   }
+
+  // ---------- Floating minimized-dialog chips ----------
+
+  /// Inserts the overlay entry on first use; safe to call repeatedly.
+  void _ensureFloatingChipsOverlay() {
+    if (_floatingChipsEntry != null) return;
+    _floatingChipsEntry = OverlayEntry(builder: (_) {
+      return ValueListenableBuilder<int>(
+        valueListenable: _minimizedVersion,
+        builder: (ctx, _, __) {
+          final size = MediaQuery.of(ctx).size;
+          final chips = <Widget>[];
+          var slot = 0;
+          if (_dialog1Minimized) {
+            chips.add(_buildChip(
+              key: '__dialog1__',
+              defaultPos: _defaultChipPos(size, slot),
+              screenSize: size,
+              icon: const Icon(Icons.translate, size: 18, color: Colors.white),
+              label: 'Lookup',
+              onTap: _showDialog1,
+              onClose: () {
+                setState(() {
+                  _dialog1Minimized = false;
+                  _dialog1EverMinimized = false;
+                });
+                _bumpMinimizedVersion();
+              },
+            ));
+            slot++;
+          }
+          for (final dialogId in _minimizedDialog2s.toList()) {
+            final url = _dialog2Urls[dialogId] ?? '';
+            final host = Uri.tryParse(url)?.host ?? 'Dialog';
+            final label = host.length > 14 ? host.substring(0, 14) : host;
+            chips.add(_buildChip(
+              key: dialogId,
+              defaultPos: _defaultChipPos(size, slot),
+              screenSize: size,
+              icon: const Icon(Icons.menu_book, size: 18, color: Colors.white),
+              label: label,
+              onTap: () => _showDialog2(dialogId),
+              onClose: () => _closeMinimizedDialog2(dialogId),
+            ));
+            slot++;
+          }
+          return Stack(children: chips);
+        },
+      );
+    });
+    final overlay = Overlay.of(context, rootOverlay: true);
+    overlay.insert(_floatingChipsEntry!);
+  }
+
+  Offset _defaultChipPos(Size size, int slot) {
+    return Offset(size.width - 140, size.height - 80 - slot * 56.0);
+  }
+
+  Widget _buildChip({
+    required String key,
+    required Offset defaultPos,
+    required Size screenSize,
+    required Widget icon,
+    required String label,
+    required VoidCallback onTap,
+    required VoidCallback onClose,
+  }) {
+    return _FloatingDraggableChip(
+      key: ValueKey(key),
+      startPosition: _chipPositions[key] ?? defaultPos,
+      screenSize: screenSize,
+      icon: icon,
+      label: label,
+      onTap: onTap,
+      onClose: onClose,
+      onPositionChanged: (p) { _chipPositions[key] = p; },
+    );
+  }
+
+  void _bumpMinimizedVersion() {
+    _ensureFloatingChipsOverlay();
+    _minimizedVersion.value++;
+  }
+
+  void _closeMinimizedDialog2(String dialogId) {
+    final controller = _dialog2Controllers[dialogId];
+    if (controller != null) _shutdownDialogWebView(controller);
+    _dialog2ErrorNotifiers[dialogId]?.dispose();
+    _dialog2Controllers.remove(dialogId);
+    _dialog2ErrorNotifiers.remove(dialogId);
+    _dialog2Urls.remove(dialogId);
+    _minimizedDialog2s.remove(dialogId);
+    _everMinimizedDialog2s.remove(dialogId);
+    _filmotChannelsSeen.remove(dialogId);
+    if (mounted) setState(() {});
+    _bumpMinimizedVersion();
+  }
+
+  // ---------- Filmot helpers ----------
+
+  bool _isFilmotUrl(String? url) {
+    final host = Uri.tryParse(url ?? '')?.host ?? '';
+    return host.endsWith('filmot.com');
+  }
+
+  Future<void> _saveFilmotBlacklist() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('filmotChannelBlacklist', _filmotChannelBlacklist.toList());
+  }
+
+  Future<void> _saveSavedVideos() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('savedVideos', jsonEncode(_savedVideos));
+  }
+
+  /// Pushes the current blacklist + disabled state + known channel map into
+  /// the dialog WebView and re-runs the annotator. Safe to call before the
+  /// page has finished loading.
+  void _pushFilmotConfig(WebViewController controller) {
+    final list = jsonEncode(_filmotChannelBlacklist.toList());
+    final disabled = _filmotBlacklistDisabled ? 'true' : 'false';
+    final map = jsonEncode(_videoChannelCache);
+    controller.runJavaScript(
+      'window.__cupitorFilmotBlacklist = $list;'
+      'window.__cupitorFilmotBlacklistDisabled = $disabled;'
+      'window.__cupitorVideoChannel = Object.assign(window.__cupitorVideoChannel||{}, $map);'
+      'if (window.__cupitorFilmotApply) window.__cupitorFilmotApply();'
+    );
+  }
+
+  Future<void> _saveVideoChannelCache() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('videoChannelCache', jsonEncode(_videoChannelCache));
+  }
+
+  /// Resolves channel names for the given YouTube video IDs by calling the
+  /// public oEmbed endpoint (no auth, returns `author_name`). Caches results
+  /// in memory + SharedPreferences and pushes the resolved map back into all
+  /// open filmot dialogs so their annotators can hide blacklisted rows.
+  Future<void> _resolveVideoChannels(List<String> ids) async {
+    final pending = ids
+        .toSet()
+        .where((id) => id.isNotEmpty
+            && !_videoChannelCache.containsKey(id)
+            && !_videoChannelInflight.contains(id))
+        .toList();
+    if (pending.isEmpty) return;
+    _videoChannelInflight.addAll(pending);
+    bool anyResolved = false;
+    // Run up to 6 lookups in parallel; chunk through the list.
+    const concurrency = 6;
+    for (var i = 0; i < pending.length; i += concurrency) {
+      final batch = pending.skip(i).take(concurrency).toList();
+      await Future.wait(batch.map((id) async {
+        try {
+          final r = await http
+              .get(Uri.parse('https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=$id&format=json'))
+              .timeout(const Duration(seconds: 8));
+          if (r.statusCode == 200) {
+            final j = jsonDecode(r.body) as Map<String, dynamic>;
+            final author = (j['author_name'] ?? '').toString().trim();
+            if (author.isNotEmpty) {
+              _videoChannelCache[id] = author;
+              anyResolved = true;
+            } else {
+              _videoChannelCache[id] = ''; // negative cache to avoid retries
+            }
+          } else if (r.statusCode == 401 || r.statusCode == 404) {
+            _videoChannelCache[id] = '';
+          }
+        } catch (_) { /* leave uncached so we retry later */ }
+        _videoChannelInflight.remove(id);
+      }));
+      // Push partial results so the UI updates progressively.
+      if (anyResolved) {
+        for (final entry in _dialog2Controllers.entries) {
+          if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+        }
+      }
+    }
+    if (anyResolved) await _saveVideoChannelCache();
+  }
+
+  /// Injects the Filmot annotator into the dialog WebView. Idempotent — the
+  /// script self-guards against re-installation. Handles both layouts:
+  /// (a) search results — `<div id="vcard_{ytId}">` blocks with NO channel info
+  ///     in the HTML, resolved via Flutter-side oEmbed lookups;
+  /// (b) sidebyside detail — a single `a[href*="/channel/"]` whose text is
+  ///     the icon, so we read the channel name from the resolved map keyed by
+  ///     the video id in the URL.
+  void _injectFilmotHelper(WebViewController controller) {
+    final list = jsonEncode(_filmotChannelBlacklist.toList());
+    final disabled = _filmotBlacklistDisabled ? 'true' : 'false';
+    final map = jsonEncode(_videoChannelCache);
+    controller.runJavaScript('''
+      window.__cupitorFilmotBlacklist = $list;
+      window.__cupitorFilmotBlacklistDisabled = $disabled;
+      window.__cupitorVideoChannel = Object.assign(window.__cupitorVideoChannel||{}, $map);
+      (function(){
+        if (window.__cupitorFilmotInstalled) { if (window.__cupitorFilmotApply) window.__cupitorFilmotApply(); return; }
+        window.__cupitorFilmotInstalled = true;
+        function bridge(msg) { try { FilmotBridge.postMessage(JSON.stringify(msg)); } catch(e) {} }
+        function titleFromCard(card) {
+          var a = card.querySelector('a[id^="vlink"]');
+          if (a) return (a.textContent || '').trim().slice(0, 200);
+          var t = card.querySelector('h1,h2,h3,h4,h5,.title,[class*=title]');
+          if (t) return (t.textContent || '').trim().slice(0, 200);
+          return '';
+        }
+        // Set a value only if it differs from current, to skip layout thrashing
+        // when annotate runs repeatedly with the same data.
+        function setStyle(el, prop, val) { if (el.style[prop] !== val) el.style[prop] = val; }
+        function setText(el, val) { if (el.textContent !== val) el.textContent = val; }
+
+        // Auto-skip the currently-playing video if its channel is blacklisted.
+        // Filmot's prev/next buttons swap the iframe src in place — so the
+        // only reliable hook is to watch the iframe and invoke filmot's own
+        // navigateToLocalResult/nextVideo. Throttled to keep the skip from
+        // racing when several blocked channels are queued in a row.
+        var lastAutoSkipAt = 0;
+        var lastCheckedSrc = '';
+        function blacklistedChannelOf(videoId) {
+          if (!videoId) return null;
+          var disabled = window.__cupitorFilmotBlacklistDisabled === true;
+          if (disabled) return null;
+          var bl = window.__cupitorFilmotBlacklist || [];
+          if (!bl.length) return null;
+          var ch = (window.__cupitorVideoChannel || {})[videoId];
+          if (!ch) return null;
+          for (var i = 0; i < bl.length; i++) if (bl[i] === ch) return ch;
+          return null;
+        }
+        function currentVideoId() {
+          var ifr = document.getElementById('player');
+          if (ifr && ifr.src) {
+            var m = ifr.src.match(/youtube\\.com\\/embed\\/([A-Za-z0-9_-]{6,})/);
+            if (m) return m[1];
+          }
+          // Fallback to filmot's own global if it's defined.
+          if (typeof window.currentVideoID === 'string' && window.currentVideoID) return window.currentVideoID;
+          return null;
+        }
+        // Find the index of the currently-playing video in filmot's local
+        // vcard list (`<div class="vcardN ...">`). Needed by playNextVideo().
+        function currentVcardIndex() {
+          var id = currentVideoId();
+          if (!id) return -1;
+          var card = document.getElementById('vcard_' + id);
+          if (!card) return -1;
+          var m = (card.className || '').match(/(?:^|\\s)vcard(\\d+)(?:\\s|\$)/);
+          return m ? parseInt(m[1], 10) : -1;
+        }
+        function autoSkipIfBlacklisted(reason) {
+          var id = currentVideoId();
+          if (!id) return;
+          var ch = (window.__cupitorVideoChannel || {})[id];
+          if (ch === undefined) {
+            // Not resolved yet — ask Flutter to resolve so a later push can re-check.
+            bridge({action:'resolveVideos', ids:[id]});
+            return;
+          }
+          var blocked = blacklistedChannelOf(id);
+          if (!blocked) return;
+          var now = Date.now();
+          if (now - lastAutoSkipAt < 800) return;
+          lastAutoSkipAt = now;
+          try { if (typeof window.stopDownTimer === 'function') window.stopDownTimer(); } catch(e){}
+          // Preferred path: filmot's own next button carries the correct
+          // current index in its onclick, and uses playNextVideo() which
+          // already skips past `.d-none` cards.
+          try {
+            var btn = document.getElementById('nextVideoButton');
+            if (btn && !btn.classList.contains('d-none')) { btn.click(); return; }
+          } catch(e){}
+          // Fallback: derive the current index from the highlighted vcard
+          // and invoke playNextVideo directly.
+          try {
+            var idx = currentVcardIndex();
+            if (idx >= 0 && typeof window.playNextVideo === 'function') { window.playNextVideo(idx, 1); return; }
+          } catch(e){}
+          // Last-ditch fallbacks.
+          try {
+            if (typeof window.nextVideo === 'function') { window.nextVideo(); return; }
+            if (typeof window.navigateToLocalResult === 'function') window.navigateToLocalResult(1);
+          } catch(e){}
+        }
+
+        function annotate() {
+          var bl = window.__cupitorFilmotBlacklist || [];
+          var disabled = window.__cupitorFilmotBlacklistDisabled === true;
+          var map = window.__cupitorVideoChannel || {};
+          var blSet = {};
+          for (var i = 0; i < bl.length; i++) blSet[bl[i]] = true;
+
+          // --- (a) Search-result cards ---
+          var cards = document.querySelectorAll('[id^="vcard_"]');
+          var seenChannels = {};
+          var unknownIds = [];
+          for (var c = 0; c < cards.length; c++) {
+            var card = cards[c];
+            var id = card.id.replace(/^vcard_/, '');
+            if (!id) continue;
+            var ch = map[id];
+            if (ch === undefined) {
+              unknownIds.push(id);
+              setStyle(card, 'opacity', '0.6');
+            } else {
+              setStyle(card, 'opacity', '');
+              if (ch) seenChannels[ch] = true;
+              // Use Bootstrap's `d-none` instead of inline style so filmot's
+              // own playNextVideo()/playNextVideo prev path treats blacklisted
+              // cards as "skipped" — they call `card.classList.contains("d-none")`.
+              if (!disabled && ch && blSet[ch]) {
+                if (!card.classList.contains('d-none')) card.classList.add('d-none');
+              } else {
+                if (card.classList.contains('d-none')) card.classList.remove('d-none');
+              }
+            }
+            // Annotate once; label refreshed only when its text actually changes.
+            if (card.getAttribute('data-cup-ann') !== '1') {
+              card.setAttribute('data-cup-ann', '1');
+              var bar = document.createElement('div');
+              bar.className = '__cup_bar';
+              bar.style.cssText = 'display:flex;gap:4px;padding:2px 0;font-size:11px';
+              var label = document.createElement('span');
+              label.className = '__cup_channel_label';
+              label.style.cssText = 'flex:1;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+              bar.appendChild(label);
+              var bbtn = document.createElement('button');
+              bbtn.textContent = '🚫';
+              bbtn.title = 'Blacklist this channel';
+              bbtn.style.cssText = 'padding:1px 6px;font-size:11px;border:1px solid #888;background:#fee;cursor:pointer;border-radius:3px;line-height:1';
+              bbtn.onclick = (function(videoId, lbl){ return function(e){
+                e.preventDefault(); e.stopPropagation();
+                var channel = (window.__cupitorVideoChannel || {})[videoId];
+                if (!channel) { setText(lbl, '(no channel resolved yet)'); return; }
+                bridge({action:'blockChannel', channel: channel});
+              }; })(id, label);
+              bar.appendChild(bbtn);
+              var sbtn = document.createElement('button');
+              sbtn.textContent = '💾';
+              sbtn.title = 'Save video URL';
+              sbtn.style.cssText = 'padding:1px 6px;font-size:11px;border:1px solid #888;background:#efe;cursor:pointer;border-radius:3px;line-height:1';
+              sbtn.onclick = (function(videoId, btn, cardEl){ return function(e){
+                e.preventDefault(); e.stopPropagation();
+                var channel = (window.__cupitorVideoChannel || {})[videoId] || '';
+                bridge({action:'saveVideo', url:'https://www.youtube.com/watch?v=' + videoId, channel: channel, title: titleFromCard(cardEl)});
+                btn.textContent = '✅';
+              }; })(id, sbtn, card);
+              bar.appendChild(sbtn);
+              card.insertBefore(bar, card.firstChild);
+            }
+            var existingLabel = card.querySelector('.__cup_channel_label');
+            if (existingLabel) {
+              var lblText = (ch === undefined) ? '(resolving channel…)' : (ch === '' ? '(channel unknown)' : ch);
+              setText(existingLabel, lblText);
+            }
+          }
+
+          // --- (b) Detail-page channel link (no anchor text — read from URL) ---
+          var detailLinks = document.querySelectorAll('a[href*="/channel/"], a[href*="youtube.com/@"]');
+          var detailId = null;
+          var pm = location.pathname.match(/\\/sidebyside\\/([A-Za-z0-9_-]{6,})/);
+          if (pm) detailId = pm[1];
+          for (var d = 0; d < detailLinks.length; d++) {
+            var dl = detailLinks[d];
+            if (dl.getAttribute('data-cup-ann') === '1') continue;
+            dl.setAttribute('data-cup-ann', '1');
+            var lbl2 = document.createElement('span');
+            lbl2.className = '__cup_channel_label';
+            lbl2.style.cssText = 'margin:0 6px;font-size:12px;color:#444';
+            var ch2 = (detailId && map[detailId]) ? map[detailId] : '';
+            lbl2.textContent = ch2 || '(resolving channel…)';
+            if (ch2) seenChannels[ch2] = true;
+            dl.parentNode.insertBefore(lbl2, dl);
+            var b2 = document.createElement('button');
+            b2.textContent = '🚫';
+            b2.title = 'Blacklist this channel';
+            b2.style.cssText = 'margin:0 4px;padding:1px 6px;font-size:11px;border:1px solid #888;background:#fee;cursor:pointer;border-radius:3px;line-height:1';
+            b2.onclick = (function(vId, lbl){ return function(e){
+              e.preventDefault(); e.stopPropagation();
+              var ch = vId ? (window.__cupitorVideoChannel || {})[vId] : '';
+              if (!ch) { setText(lbl, '(no channel resolved yet)'); return; }
+              bridge({action:'blockChannel', channel: ch});
+            }; })(detailId, lbl2);
+            dl.parentNode.insertBefore(b2, dl.nextSibling);
+            if (detailId) {
+              unknownIds.push(detailId);
+              var s2 = document.createElement('button');
+              s2.textContent = '💾';
+              s2.title = 'Save video URL';
+              s2.style.cssText = 'margin:0 4px;padding:1px 6px;font-size:11px;border:1px solid #888;background:#efe;cursor:pointer;border-radius:3px;line-height:1';
+              s2.onclick = (function(vId, btn){ return function(e){
+                e.preventDefault(); e.stopPropagation();
+                var ch = (window.__cupitorVideoChannel || {})[vId] || '';
+                var ttl = document.title || '';
+                bridge({action:'saveVideo', url:'https://www.youtube.com/watch?v=' + vId, channel: ch, title: ttl});
+                btn.textContent = '✅';
+              }; })(detailId, s2);
+              dl.parentNode.insertBefore(s2, b2.nextSibling);
+            }
+          }
+
+          // Keep already-annotated detail-page labels in sync with the map.
+          var dLabels = document.querySelectorAll('a[data-cup-ann="1"]');
+          for (var dl2 = 0; dl2 < dLabels.length; dl2++) {
+            var prev = dLabels[dl2].previousSibling;
+            if (prev && prev.classList && prev.classList.contains('__cup_channel_label')) {
+              var dch = (detailId && map[detailId]) ? map[detailId] : '';
+              var dtxt = dch || ((detailId && map[detailId] === '') ? '(channel unknown)' : '(resolving channel…)');
+              setText(prev, dtxt);
+              if (dch) seenChannels[dch] = true;
+            }
+          }
+
+          // Report known channels to Flutter so the dialog UI can list them.
+          var seenArr = []; for (var k in seenChannels) seenArr.push(k);
+          bridge({action:'channelsSeen', channels: seenArr});
+          if (unknownIds.length) {
+            var dedup = {}; var uniq = [];
+            for (var u = 0; u < unknownIds.length; u++) { if (!dedup[unknownIds[u]]) { dedup[unknownIds[u]] = 1; uniq.push(unknownIds[u]); } }
+            bridge({action:'resolveVideos', ids: uniq});
+          }
+          // If the currently-playing video became blacklisted (new entry, or
+          // its channel just resolved), skip to the next one.
+          autoSkipIfBlacklisted('annotate');
+        }
+
+        // Debounced scheduler — protects the main thread from filmot's
+        // own constant DOM updates (subtitle highlights, time ticks, etc.).
+        var annotateTimer = null;
+        function scheduleAnnotate() {
+          if (annotateTimer) return;
+          annotateTimer = setTimeout(function(){
+            annotateTimer = null;
+            try { annotate(); } catch(e) {}
+          }, 400);
+        }
+        window.__cupitorFilmotApply = scheduleAnnotate;
+
+        // Only run annotate when DOM mutations actually involve a vcard or a
+        // channel link — ignore subtitle, badge, and player tick updates.
+        function relevant(mutations) {
+          for (var mi = 0; mi < mutations.length; mi++) {
+            var mu = mutations[mi];
+            if (mu.type !== 'childList') continue;
+            for (var ai = 0; ai < mu.addedNodes.length; ai++) {
+              var an = mu.addedNodes[ai];
+              if (!an || an.nodeType !== 1) continue;
+              if (an.id && an.id.indexOf('vcard_') === 0) return true;
+              // Skip the bars we insert ourselves
+              if (an.className === '__cup_bar' || an.className === '__cup_channel_label') continue;
+              if (an.querySelector && (an.querySelector('[id^="vcard_"]') || an.querySelector('a[href*="/channel/"]') || an.querySelector('a[href*="youtube.com/@"]'))) return true;
+            }
+            for (var ri = 0; ri < mu.removedNodes.length; ri++) {
+              var rn = mu.removedNodes[ri];
+              if (!rn || rn.nodeType !== 1) continue;
+              if (rn.id && rn.id.indexOf('vcard_') === 0) return true;
+            }
+          }
+          return false;
+        }
+
+        annotate();
+        var mo = new MutationObserver(function(mutations){
+          try { if (relevant(mutations)) scheduleAnnotate(); } catch(e) {}
+        });
+        mo.observe(document.body || document.documentElement, {childList:true, subtree:true});
+
+        // Watch the player iframe — filmot's Next/Prev buttons swap its src
+        // without navigating, so this is the only reliable signal that the
+        // currently-playing video has changed.
+        function attachIframeWatcher() {
+          var ifr = document.getElementById('player');
+          if (!ifr || ifr.__cupWatched) return;
+          ifr.__cupWatched = true;
+          var srcMo = new MutationObserver(function(){
+            if (ifr.src === lastCheckedSrc) return;
+            lastCheckedSrc = ifr.src;
+            autoSkipIfBlacklisted('iframe-src');
+          });
+          srcMo.observe(ifr, {attributes:true, attributeFilter:['src']});
+          lastCheckedSrc = ifr.src || '';
+          // Also fire once now in case the initial video is already blocked.
+          autoSkipIfBlacklisted('initial');
+        }
+        attachIframeWatcher();
+        // The iframe may not exist yet when we install — keep trying briefly.
+        var watcherTries = 0;
+        var watcherTimer = setInterval(function(){
+          watcherTries++;
+          attachIframeWatcher();
+          var ifr2 = document.getElementById('player');
+          if ((ifr2 && ifr2.__cupWatched) || watcherTries > 20) clearInterval(watcherTimer);
+        }, 300);
+      })();
+    ''');
+  }
+
+  void _handleFilmotMessage(String dialogId, String message) {
+    Map<String, dynamic> msg;
+    try { msg = jsonDecode(message) as Map<String, dynamic>; } catch (_) { return; }
+    final action = msg['action']?.toString();
+    if (action == 'channelsSeen') {
+      final list = (msg['channels'] as List?)?.map((e) => e.toString()).toSet() ?? <String>{};
+      _filmotChannelsSeen[dialogId] = list;
+    } else if (action == 'resolveVideos') {
+      final ids = (msg['ids'] as List?)?.map((e) => e.toString()).toList() ?? <String>[];
+      if (ids.isNotEmpty) {
+        // Fire-and-forget; _resolveVideoChannels pushes results back via JS.
+        _resolveVideoChannels(ids);
+      }
+    } else if (action == 'blockChannel') {
+      final channel = msg['channel']?.toString() ?? '';
+      if (channel.isEmpty) return;
+      _filmotChannelBlacklist.add(channel);
+      _saveFilmotBlacklist();
+      // Push updated config back to every active filmot dialog so all open
+      // dialogs immediately hide rows from this channel.
+      for (final entry in _dialog2Controllers.entries) {
+        if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Blacklisted: $channel'), duration: const Duration(seconds: 2)),
+        );
+      }
+    } else if (action == 'saveVideo') {
+      final url = msg['url']?.toString() ?? '';
+      if (url.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Could not detect a video URL on this page'), duration: Duration(seconds: 2)),
+          );
+        }
+        return;
+      }
+      final title = msg['title']?.toString() ?? '';
+      if (_savedVideos.any((e) => e['url'] == url)) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Already saved: ${title.isNotEmpty ? title : url}'), duration: const Duration(seconds: 2)),
+          );
+        }
+        return;
+      }
+      _savedVideos.add({
+        'url': url,
+        'channel': msg['channel']?.toString() ?? '',
+        'title': title,
+        'savedAt': DateTime.now().toIso8601String(),
+      });
+      _saveSavedVideos();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Saved: ${title.isNotEmpty ? title : url} (${_savedVideos.length} total)'), duration: const Duration(seconds: 2)),
+        );
+      }
+    }
+  }
+
+  void _showFilmotChannelsDialog(BuildContext ctx, String dialogId, WebViewController controller) {
+    final seen = (_filmotChannelsSeen[dialogId] ?? <String>{}).toList()..sort();
+    showDialog(
+      context: ctx,
+      builder: (dctx) => StatefulBuilder(
+        builder: (dctx2, setStateDialog) {
+          // Union of "seen on this page" plus everything already blacklisted, so
+          // users can edit entries even when the relevant row isn't on screen.
+          final all = <String>{...seen, ..._filmotChannelBlacklist}.toList()..sort();
+          return AlertDialog(
+            title: Row(
+              children: [
+                Expanded(child: Text('Channel blacklist')),
+                Tooltip(
+                  message: 'Temporarily ignore the blacklist for this session — useful when too few matches show up.',
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('Disable', style: TextStyle(fontSize: 12)),
+                      Switch(
+                        value: _filmotBlacklistDisabled,
+                        onChanged: (v) {
+                          setState(() => _filmotBlacklistDisabled = v);
+                          setStateDialog(() {});
+                          for (final entry in _dialog2Controllers.entries) {
+                            if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                          }
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: all.isEmpty
+                  ? Text('No channels seen yet on this page.')
+                  : ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: all.length,
+                      itemBuilder: (_, i) {
+                        final name = all[i];
+                        final blocked = _filmotChannelBlacklist.contains(name);
+                        return CheckboxListTile(
+                          dense: true,
+                          title: Text(name, overflow: TextOverflow.ellipsis),
+                          value: blocked,
+                          onChanged: (v) {
+                            setState(() {
+                              if (v == true) {
+                                _filmotChannelBlacklist.add(name);
+                              } else {
+                                _filmotChannelBlacklist.remove(name);
+                              }
+                            });
+                            _saveFilmotBlacklist();
+                            setStateDialog(() {});
+                            for (final entry in _dialog2Controllers.entries) {
+                              if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                            }
+                          },
+                        );
+                      },
+                    ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  setState(() => _filmotChannelBlacklist.clear());
+                  _saveFilmotBlacklist();
+                  setStateDialog(() {});
+                  for (final entry in _dialog2Controllers.entries) {
+                    if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                  }
+                },
+                child: Text('Clear all'),
+              ),
+              TextButton(onPressed: () => Navigator.of(dctx).pop(), child: Text('Done')),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// Asks the dialog WebView for the YouTube URL of the focused result on the
+  /// current Filmot page, then saves it. "Focused" = the row currently nearest
+  /// the viewport center, which works for both the search-results layout (many
+  /// rows) and the single-video layout (one row).
+  Future<void> _saveCurrentFilmotVideo(WebViewController controller) async {
+    // Filmot's search-results page hosts the player at the top and a list of
+    // result cards in a sidebar. Clicking "Next video" swaps the iframe `src`
+    // and the `#divVideoDetails` content via JS — the page URL does not
+    // change. So derive the *currently playing* video id from the live iframe
+    // first, then fall back to other signals.
+    const js = r'''
+      (function(){
+        function ytIdFromAny(href) {
+          if (!href) return null;
+          var pats = [
+            /youtube\.com\/embed\/([A-Za-z0-9_-]{6,})/,
+            /youtube\.com\/watch\?v=([A-Za-z0-9_-]{6,})/,
+            /youtu\.be\/([A-Za-z0-9_-]{6,})/,
+            /[?&]v=([A-Za-z0-9_-]{6,})/,
+            /\/sidebyside\/([A-Za-z0-9_-]{6,})/,
+            /\/(?:video|watch)\/([A-Za-z0-9_-]{6,})/
+          ];
+          for (var i = 0; i < pats.length; i++) { var m = href.match(pats[i]); if (m) return m[1]; }
+          return null;
+        }
+        function packFor(id, fallbackTitle) {
+          var ch = (window.__cupitorVideoChannel || {})[id] || '';
+          var tEl = document.querySelector('#divVideoDetails .col-6');
+          var t = tEl ? (tEl.textContent || '').trim().split(/\s*[\r\n]+/)[0].slice(0, 200) : '';
+          if (!t) t = (fallbackTitle || document.title || '').trim().slice(0, 200);
+          return JSON.stringify({ url: 'https://www.youtube.com/watch?v=' + id, channel: ch, title: t });
+        }
+        // 1. The live iframe is the most reliable signal — it always reflects
+        //    the currently playing video, including after a JS-driven "Next".
+        var ifr = document.getElementById('player');
+        if (ifr && ifr.src) {
+          var id1 = ytIdFromAny(ifr.src);
+          if (id1) return packFor(id1, '');
+        }
+        // 2. The "Open on youtube:" / external-link anchor in #divVideoDetails
+        //    updates alongside the iframe.
+        var detailA = document.querySelector('#divVideoDetails a[href*="watch?v="], #linktoyoutube a[href*="watch?v="]');
+        if (detailA) {
+          var id2 = ytIdFromAny(detailA.href || detailA.getAttribute('href') || '');
+          if (id2) return packFor(id2, detailA.textContent || '');
+        }
+        // 3. URL-based: only true on the standalone /sidebyside/ detail page.
+        var pm = location.pathname.match(/\/sidebyside\/([A-Za-z0-9_-]{6,})/);
+        if (pm) return packFor(pm[1], '');
+        // 4. Last resort — pick the vcard nearest the viewport center.
+        var cards = Array.prototype.slice.call(document.querySelectorAll('[id^="vcard_"]'));
+        var center = window.innerHeight / 2;
+        var best = null, bestDist = Infinity;
+        for (var i = 0; i < cards.length; i++) {
+          var c = cards[i];
+          var r = c.getBoundingClientRect();
+          if (r.bottom < 0 || r.top > window.innerHeight) continue;
+          var d = Math.abs((r.top + r.bottom) / 2 - center);
+          if (d < bestDist) { bestDist = d; best = c; }
+        }
+        if (!best) return JSON.stringify({});
+        var id4 = best.id.replace(/^vcard_/, '');
+        var titleA = best.querySelector('a[id^="vlink"]');
+        return packFor(id4, titleA ? titleA.textContent || '' : '');
+      })();
+    ''';
+    try {
+      final raw = await controller.runJavaScriptReturningResult(js);
+      // Returned as a JSON string (double-encoded on some platforms).
+      var s = raw.toString();
+      if (s.startsWith('"') && s.endsWith('"')) {
+        s = jsonDecode(s) as String;
+      }
+      final data = jsonDecode(s) as Map<String, dynamic>;
+      final url = data['url']?.toString() ?? '';
+      if (url.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('No video URL found on screen'), duration: const Duration(seconds: 2)),
+          );
+        }
+        return;
+      }
+      _handleFilmotMessage('__manual__', jsonEncode({
+        'action': 'saveVideo',
+        'url': url,
+        'channel': data['channel']?.toString() ?? '',
+        'title': data['title']?.toString() ?? '',
+      }));
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Save failed: $e'), duration: const Duration(seconds: 2)),
+        );
+      }
+    }
+  }
+
+  void _showSavedVideosDialog(BuildContext ctx) {
+    showDialog(
+      context: ctx,
+      builder: (dctx) => StatefulBuilder(
+        builder: (dctx2, setStateDialog) => AlertDialog(
+          title: Text('Saved videos (${_savedVideos.length})'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: _savedVideos.isEmpty
+                ? Text('Nothing saved yet.')
+                : ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: _savedVideos.length,
+                    itemBuilder: (_, i) {
+                      final v = _savedVideos[i];
+                      final title = v['title']?.isNotEmpty == true ? v['title']! : v['url']!;
+                      final subtitle = [v['channel'], v['url']].where((s) => s != null && s.isNotEmpty).join(' · ');
+                      return ListTile(
+                        dense: true,
+                        title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        subtitle: Text(subtitle, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 11)),
+                        trailing: IconButton(
+                          icon: Icon(Icons.delete_outline, size: 20),
+                          onPressed: () {
+                            setState(() => _savedVideos.removeAt(i));
+                            _saveSavedVideos();
+                            setStateDialog(() {});
+                          },
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: _savedVideos.isEmpty ? null : () {
+                final urls = _savedVideos.map((v) => v['url']).whereType<String>().join('\n');
+                Clipboard.setData(ClipboardData(text: urls));
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  SnackBar(content: Text('Copied ${_savedVideos.length} URLs'), duration: const Duration(seconds: 2)),
+                );
+              },
+              child: Text('Copy URLs'),
+            ),
+            TextButton(
+              onPressed: _savedVideos.isEmpty ? null : () {
+                final lines = _savedVideos.map((v) {
+                  return [v['title'] ?? '', v['channel'] ?? '', v['url'] ?? '', v['savedAt'] ?? '']
+                      .map((s) => s.replaceAll('"', '""'))
+                      .map((s) => '"$s"')
+                      .join(',');
+                }).join('\n');
+                final header = '"title","channel","url","savedAt"\n';
+                Clipboard.setData(ClipboardData(text: header + lines));
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  SnackBar(content: Text('Copied CSV'), duration: const Duration(seconds: 2)),
+                );
+              },
+              child: Text('Copy CSV'),
+            ),
+            TextButton(
+              onPressed: _savedVideos.isEmpty ? null : () {
+                showDialog(
+                  context: dctx,
+                  builder: (cctx) => AlertDialog(
+                    title: Text('Clear all saved videos?'),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.of(cctx).pop(), child: Text('Cancel')),
+                      TextButton(
+                        onPressed: () {
+                          setState(() => _savedVideos.clear());
+                          _saveSavedVideos();
+                          setStateDialog(() {});
+                          Navigator.of(cctx).pop();
+                        },
+                        child: Text('Clear'),
+                      ),
+                    ],
+                  ),
+                );
+              },
+              child: Text('Clear'),
+            ),
+            TextButton(onPressed: () => Navigator.of(dctx).pop(), child: Text('Close')),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ---------- end Filmot helpers ----------
 
   String getUrlForLanguage(String lang) {
     return _dialogUrl + '?lang=' + (_languageParams[lang] ?? lang);
@@ -2404,7 +3339,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             },
             onPageFinished: (url) {
               _injectAdBlocker(dialogController);
-              _injectEinkCss(dialogController);
               dialogController?.runJavaScript(jsCodeToFilterData(_currentDialogText));
             },
           ),
@@ -2419,12 +3353,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   void _showDialog1() {
     if (dialogController == null) return;
+    // Already on screen — nothing to push. The caller's content update via
+    // dialogController.runJavaScript will reach the live WebView regardless.
+    if (_dialog1Visible) {
+      if (_dialog1Minimized) setState(() => _dialog1Minimized = false);
+      return;
+    }
     setState(() => _dialog1Minimized = false);
+    _bumpMinimizedVersion();
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
 
     // If dialog has been minimized before, tapping outside should minimize, not close
     final hasBeenMinimized = _dialog1EverMinimized;
+    _dialog1Visible = true;
 
     showDialog(
       context: context,
@@ -2435,6 +3377,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             onTap: () {
               setState(() => _dialog1Minimized = true);
               Navigator.of(ctx).pop();
+              _bumpMinimizedVersion();
             },
             child: Container(
               color: Colors.transparent,
@@ -2442,7 +3385,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 child: GestureDetector(
                   onTap: () {}, // Prevent tap propagation from dialog content
                   child: Dialog(
-                    insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: screenHeight * 0.025),
+                    insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: 0),
                     child: _buildDialog1Content(ctx, screenWidth, screenHeight),
                   ),
                 ),
@@ -2450,20 +3393,21 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             ),
           )
         : Dialog(
-            insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: screenHeight * 0.025),
+            insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: 0),
             child: _buildDialog1Content(ctx, screenWidth, screenHeight),
           ),
     ).then((_) {
       // Dialog closed - but keep controller alive to avoid reloading.
       // Controller will be cleaned up only when app is disposed or language changes.
       // This prevents unnecessary reloads when reopening the dialog.
+      _dialog1Visible = false;
     });
   }
 
   Widget _buildDialog1Content(BuildContext ctx, double screenWidth, double screenHeight) {
     return Container(
       width: screenWidth,
-      height: screenHeight * 0.95,
+      height: screenHeight,
       child: Column(
         children: [
           Container(
@@ -2471,6 +3415,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
+                ValueListenableBuilder<bool>(
+                  // The mic state changes async inside _speech callbacks, so
+                  // the outer State's setState() doesn't repaint the dialog
+                  // route — listen to the mirrored notifier instead.
+                  valueListenable: _isListeningNotifier,
+                  builder: (_, listening, __) => IconButton(
+                    tooltip: listening ? 'Stop listening' : 'Voice input',
+                    icon: Icon(
+                      listening ? Icons.mic : Icons.mic_none,
+                      color: listening ? Colors.red : null,
+                    ),
+                    onPressed: _toggleVoiceInput,
+                  ),
+                ),
                 IconButton(
                   tooltip: 'Reload (use if dialog appears stuck)',
                   icon: Icon(Icons.refresh),
@@ -2496,6 +3454,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       _dialog1EverMinimized = true; // Mark as ever minimized
                     });
                     Navigator.of(ctx).pop();
+                    _bumpMinimizedVersion();
                   },
                   child: Text('Minimize'),
                 ),
@@ -2504,6 +3463,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     // Clear minimized state when manually closing
                     setState(() => _dialog1Minimized = false);
                     Navigator.of(ctx).pop();
+                    _bumpMinimizedVersion();
                   },
                   child: Text('Close'),
                 ),
@@ -2545,6 +3505,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (_isListening) {
       await _speech.stop();
       setState(() => _isListening = false);
+            _isListeningNotifier.value = false;
       // Resume normal app bar timer behavior when voice input stops
       if (_showAppBar && Platform.isAndroid) {
         _showAppBarWithTimer();
@@ -2560,6 +3521,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           if (status == 'done' || status == 'notListening') {
             if (mounted && _isListening) {
               setState(() => _isListening = false);
+            _isListeningNotifier.value = false;
               // Resume normal timer behavior when voice input stops
               if (_showAppBar && Platform.isAndroid) {
                 _showAppBarWithTimer();
@@ -2575,6 +3537,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           debugPrint('Speech error: $error');
           if (mounted) {
             setState(() => _isListening = false);
+            _isListeningNotifier.value = false;
             // Resume normal timer behavior on error
             if (_showAppBar && Platform.isAndroid) {
               _showAppBarWithTimer();
@@ -2589,6 +3552,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         return;
       }
       setState(() => _isListening = true);
+      _isListeningNotifier.value = true;
       await _speech.listen(
         localeId: _speechLocale(),
         onResult: (result) {
@@ -2596,6 +3560,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           if (result.finalResult && lastWords.isNotEmpty) {
             _speech.stop();
             setState(() => _isListening = false);
+            _isListeningNotifier.value = false;
             // Resume normal timer behavior when voice input completes
             if (_showAppBar && Platform.isAndroid) {
               _showAppBarWithTimer();
@@ -2612,6 +3577,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       debugPrint('Speech init error: $e');
       if (mounted) {
         setState(() => _isListening = false);
+            _isListeningNotifier.value = false;
         // Resume normal timer behavior on error
         if (_showAppBar && Platform.isAndroid) {
           _showAppBarWithTimer();
@@ -2692,20 +3658,56 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   Timer? _appBarTimer;
   DateTime? _lastTapTime;
+  // Long-press tracking — fires a top-bar toggle if the pointer stays down
+  // for ~500ms without significant movement. We must NOT consume the touch
+  // (the WebView still needs it for native text selection), so this lives
+  // inside the existing translucent Listener.
+  Timer? _longPressTimer;
+  Offset? _pointerDownPos;
+  static const double _kLongPressMoveSlop = 12.0;
+  static const Duration _kLongPressDuration = Duration(milliseconds: 500);
 
   void _handleDoubleTapDetection() {
     final now = DateTime.now();
     if (_lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 400)) {
       _lastTapTime = null;
-      if (_showAppBar) {
-        _appBarTimer?.cancel();
-        setState(() => _showAppBar = false);
-      } else {
-        _showAppBarWithTimer();
-      }
+      _toggleAppBar();
     } else {
       _lastTapTime = now;
     }
+  }
+
+  void _toggleAppBar() {
+    if (_showAppBar) {
+      _appBarTimer?.cancel();
+      setState(() => _showAppBar = false);
+    } else {
+      _showAppBarWithTimer();
+    }
+  }
+
+  void _onPagePointerDown(PointerDownEvent e) {
+    _handleDoubleTapDetection();
+    _pointerDownPos = e.position;
+    _longPressTimer?.cancel();
+    _longPressTimer = Timer(_kLongPressDuration, () {
+      _longPressTimer = null;
+      _toggleAppBar();
+    });
+  }
+
+  void _onPagePointerMove(PointerMoveEvent e) {
+    if (_longPressTimer == null || _pointerDownPos == null) return;
+    if ((e.position - _pointerDownPos!).distance > _kLongPressMoveSlop) {
+      _longPressTimer?.cancel();
+      _longPressTimer = null;
+    }
+  }
+
+  void _onPagePointerUp(PointerUpEvent _) {
+    _longPressTimer?.cancel();
+    _longPressTimer = null;
+    _pointerDownPos = null;
   }
 
   void _showAppBarWithTimer() {
@@ -2896,12 +3898,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 ],
               ),
             ),
-            // Double-tap detector (Android only — macOS keeps app bar always visible)
+            // Double-tap + long-press detector (Android only — macOS keeps the
+            // app bar always visible). Listener doesn't consume events, so the
+            // WebView still gets the touches for native text selection.
             if (Platform.isAndroid)
               Positioned.fill(
                 child: Listener(
                   behavior: HitTestBehavior.translucent,
-                  onPointerDown: (_) => _handleDoubleTapDetection(),
+                  onPointerDown: _onPagePointerDown,
+                  onPointerMove: _onPagePointerMove,
+                  onPointerUp: _onPagePointerUp,
+                  onPointerCancel: (_) { _longPressTimer?.cancel(); _longPressTimer = null; _pointerDownPos = null; },
                 ),
               ),
             // Transparent overlay to unfocus URL bar when tapping the page
@@ -2973,45 +3980,108 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   ),
                 ),
               ),
-            // Restore buttons for minimized dialog webviews
-            if (_dialog1Minimized || _minimizedDialog2s.isNotEmpty)
-              Positioned(
-                right: 16,
-                bottom: 16,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    // Multiple dialog2 restore buttons
-                    ..._minimizedDialog2s.map((dialogId) {
-                      final url = _dialog2Urls[dialogId] ?? '';
-                      final host = Uri.tryParse(url)?.host ?? 'Dialog';
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 8),
-                        child: FloatingActionButton.extended(
-                          heroTag: 'restoreDialog2_$dialogId',
-                          tooltip: 'Restore: $host',
-                          onPressed: () => _showDialog2(dialogId),
-                          icon: const Icon(Icons.menu_book, size: 16),
-                          label: Text(
-                            host.length > 12 ? '${host.substring(0, 12)}...' : host,
-                            style: TextStyle(fontSize: 12),
-                          ),
-                        ),
-                      );
-                    }).toList(),
-                    // Dialog1 restore button
-                    if (_dialog1Minimized)
-                      FloatingActionButton.small(
-                        heroTag: 'restoreDialog1',
-                        tooltip: 'Restore dialog',
-                        onPressed: _showDialog1,
-                        child: const Icon(Icons.translate),
-                      ),
-                  ],
-                ),
-              ),
+            // Minimized-dialog chips live on the root overlay (see
+            // _ensureFloatingChipsOverlay) so they stay on top of any open
+            // dialog and can be dragged freely.
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A small draggable chip shown on the root overlay to represent a minimized
+/// dialog. Tap to restore; the trailing "×" closes the dialog entirely.
+class _FloatingDraggableChip extends StatefulWidget {
+  final Offset startPosition;
+  final Size screenSize;
+  final Widget icon;
+  final String label;
+  final VoidCallback onTap;
+  final VoidCallback onClose;
+  final ValueChanged<Offset>? onPositionChanged;
+  const _FloatingDraggableChip({
+    super.key,
+    required this.startPosition,
+    required this.screenSize,
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    required this.onClose,
+    this.onPositionChanged,
+  });
+  @override
+  State<_FloatingDraggableChip> createState() => _FloatingDraggableChipState();
+}
+
+class _FloatingDraggableChipState extends State<_FloatingDraggableChip> {
+  late Offset _pos = widget.startPosition;
+  bool _dragging = false;
+  static const double _kEstimatedWidth = 140;
+  static const double _kEstimatedHeight = 44;
+
+  @override
+  void didUpdateWidget(_FloatingDraggableChip old) {
+    super.didUpdateWidget(old);
+    // Re-clamp if the screen rotated and the chip would be off-screen.
+    final maxX = widget.screenSize.width - _kEstimatedWidth;
+    final maxY = widget.screenSize.height - _kEstimatedHeight;
+    if (_pos.dx > maxX || _pos.dy > maxY) {
+      _pos = Offset(_pos.dx.clamp(0.0, maxX), _pos.dy.clamp(0.0, maxY));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      left: _pos.dx,
+      top: _pos.dy,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onPanStart: (_) => setState(() => _dragging = true),
+        onPanUpdate: (d) {
+          setState(() {
+            final nx = (_pos.dx + d.delta.dx).clamp(0.0, widget.screenSize.width - _kEstimatedWidth);
+            final ny = (_pos.dy + d.delta.dy).clamp(0.0, widget.screenSize.height - _kEstimatedHeight);
+            _pos = Offset(nx, ny);
+          });
+          widget.onPositionChanged?.call(_pos);
+        },
+        onPanEnd: (_) => setState(() => _dragging = false),
+        // Treat a simple press as restore — onTap, not onPanEnd-without-movement,
+        // because GestureDetector resolves them independently.
+        onTap: widget.onTap,
+        child: Material(
+          elevation: _dragging ? 12 : 6,
+          color: Theme.of(context).primaryColor,
+          borderRadius: BorderRadius.circular(22),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(10, 6, 4, 6),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                widget.icon,
+                const SizedBox(width: 6),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 90),
+                  child: Text(
+                    widget.label,
+                    style: const TextStyle(color: Colors.white, fontSize: 12),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                InkWell(
+                  onTap: widget.onClose,
+                  customBorder: const CircleBorder(),
+                  child: const Padding(
+                    padding: EdgeInsets.all(4),
+                    child: Icon(Icons.close, color: Colors.white70, size: 16),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
