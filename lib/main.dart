@@ -11,6 +11,7 @@ import 'package:http/http.dart' as http;
 import 'package:pdfrx/pdfrx.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:google_mlkit_translation/google_mlkit_translation.dart' as mlkit;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -108,6 +109,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // Mirror of _isListening for widgets in showDialog routes (which the outer
   // setState() doesn't reach).
   final ValueNotifier<bool> _isListeningNotifier = ValueNotifier(false);
+  // Long-press-to-dictate mode: keeps the speech recognizer alive (auto-
+  // restarting across the package's per-utterance windows), accumulating
+  // transcript until the user taps again to stop.
+  bool _continuousVoiceActive = false;
+  final StringBuffer _continuousTranscript = StringBuffer();
+  String _continuousPartial = '';
   final TextEditingController _findController = TextEditingController();
   int? _pendingScrollToPage;
   int? _pendingPdfPage;
@@ -1758,12 +1765,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       },
                     ),
                     ListTile(
-                      leading: Icon(_isListening ? Icons.mic : Icons.mic_none,
-                          color: _isListening ? Colors.red : null),
-                      title: Text(_isListening ? 'Stop listening' : 'Voice input'),
+                      leading: Icon(Icons.bookmarks_outlined),
+                      title: Text('Bookmarks'),
                       onTap: () {
                         Navigator.of(ctx).pop();
-                        _toggleVoiceInput();
+                        _showBookmarks();
                       },
                     ),
                     ListTile(
@@ -2335,6 +2341,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 ),
                 if (_isFilmotUrl(url)) ...[
                   IconButton(
+                    tooltip: 'Capture subtitle (with context, translate, send to lookup)',
+                    icon: Icon(Icons.subtitles, size: 20),
+                    onPressed: () => _captureFilmotSubtitle(ctx, controller),
+                  ),
+                  IconButton(
                     tooltip: 'Channel blacklist (tap to edit / temporarily disable)',
                     icon: Icon(Icons.block, size: 20),
                     onPressed: () => _showFilmotChannelsDialog(ctx, dialogId, controller),
@@ -2350,16 +2361,19 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     onPressed: () => _saveCurrentFilmotVideo(controller),
                   ),
                 ],
-                TextButton(
+                IconButton(
+                  tooltip: 'Minimize',
+                  icon: const Icon(Icons.minimize, size: 20),
                   onPressed: () {
                     _minimizedDialog2s.add(dialogId);
                     _everMinimizedDialog2s.add(dialogId); // Mark as ever minimized
                     Navigator.of(ctx).pop();
                     _bumpMinimizedVersion();
                   },
-                  child: Text('Minimize'),
                 ),
-                TextButton(
+                IconButton(
+                  tooltip: 'Close',
+                  icon: const Icon(Icons.close, size: 20),
                   onPressed: () {
                     // Clear minimized state when manually closing
                     _minimizedDialog2s.remove(dialogId);
@@ -2369,7 +2383,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     Navigator.of(ctx).pop();
                     _bumpMinimizedVersion();
                   },
-                  child: Text('Close'),
                 ),
               ],
             ),
@@ -3047,6 +3060,823 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// current Filmot page, then saves it. "Focused" = the row currently nearest
   /// the viewport center, which works for both the search-results layout (many
   /// rows) and the single-video layout (one row).
+  // Maps our ISO-639-1 codes to ML Kit's TranslateLanguage enum. Returns null
+  // if the language isn't supported on-device.
+  mlkit.TranslateLanguage? _toMlKitLang(String code) {
+    switch (code.toLowerCase()) {
+      case 'sv': return mlkit.TranslateLanguage.swedish;
+      case 'es': return mlkit.TranslateLanguage.spanish;
+      case 'en': return mlkit.TranslateLanguage.english;
+      case 'de': return mlkit.TranslateLanguage.german;
+      case 'fr': return mlkit.TranslateLanguage.french;
+      case 'it': return mlkit.TranslateLanguage.italian;
+      case 'pt': return mlkit.TranslateLanguage.portuguese;
+      case 'nl': return mlkit.TranslateLanguage.dutch;
+      case 'no': return mlkit.TranslateLanguage.norwegian;
+      case 'da': return mlkit.TranslateLanguage.danish;
+      case 'fi': return mlkit.TranslateLanguage.finnish;
+      case 'pl': return mlkit.TranslateLanguage.polish;
+      case 'ru': return mlkit.TranslateLanguage.russian;
+      case 'ja': return mlkit.TranslateLanguage.japanese;
+      case 'zh': return mlkit.TranslateLanguage.chinese;
+      case 'ko': return mlkit.TranslateLanguage.korean;
+      case 'ar': return mlkit.TranslateLanguage.arabic;
+      case 'hi': return mlkit.TranslateLanguage.hindi;
+      case 'tr': return mlkit.TranslateLanguage.turkish;
+      default: return null;
+    }
+  }
+
+  /// Translates `text` using Android/iOS ML Kit on-device. Downloads the
+  /// required language models on first use (one-time, ~30MB per language).
+  /// Works offline once the models are present.
+  Future<String> _translateOnDevice(String text, String sourceLang, String targetLang) async {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      throw 'On-device translation requires Android or iOS';
+    }
+    final sl = _toMlKitLang(sourceLang);
+    final tl = _toMlKitLang(targetLang);
+    if (sl == null || tl == null) {
+      throw 'Unsupported language for ML Kit: $sourceLang→$targetLang';
+    }
+    final mm = mlkit.OnDeviceTranslatorModelManager();
+    if (!await mm.isModelDownloaded(sl.bcpCode)) {
+      await mm.downloadModel(sl.bcpCode);
+    }
+    if (!await mm.isModelDownloaded(tl.bcpCode)) {
+      await mm.downloadModel(tl.bcpCode);
+    }
+    final translator = mlkit.OnDeviceTranslator(sourceLanguage: sl, targetLanguage: tl);
+    try {
+      return await translator.translateText(text);
+    } finally {
+      await translator.close();
+    }
+  }
+
+  /// Translates a list of lines into the target language, preserving the list
+  /// order and length. Uses Google if `preferOnDevice` is false (auto-falls
+  /// back to on-device on failure); uses ML Kit directly when true. Empty
+  /// input lines come back as empty strings.
+  Future<List<String>> _translateLines(
+    List<String> lines,
+    String sourceLang,
+    String targetLang, {
+    required bool preferOnDevice,
+  }) async {
+    final out = List<String>.filled(lines.length, '');
+    if (lines.isEmpty) return out;
+    if (preferOnDevice) {
+      // Open one translator and reuse it for the whole batch.
+      final sl = _toMlKitLang(sourceLang);
+      final tl = _toMlKitLang(targetLang);
+      if (sl == null || tl == null) throw 'Unsupported language for ML Kit: $sourceLang→$targetLang';
+      final mm = mlkit.OnDeviceTranslatorModelManager();
+      if (!await mm.isModelDownloaded(sl.bcpCode)) await mm.downloadModel(sl.bcpCode);
+      if (!await mm.isModelDownloaded(tl.bcpCode)) await mm.downloadModel(tl.bcpCode);
+      final translator = mlkit.OnDeviceTranslator(sourceLanguage: sl, targetLanguage: tl);
+      try {
+        for (var i = 0; i < lines.length; i++) {
+          if (lines[i].trim().isEmpty) continue;
+          out[i] = await translator.translateText(lines[i]);
+        }
+        return out;
+      } finally {
+        await translator.close();
+      }
+    }
+    // Google path — N parallel HTTP calls in batches of 6. On any individual
+    // failure, fall back to on-device for that line (and the rest).
+    const concurrency = 6;
+    Object? googleErr;
+    for (var i = 0; i < lines.length; i += concurrency) {
+      final end = (i + concurrency < lines.length) ? i + concurrency : lines.length;
+      final futures = <Future<void>>[];
+      for (var j = i; j < end; j++) {
+        final idx = j;
+        if (lines[idx].trim().isEmpty) continue;
+        futures.add(() async {
+          try {
+            out[idx] = await _translateText(lines[idx], sourceLang, targetLang);
+          } catch (e) {
+            googleErr = e;
+          }
+        }());
+      }
+      await Future.wait(futures);
+      if (googleErr != null) break;
+    }
+    if (googleErr != null) {
+      // One or more failed via Google — finish the rest on-device.
+      final pending = <int>[];
+      for (var k = 0; k < lines.length; k++) {
+        if (out[k].isEmpty && lines[k].trim().isNotEmpty) pending.add(k);
+      }
+      if (pending.isNotEmpty) {
+        final fallback = await _translateLines(
+          pending.map((i) => lines[i]).toList(),
+          sourceLang, targetLang,
+          preferOnDevice: true,
+        );
+        for (var k = 0; k < pending.length; k++) {
+          out[pending[k]] = fallback[k];
+        }
+      }
+    }
+    return out;
+  }
+
+  /// Translates `text` via Google's public unauthenticated endpoint. Returns
+  /// the translation as a single string (segments rejoined). Throws on error.
+  Future<String> _translateText(String text, String sourceLang, String targetLang) async {
+    final uri = Uri.parse(
+      'https://translate.googleapis.com/translate_a/single'
+      '?client=gtx&sl=$sourceLang&tl=$targetLang&dt=t'
+      '&q=${Uri.encodeQueryComponent(text)}'
+    );
+    final resp = await http.get(uri).timeout(const Duration(seconds: 15));
+    if (resp.statusCode != 200) {
+      throw 'HTTP ${resp.statusCode}';
+    }
+    final body = jsonDecode(resp.body) as List;
+    final segments = body[0] as List;
+    final out = StringBuffer();
+    for (final seg in segments) {
+      if (seg is List && seg.isNotEmpty && seg[0] != null) {
+        out.write(seg[0].toString());
+      }
+    }
+    return out.toString();
+  }
+
+  /// Surfaces capture-time errors above the open Filmot dialog2 via a small
+  /// AlertDialog — the root ScaffoldMessenger's snackbars sit *behind* the
+  /// dialog and look like "nothing happened" to the user.
+  void _showCaptureError(String title, String message) {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dctx).pop(), child: const Text('OK')),
+        ],
+      ),
+    );
+  }
+
+  /// Scrapes the open Filmot detail page's subtitle list (`#subtitlesIn`),
+  /// finds the line that matches the URL's search query, and opens a dialog
+  /// where the user can adjust before/after context, translate, and hand
+  /// the result to dialog1 for word-level lookup.
+  Future<void> _captureFilmotSubtitle(BuildContext ctx, WebViewController controller) async {
+    const js = r'''
+      (function(){
+        var query = '';
+        try {
+          // Filmot search URL: /search/%22word%22/N → first segment after
+          // /search/ is the (URI-encoded) quoted query.
+          var m = location.pathname.match(/\/search\/([^/]+)/);
+          if (m) {
+            var raw = decodeURIComponent(m[1]);
+            // decodeURIComponent already converts %22 → ", so this strips
+            // the literal surrounding quotes left from the filmot syntax.
+            raw = raw.replace(/^["']+|["']+$/g, '');
+            query = raw;
+          }
+        } catch(e){}
+        // Identify the currently-playing video. iframe.src is the most
+        // reliable signal because filmot's Next/Prev swaps the src in place.
+        function ytId(href) {
+          if (!href) return null;
+          var pats = [
+            /youtube\.com\/embed\/([A-Za-z0-9_-]{6,})/,
+            /youtube\.com\/watch\?v=([A-Za-z0-9_-]{6,})/,
+            /youtu\.be\/([A-Za-z0-9_-]{6,})/,
+            /[?&]v=([A-Za-z0-9_-]{6,})/,
+            /\/sidebyside\/([A-Za-z0-9_-]{6,})/
+          ];
+          for (var p = 0; p < pats.length; p++) { var mmId = href.match(pats[p]); if (mmId) return mmId[1]; }
+          return null;
+        }
+        var videoId = null;
+        var ifr = document.getElementById('player');
+        if (ifr && ifr.src) videoId = ytId(ifr.src);
+        if (!videoId) {
+          var ax = document.querySelector('#divVideoDetails a[href*="watch?v="], #linktoyoutube a[href*="watch?v="]');
+          if (ax) videoId = ytId(ax.href || ax.getAttribute('href') || '');
+        }
+        if (!videoId) {
+          var pmSb = location.pathname.match(/\/sidebyside\/([A-Za-z0-9_-]{6,})/);
+          if (pmSb) videoId = pmSb[1];
+        }
+        var videoTitle = '';
+        var titleEl = document.querySelector('#divVideoDetails .col-6');
+        if (titleEl) videoTitle = (titleEl.textContent || '').trim().split(/\s*[\r\n]+/)[0].slice(0, 200);
+        if (!videoTitle) videoTitle = (document.title || '').trim();
+        var divs = document.querySelectorAll('#subtitlesIn > div[id^="s"]');
+        var lines = [];
+        for (var i = 0; i < divs.length; i++) {
+          var div = divs[i];
+          var a = div.querySelector('a[href*="jtt("]');
+          var ts = 0;
+          if (a) {
+            var mm = a.getAttribute('href').match(/jtt\((\d+),([\d.]+)\)/);
+            if (mm) ts = parseFloat(mm[2]);
+          }
+          var clone = div.cloneNode(true);
+          var anc = clone.querySelector('a');
+          if (anc) anc.parentNode.removeChild(anc);
+          var text = (clone.textContent || '').replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
+          var idM = div.id.match(/^s(\d+)/);
+          lines.push({ i: idM ? parseInt(idM[1], 10) : i, ts: ts, t: text });
+        }
+        // --- Robust match resolution ---
+        // Filmot does fuzzy/stemmed search across word forms (esp. in highly
+        // inflected languages like Swedish), so an exact substring lookup on
+        // the query word often misses. Try a cascade of strategies and remember
+        // which one fired so the UI can flag fallbacks.
+        function stripDiacritics(s) {
+          try { return s.normalize('NFD').replace(/[̀-ͯ]/g, ''); }
+          catch(e) { return s; }
+        }
+        function findMatch(lines, query) {
+          if (!query) return { idx: -1, reason: 'no-query' };
+          var q = query.toLowerCase();
+          // 1) Exact substring.
+          for (var i = 0; i < lines.length; i++) {
+            if (lines[i].t.toLowerCase().indexOf(q) !== -1) return { idx: i, reason: 'exact' };
+          }
+          // 2) Diacritic-insensitive substring (e.g. "atgang" matches "åtgång").
+          var qs = stripDiacritics(q);
+          if (qs !== q) {
+            for (var i2 = 0; i2 < lines.length; i2++) {
+              if (stripDiacritics(lines[i2].t.toLowerCase()).indexOf(qs) !== -1) return { idx: i2, reason: 'normalized' };
+            }
+          }
+          // 3) Stemmed prefix — drop trailing chars to catch inflections
+          // ("vakna" should match "vaknade", "vaknar", "vaknat", "vakn-up", ...).
+          for (var trim = 1; trim <= 4 && q.length - trim >= 3; trim++) {
+            var qt = stripDiacritics(q.substring(0, q.length - trim));
+            for (var i3 = 0; i3 < lines.length; i3++) {
+              if (stripDiacritics(lines[i3].t.toLowerCase()).indexOf(qt) !== -1) return { idx: i3, reason: 'stem(-' + trim + ')' };
+            }
+          }
+          // 4) Word-overlap — for multi-word queries, find the line containing
+          // the largest number of query tokens.
+          var tokens = q.split(/\s+/).filter(function(w){ return w.length > 1; });
+          if (tokens.length > 1) {
+            var best = -1, bestN = 0;
+            for (var i4 = 0; i4 < lines.length; i4++) {
+              var lt = stripDiacritics(lines[i4].t.toLowerCase());
+              var n = 0;
+              for (var t = 0; t < tokens.length; t++) {
+                if (lt.indexOf(stripDiacritics(tokens[t])) !== -1) n++;
+              }
+              if (n > bestN) { bestN = n; best = i4; }
+            }
+            if (best >= 0 && bestN >= Math.max(1, Math.ceil(tokens.length / 2))) {
+              return { idx: best, reason: 'tokens(' + bestN + '/' + tokens.length + ')' };
+            }
+          }
+          return { idx: -1, reason: 'no-match' };
+        }
+        var resolved = findMatch(lines, query);
+        var matchIdx = resolved.idx;
+        var matchReason = resolved.reason;
+        // 5) Time-based fallback — anchor at whatever subtitle is playing right now.
+        if (matchIdx < 0 && lines.length) {
+          try {
+            var ct = null;
+            if (window.player && typeof window.player.getCurrentTime === 'function') {
+              ct = window.player.getCurrentTime();
+            }
+            if (typeof ct === 'number' && ct >= 0) {
+              for (var ti = 0; ti < lines.length; ti++) {
+                var nxt = (ti + 1 < lines.length) ? lines[ti + 1].ts : (lines[ti].ts + 3);
+                if (ct >= lines[ti].ts && ct < nxt) { matchIdx = ti; matchReason = 'currentTime'; break; }
+              }
+              if (matchIdx < 0) { matchIdx = lines.length - 1; matchReason = 'currentTime'; }
+            }
+          } catch(e) {}
+        }
+        // 6) Last resort: first non-empty line.
+        if (matchIdx < 0) {
+          for (var fi = 0; fi < lines.length; fi++) {
+            if ((lines[fi].t || '').trim().length) { matchIdx = fi; matchReason = 'firstNonEmpty'; break; }
+          }
+        }
+        return JSON.stringify({
+          query: query,
+          lines: lines,
+          matchIdx: matchIdx,
+          matchReason: matchReason,
+          videoId: videoId || '',
+          videoUrl: videoId ? ('https://www.youtube.com/watch?v=' + videoId) : '',
+          videoTitle: videoTitle
+        });
+      })();
+    ''';
+    // Retry the scrape a few times — when filmot navigates Next/Prev it
+    // does a full page load and its own subtitle population may finish
+    // slightly after onPageFinished. Without a retry the user often gets
+    // an empty result on the first tap right after navigation.
+    Map<String, dynamic>? data;
+    Object? lastErr;
+    for (var attempt = 0; attempt < 4; attempt++) {
+      try {
+        final raw = await controller.runJavaScriptReturningResult(js);
+        var s = raw.toString();
+        if (s.startsWith('"') && s.endsWith('"')) s = jsonDecode(s) as String;
+        final d = jsonDecode(s) as Map<String, dynamic>;
+        final lines = (d['lines'] as List?) ?? const [];
+        if (lines.isNotEmpty) { data = d; break; }
+        // Empty page DOM — keep the last seen `d` in case all retries miss.
+        data = d;
+      } catch (e) {
+        lastErr = e;
+      }
+      if (attempt < 3) await Future.delayed(const Duration(milliseconds: 500));
+    }
+    if (data == null) {
+      _showCaptureError('Capture failed', 'Could not read the subtitle list.\n\n$lastErr');
+      return;
+    }
+    final linesRaw = (data['lines'] as List?) ?? const [];
+    final query = (data['query'] ?? '').toString();
+    var matchIdx = (data['matchIdx'] as num?)?.toInt() ?? -1;
+    final matchReason = (data['matchReason'] ?? '').toString();
+    final videoUrl = (data['videoUrl'] ?? '').toString();
+    final videoId = (data['videoId'] ?? '').toString();
+    final videoTitle = (data['videoTitle'] ?? '').toString();
+    if (linesRaw.isEmpty) {
+      _showCaptureError(
+        'No subtitle lines',
+        'Filmot has not loaded any subtitle lines on this page yet '
+        '(or this video has no captions). Wait a moment for the page '
+        'to settle and try again — if the player works, the captions '
+        'usually appear shortly after.',
+      );
+      return;
+    }
+    // The JS-side cascade should always have set matchIdx to something
+    // sensible when lines exist. If not (all-empty subtitle text, etc.),
+    // anchor on the first line so the user can still adjust manually.
+    if (matchIdx < 0) matchIdx = 0;
+    // Build structured {index, start, end, text} for every line in the page.
+    // End-time = next line's start (within the captured range we'll slice).
+    // For the absolute last line we add a 3s tail.
+    final allLines = <Map<String, dynamic>>[];
+    for (var i = 0; i < linesRaw.length; i++) {
+      final l = linesRaw[i] as Map<String, dynamic>;
+      allLines.add({
+        'index': (l['i'] as num?)?.toInt() ?? i,
+        'start': (l['ts'] as num?)?.toDouble() ?? 0.0,
+        'text': (l['t'] ?? '').toString(),
+        'end': 0.0,
+      });
+    }
+    for (var i = 0; i < allLines.length; i++) {
+      if (i + 1 < allLines.length) {
+        allLines[i]['end'] = allLines[i + 1]['start'];
+      } else {
+        allLines[i]['end'] = (allLines[i]['start'] as double) + 3.0;
+      }
+    }
+    if (!mounted) return;
+    _showSubtitleCaptureDialog(
+      ctx,
+      query: query,
+      allLines: allLines,
+      matchIdx: matchIdx,
+      matchReason: matchReason,
+      videoUrl: videoUrl,
+      videoId: videoId,
+      videoTitle: videoTitle,
+    );
+  }
+
+  void _showSubtitleCaptureDialog(BuildContext ctx, {
+    required String query,
+    required List<Map<String, dynamic>> allLines,
+    required int matchIdx,
+    required String matchReason,
+    required String videoUrl,
+    required String videoId,
+    required String videoTitle,
+  }) {
+    // matchIdx is mutable — the user can change the anchor line manually
+    // via the picker below.
+    int currentMatchIdx = matchIdx;
+    String currentMatchReason = matchReason;
+    int before = 2;
+    int after = 2;
+    // Parallel to the captured-range slice. Empty list = not translated yet.
+    List<String> translation = const [];
+    String? translationSource; // 'google' | 'on-device'
+    bool translating = false;
+    bool preferOnDevice = false;
+    String? translateError;
+    // Memo key — if before/after changes after a translation, invalidate it.
+    String? translatedFor;
+    // Per-line editable text. Keyed by `allLines` index so original edits
+    // survive slider changes (the underlying `allLines` entry persists).
+    // Translation controllers are keyed the same way but rebuilt whenever
+    // the range changes (translation itself is range-scoped and invalidates).
+    final Map<int, TextEditingController> origCtrls = {};
+    final Map<int, TextEditingController> trCtrls = {};
+    void disposeTrCtrls() { for (final c in trCtrls.values) { c.dispose(); } trCtrls.clear(); }
+    showDialog(
+      context: ctx,
+      builder: (dctx) => StatefulBuilder(
+        builder: (dctx2, setStateDialog) {
+          final start = (currentMatchIdx - before).clamp(0, allLines.length - 1);
+          final end = (currentMatchIdx + after).clamp(0, allLines.length - 1);
+          final captured = allLines.sublist(start, end + 1);
+          final capturedKey = '$start-$end';
+          if (translatedFor != null && translatedFor != capturedKey) {
+            // Range changed — stale translation; clear it.
+            translation = const [];
+            translatedFor = null;
+            translationSource = null;
+            disposeTrCtrls();
+          }
+          // Ensure an original-text controller for each currently-visible line.
+          // Stable key = allLines index, so a controller (and its edited text)
+          // is retained when the slider expands/contracts the visible range.
+          for (final line in captured) {
+            final idx = line['index'] as int;
+            origCtrls.putIfAbsent(idx, () => TextEditingController(text: (line['text'] as String)));
+          }
+          // After a translate(), build a parallel set of translation controllers
+          // (one per visible line). Done once per fresh translation.
+          if (translation.length == captured.length && translatedFor == capturedKey && trCtrls.isEmpty) {
+            for (var i = 0; i < captured.length; i++) {
+              final idx = captured[i]['index'] as int;
+              trCtrls[idx] = TextEditingController(text: translation[i]);
+            }
+          }
+          final matchTs = (allLines[currentMatchIdx]['start'] as num?)?.toDouble() ?? 0;
+          final mmss = '${(matchTs ~/ 60).toString().padLeft(2,'0')}:${(matchTs % 60).floor().toString().padLeft(2,'0')}';
+          final screenW = MediaQuery.of(dctx2).size.width;
+          final dialogW = (screenW - 32).clamp(320.0, 1100.0);
+          return AlertDialog(
+            insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+            titlePadding: const EdgeInsets.fromLTRB(20, 16, 12, 8),
+            title: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        query.isEmpty ? mmss : '"$query"  ·  $mmss',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      if (videoTitle.isNotEmpty || videoUrl.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            videoTitle.isNotEmpty ? videoTitle : videoUrl,
+                            style: TextStyle(fontSize: 11, color: Colors.grey.shade700, fontWeight: FontWeight.normal),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Close',
+                  icon: const Icon(Icons.close, size: 20),
+                  onPressed: () => Navigator.of(dctx).pop(),
+                ),
+              ],
+            ),
+            content: SizedBox(
+              width: dialogW,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const SizedBox(width: 60, child: Text('Anchor')),
+                        Expanded(
+                          child: Text(
+                            '${(allLines[currentMatchIdx]['start'] as num).toStringAsFixed(1)}s  ·  '
+                            '${(allLines[currentMatchIdx]['text'] as String)}',
+                            style: const TextStyle(fontSize: 12),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        TextButton.icon(
+                          icon: const Icon(Icons.list, size: 16),
+                          label: const Text('Change'),
+                          onPressed: () => _pickAnchorLine(
+                            dctx2,
+                            allLines: allLines,
+                            current: currentMatchIdx,
+                            onPicked: (i) => setStateDialog(() {
+                              currentMatchIdx = i;
+                              currentMatchReason = 'manual';
+                            }),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (currentMatchReason.isNotEmpty && currentMatchReason != 'exact' && currentMatchReason != 'normalized')
+                      Padding(
+                        padding: const EdgeInsets.only(top: 2, bottom: 4),
+                        child: Text(
+                          query.isEmpty
+                              ? 'Anchored via ${currentMatchReason} (no /search/ query in URL — pick manually if needed)'
+                              : 'No exact match for "$query" — anchored via ${currentMatchReason}. Pick manually if this isn\'t right.',
+                          style: TextStyle(fontSize: 11, color: Colors.orange.shade800),
+                        ),
+                      ),
+                    const SizedBox(height: 8),
+                    Row(children: [
+                      const SizedBox(width: 110, child: Text('Lines Before')),
+                      _lineCountPicker(value: before, onChanged: (v) => setStateDialog(() => before = v)),
+                    ]),
+                    const SizedBox(height: 8),
+                    Row(children: [
+                      const SizedBox(width: 110, child: Text('Lines After')),
+                      _lineCountPicker(value: after, onChanged: (v) => setStateDialog(() => after = v)),
+                    ]),
+                    const Divider(),
+                    Text('Captured (${end - start + 1} lines)', style: Theme.of(dctx2).textTheme.titleSmall),
+                    Container(
+                      constraints: const BoxConstraints(maxHeight: 220),
+                      width: double.infinity,
+                      margin: const EdgeInsets.symmetric(vertical: 8),
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(border: Border.all(color: Colors.grey), borderRadius: BorderRadius.circular(4)),
+                      child: SingleChildScrollView(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: List.generate(captured.length, (i) {
+                            final line = captured[i];
+                            final idx = line['index'] as int;
+                            final ctrl = origCtrls[idx]!;
+                            return _editableLineRow(
+                              ts: (line['start'] as num).toDouble(),
+                              controller: ctrl,
+                              onChanged: (v) { line['text'] = v; },
+                            );
+                          }),
+                        ),
+                      ),
+                    ),
+                    if (translateError != null)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Text(translateError!, style: TextStyle(color: Colors.red.shade700, fontSize: 12)),
+                      ),
+                    Row(
+                      children: [
+                        Checkbox(
+                          value: preferOnDevice,
+                          onChanged: (v) => setStateDialog(() => preferOnDevice = v ?? false),
+                        ),
+                        const Expanded(child: Text('Use on-device translation (ML Kit, offline)', style: TextStyle(fontSize: 12))),
+                      ],
+                    ),
+                    if (translation.isNotEmpty) ...[
+                      Text(
+                        'Translation ($_selectedLanguage → en)${translationSource != null ? "  ·  via $translationSource" : ""}',
+                        style: Theme.of(dctx2).textTheme.titleSmall,
+                      ),
+                      Container(
+                        constraints: const BoxConstraints(maxHeight: 220),
+                        width: double.infinity,
+                        margin: const EdgeInsets.symmetric(vertical: 8),
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(border: Border.all(color: Colors.blue), borderRadius: BorderRadius.circular(4)),
+                        child: SingleChildScrollView(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: List.generate(captured.length, (i) {
+                              final line = captured[i];
+                              final idx = line['index'] as int;
+                              final ctrl = trCtrls[idx];
+                              if (ctrl == null) return const SizedBox.shrink();
+                              return _editableLineRow(
+                                ts: (line['start'] as num).toDouble(),
+                                controller: ctrl,
+                                onChanged: (v) {
+                                  if (i < translation.length) translation[i] = v;
+                                },
+                              );
+                            }),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: translating || captured.isEmpty ? null : () async {
+                  setStateDialog(() { translating = true; translateError = null; });
+                  try {
+                    final perLine = await _translateLines(
+                      captured.map((l) => (l['text'] as String)).toList(),
+                      _selectedLanguage,
+                      'en',
+                      preferOnDevice: preferOnDevice,
+                    );
+                    setStateDialog(() {
+                      translation = perLine;
+                      translatedFor = capturedKey;
+                      translationSource = preferOnDevice ? 'on-device (ML Kit)' : 'google (with on-device fallback)';
+                      translating = false;
+                    });
+                  } catch (e) {
+                    setStateDialog(() {
+                      translateError = 'Translation failed: $e';
+                      translating = false;
+                    });
+                  }
+                },
+                child: Text(translating ? 'Translating…' : (preferOnDevice ? 'Translate (on-device)' : 'Translate')),
+              ),
+              TextButton(
+                onPressed: captured.isEmpty ? null : () {
+                  Navigator.of(dctx).pop();
+                  // Build a translation array parallel to `captured` so the
+                  // page can zip them positionally — empty strings preserve
+                  // the alignment when a line wasn't translatable.
+                  final translationArr = <Map<String, dynamic>>[];
+                  for (var i = 0; i < captured.length; i++) {
+                    translationArr.add({
+                      'index': captured[i]['index'],
+                      'start': captured[i]['start'],
+                      'end': captured[i]['end'],
+                      'text': i < translation.length ? translation[i] : '',
+                    });
+                  }
+                  _sendCapturedSubtitleToDialog1(<String, dynamic>{
+                    'query': query,
+                    'sourceLang': _selectedLanguage,
+                    'targetLang': 'en',
+                    'matchIndex': currentMatchIdx - start,
+                    'lines': captured,
+                    'translation': translationArr,
+                    'videoUrl': videoUrl,
+                    'videoId': videoId,
+                    'videoTitle': videoTitle,
+                  });
+                },
+                child: const Text('Send to lookup'),
+              ),
+            ],
+          );
+        },
+      ),
+    ).then((_) {
+      for (final c in origCtrls.values) { c.dispose(); }
+      for (final c in trCtrls.values) { c.dispose(); }
+      origCtrls.clear();
+      trCtrls.clear();
+    });
+  }
+
+  /// Opens a list of all subtitle lines on the page and lets the user pick
+  /// one as the anchor for the captured range. Used when the auto-matcher's
+  /// pick is wrong (fuzzy match landed on the wrong line, no /search/ query
+  /// in URL, etc.). Supports a quick text filter.
+  void _pickAnchorLine(BuildContext ctx, {
+    required List<Map<String, dynamic>> allLines,
+    required int current,
+    required ValueChanged<int> onPicked,
+  }) {
+    String filter = '';
+    showDialog(
+      context: ctx,
+      builder: (pctx) => StatefulBuilder(
+        builder: (pctx2, setSt) {
+          final f = filter.trim().toLowerCase();
+          final visible = <int>[];
+          for (var i = 0; i < allLines.length; i++) {
+            final t = (allLines[i]['text'] as String).trim();
+            if (t.isEmpty) continue;
+            if (f.isEmpty || t.toLowerCase().contains(f)) visible.add(i);
+          }
+          return AlertDialog(
+            insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+            title: const Text('Pick anchor line'),
+            content: SizedBox(
+              width: 560,
+              height: 480,
+              child: Column(
+                children: [
+                  TextField(
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      hintText: 'Filter…',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                      prefixIcon: Icon(Icons.search, size: 18),
+                    ),
+                    onChanged: (v) => setSt(() => filter = v),
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: ListView.builder(
+                      itemCount: visible.length,
+                      itemBuilder: (_, vi) {
+                        final i = visible[vi];
+                        final l = allLines[i];
+                        final ts = (l['start'] as num).toDouble();
+                        return ListTile(
+                          dense: true,
+                          selected: i == current,
+                          leading: SizedBox(
+                            width: 44,
+                            child: Text(
+                              '${ts.toStringAsFixed(1)}s',
+                              style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
+                            ),
+                          ),
+                          title: Text(l['text'] as String, style: const TextStyle(fontSize: 12)),
+                          onTap: () {
+                            Navigator.of(pctx).pop();
+                            onPicked(i);
+                          },
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.of(pctx).pop(), child: const Text('Cancel')),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// One editable row: a timestamp label and a borderless TextField that
+  /// fills the rest of the width. The line and its timestamp stay 1:1 so
+  /// edits don't break SRT mapping.
+  Widget _editableLineRow({
+    required double ts,
+    required TextEditingController controller,
+    required ValueChanged<String> onChanged,
+  }) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 52,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 8, right: 4),
+            child: Text(
+              '${ts.toStringAsFixed(1)}s',
+              style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
+            ),
+          ),
+        ),
+        Expanded(
+          child: TextField(
+            controller: controller,
+            style: const TextStyle(fontSize: 13),
+            maxLines: null,
+            decoration: const InputDecoration(
+              border: InputBorder.none,
+              isDense: true,
+              contentPadding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+            ),
+            onChanged: onChanged,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// A compact dropdown that lets the user pick a number in 0..15. Used in
+  /// the capture dialog instead of sliders so the value is selectable.
+  Widget _lineCountPicker({required int value, required ValueChanged<int> onChanged}) {
+    return DropdownButton<int>(
+      value: value.clamp(0, 15),
+      isDense: true,
+      items: List.generate(16, (i) => DropdownMenuItem<int>(value: i, child: Text('$i'))),
+      onChanged: (v) { if (v != null) onChanged(v); },
+    );
+  }
+
   Future<void> _saveCurrentFilmotVideo(WebViewController controller) async {
     // Filmot's search-results page hosts the player at the top and a list of
     // result cards in a sidebar. Clicking "Next video" swaps the iframe `src`
@@ -3340,6 +4170,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             onPageFinished: (url) {
               _injectAdBlocker(dialogController);
               dialogController?.runJavaScript(jsCodeToFilterData(_currentDialogText));
+              final pending = _pendingCapturedSubtitle;
+              if (pending != null) {
+                _pendingCapturedSubtitle = null;
+                dialogController?.runJavaScript(_jsCodeForCapturedSubtitle(pending));
+              }
             },
           ),
         )
@@ -3447,7 +4282,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     _openDialogWithWebview(_currentDialogText);
                   },
                 ),
-                TextButton(
+                IconButton(
+                  tooltip: 'Minimize',
+                  icon: const Icon(Icons.minimize, size: 20),
                   onPressed: () {
                     setState(() {
                       _dialog1Minimized = true;
@@ -3456,16 +4293,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     Navigator.of(ctx).pop();
                     _bumpMinimizedVersion();
                   },
-                  child: Text('Minimize'),
                 ),
-                TextButton(
+                IconButton(
+                  tooltip: 'Close',
+                  icon: const Icon(Icons.close, size: 20),
                   onPressed: () {
                     // Clear minimized state when manually closing
                     setState(() => _dialog1Minimized = false);
                     Navigator.of(ctx).pop();
                     _bumpMinimizedVersion();
                   },
-                  child: Text('Close'),
                 ),
               ],
             ),
@@ -3586,6 +4423,221 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
   }
 
+  /// Starts the long-press dictation mode. Accumulates partial+final results
+  /// into `_continuousTranscript` and auto-restarts the recognizer each time
+  /// the underlying engine ends an utterance, until the user taps the mic to
+  /// stop (or 5 minutes elapse as a safety net).
+  Future<void> _startContinuousVoiceCapture() async {
+    if (_continuousVoiceActive) return;
+    // If a normal (one-shot) listen is in progress, cancel it first.
+    if (_isListening) {
+      try { await _speech.stop(); } catch (_) {}
+    }
+    _continuousTranscript.clear();
+    _continuousPartial = '';
+    _continuousVoiceActive = true;
+    setState(() => _isListening = true);
+    _isListeningNotifier.value = true;
+    _showAppBarWithTimer();
+    final started = await _initContinuousListen();
+    if (!started) {
+      _continuousVoiceActive = false;
+      setState(() => _isListening = false);
+      _isListeningNotifier.value = false;
+      _showVoiceInputFallback();
+    }
+  }
+
+  Future<bool> _initContinuousListen() async {
+    try {
+      final ok = await _speech.initialize(
+        onStatus: (status) {
+          // The speech_to_text plugin ends each utterance on its own; in
+          // continuous mode we just restart listening as long as the user
+          // still wants us listening.
+          if (status == 'done' || status == 'notListening') {
+            if (_continuousVoiceActive && mounted) {
+              _restartContinuousListen();
+            }
+          }
+        },
+        onError: (e) {
+          debugPrint('Continuous speech error: $e');
+          if (_continuousVoiceActive && mounted) {
+            _restartContinuousListen();
+          }
+        },
+      );
+      if (!ok) return false;
+      await _speech.listen(
+        localeId: _speechLocale(),
+        partialResults: true,
+        listenFor: const Duration(minutes: 5),
+        pauseFor: const Duration(seconds: 30),
+        onResult: (result) {
+          final words = result.recognizedWords;
+          if (result.finalResult) {
+            if (words.trim().isNotEmpty) {
+              if (_continuousTranscript.isNotEmpty) _continuousTranscript.write(' ');
+              _continuousTranscript.write(words.trim());
+            }
+            _continuousPartial = '';
+          } else {
+            _continuousPartial = words;
+          }
+        },
+      );
+      return true;
+    } catch (e) {
+      debugPrint('Continuous speech init failed: $e');
+      return false;
+    }
+  }
+
+  void _restartContinuousListen() {
+    if (!_continuousVoiceActive) return;
+    // Tiny delay so the plugin's previous session is fully torn down before
+    // we kick off a new one. Without it, listen() occasionally throws.
+    Future.delayed(const Duration(milliseconds: 200), () async {
+      if (!_continuousVoiceActive) return;
+      try {
+        await _speech.listen(
+          localeId: _speechLocale(),
+          partialResults: true,
+          listenFor: const Duration(minutes: 5),
+          pauseFor: const Duration(seconds: 30),
+          onResult: (result) {
+            final words = result.recognizedWords;
+            if (result.finalResult) {
+              if (words.trim().isNotEmpty) {
+                if (_continuousTranscript.isNotEmpty) _continuousTranscript.write(' ');
+                _continuousTranscript.write(words.trim());
+              }
+              _continuousPartial = '';
+            } else {
+              _continuousPartial = words;
+            }
+          },
+        );
+      } catch (e) {
+        debugPrint('Continuous restart failed: $e');
+      }
+    });
+  }
+
+  Future<void> _stopContinuousVoiceCapture() async {
+    if (!_continuousVoiceActive) return;
+    _continuousVoiceActive = false;
+    try { await _speech.stop(); } catch (_) {}
+    if (mounted) setState(() => _isListening = false);
+    _isListeningNotifier.value = false;
+    // Append any trailing partial that hadn't promoted to a final result yet.
+    if (_continuousPartial.trim().isNotEmpty) {
+      if (_continuousTranscript.isNotEmpty) _continuousTranscript.write(' ');
+      _continuousTranscript.write(_continuousPartial.trim());
+    }
+    final transcript = _continuousTranscript.toString().trim();
+    _continuousPartial = '';
+    _continuousTranscript.clear();
+    if (!mounted) return;
+    if (transcript.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No speech captured'), duration: Duration(seconds: 2)),
+      );
+      return;
+    }
+    _showTranscriptDialog(transcript);
+  }
+
+  /// Opens a dialog that hosts the captured text in a WebView, with the
+  /// same `clickable-word` wrapping (and CaptionHandler bridge) the main
+  /// page uses — so tapping a word triggers the usual lookup flow.
+  Future<void> _showTranscriptDialog(String transcript) async {
+    final escaped = _htmlEscape(transcript);
+    final utilsJs = await rootBundle.loadString('assets/js/utils.js');
+    final html = '''
+<!doctype html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; font-size: 17px;
+         line-height: 1.6; padding: 16px; color: #222; }
+  .clickable-word { cursor: pointer; border-bottom: 1px dotted #888; }
+  .clickable-word:active { background: #ffe082; }
+</style>
+</head><body><div id="transcript">$escaped</div>
+<script>$utilsJs</script>
+</body></html>
+''';
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (dctx) {
+        late final WebViewController ctrl;
+        ctrl = WebViewController()
+          ..setJavaScriptMode(JavaScriptMode.unrestricted)
+          ..setUserAgent(_userAgent)
+          ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) {
+            // Tap a word → main lookup flow.
+            _openDialogWithWebview(msg.message.toString().replaceAll('"', ''));
+          })
+          ..loadHtmlString(html);
+        final screenW = MediaQuery.of(dctx).size.width;
+        final screenH = MediaQuery.of(dctx).size.height;
+        return Dialog(
+          insetPadding: EdgeInsets.symmetric(horizontal: screenW * 0.02, vertical: 24),
+          child: SizedBox(
+            width: screenW * 0.96,
+            height: screenH * 0.85,
+            child: Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 8, 8, 4),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.mic, size: 18, color: Colors.red),
+                      const SizedBox(width: 8),
+                      const Expanded(child: Text('Captured speech', style: TextStyle(fontWeight: FontWeight.w600))),
+                      IconButton(
+                        tooltip: 'Copy text',
+                        icon: const Icon(Icons.copy, size: 20),
+                        onPressed: () async {
+                          await Clipboard.setData(ClipboardData(text: transcript));
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Copied'), duration: Duration(seconds: 1)),
+                            );
+                          }
+                        },
+                      ),
+                      IconButton(
+                        tooltip: 'Close',
+                        icon: const Icon(Icons.close, size: 20),
+                        onPressed: () => Navigator.of(dctx).pop(),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 1),
+                Expanded(child: WebViewWidget(controller: ctrl)),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// Minimal HTML escape — only needs to cover the characters that can
+  /// terminate or escape attribute / element context.
+  String _htmlEscape(String s) {
+    return s
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+  }
+
   void _showVoiceInputFallback() {
     final ctrl = TextEditingController();
     showDialog(
@@ -3620,6 +4672,44 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // Token is intentionally NOT passed here — GitHub API calls are proxied
     // through the GitHubProxy JavaScriptChannel so the token stays in Flutter.
     return "window.dispatchEvent(new CustomEvent('filterData', { detail: { text: '$escaped' } }));";
+  }
+
+  /// Builds the JS that fires a `capturedSubtitle` CustomEvent on the dialog1
+  /// page. The page listens for this to handle multi-line subtitle captures
+  /// distinctly from single-word lookups (`filterData`).
+  ///
+  /// Detail shape (SRT-reconstructable):
+  /// ```
+  /// {
+  ///   query:       "<the matched search word>",
+  ///   sourceLang:  "sv" | "es" | ...,
+  ///   targetLang:  "en",
+  ///   matchIndex:  <int — index into `lines` of the matched line>,
+  ///   lines:       [ { index, start, end, text }, ... ],
+  ///   translation: [ { index, start, end, text }, ... ]   // same length, parallel
+  /// }
+  /// ```
+  /// `start` and `end` are seconds (doubles). The page can format them to
+  /// SRT timestamps (`HH:MM:SS,mmm`) by itself.
+  String _jsCodeForCapturedSubtitle(Map<String, dynamic> payload) {
+    final detail = jsonEncode(payload);
+    return "window.dispatchEvent(new CustomEvent('capturedSubtitle', { detail: $detail }));";
+  }
+
+  // Set when capture happens before dialog1 has ever been initialized — the
+  // event is then fired in onPageFinished, after the page is ready to listen.
+  Map<String, dynamic>? _pendingCapturedSubtitle;
+
+  void _sendCapturedSubtitleToDialog1(Map<String, dynamic> payload) {
+    if (dialogController != null) {
+      dialogController!.runJavaScript(_jsCodeForCapturedSubtitle(payload));
+      _showDialog1();
+      return;
+    }
+    // No dialog1 controller yet — let _openDialogWithWebview spin one up,
+    // then dispatch from onPageFinished once the listener is alive.
+    _pendingCapturedSubtitle = payload;
+    _openDialogWithWebview('');
   }
 
   Widget _errorView(String message, VoidCallback onRetry) {
@@ -3783,10 +4873,36 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             });
           },
         ),
-        IconButton(
-          icon: Icon(Icons.bookmarks_outlined),
-          onPressed: _showBookmarks,
-          tooltip: 'Bookmarks',
+        GestureDetector(
+          // Long-press = enter continuous-listen mode (until next tap to stop).
+          // Tap = original one-shot voice input.
+          onLongPress: () {
+            if (Platform.isAndroid && !_isListening) {
+              HapticFeedback.mediumImpact();
+            }
+            _startContinuousVoiceCapture();
+          },
+          child: ValueListenableBuilder<bool>(
+            valueListenable: _isListeningNotifier,
+            builder: (_, listening, __) => IconButton(
+              tooltip: listening
+                  ? (_continuousVoiceActive ? 'Stop continuous capture' : 'Stop listening')
+                  : 'Voice input (long-press for continuous)',
+              icon: Icon(
+                listening ? Icons.mic : Icons.mic_none,
+                color: listening
+                    ? (_continuousVoiceActive ? Colors.red : Colors.redAccent)
+                    : null,
+              ),
+              onPressed: () {
+                if (_continuousVoiceActive) {
+                  _stopContinuousVoiceCapture();
+                } else {
+                  _toggleVoiceInput();
+                }
+              },
+            ),
+          ),
         ),
         IconButton(
           icon: Icon(Icons.open_in_new),
