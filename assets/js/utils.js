@@ -8,7 +8,7 @@
 
   const SKIP_TAGS = new Set([
     'A', 'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'INPUT', 'SVG',
-    'CANVAS', 'CODE', 'PRE'
+    'CANVAS', 'CODE', 'PRE', 'BUTTON', 'SELECT', 'OPTION', 'VIDEO', 'AUDIO'
   ]);
 
   const now = () => (typeof performance !== 'undefined' && performance.now)

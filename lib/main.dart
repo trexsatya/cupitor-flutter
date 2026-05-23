@@ -99,6 +99,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   static const int _kSnippetLogCap = 500;
   bool _showToolbar = false;
   bool _showAppBar = true;
+  // Platforms whose top app bar auto-hides on a timer and toggles via
+  // double-tap / long-press. Mac mirrors Android so both feel identical.
+  bool get _autoHideAppBar => Platform.isAndroid || Platform.isMacOS;
   String? _githubToken;
   int _pdfTextFontSize = 15;
   bool _showFindBar = false;
@@ -230,6 +233,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     WakelockPlus.enable();
+    // Kick the 10s auto-hide timer so the app bar fades on its own after
+    // launch (otherwise it only starts on user-driven triggers like
+    // selection/voice, and a fresh window would stay open indefinitely).
+    if (_autoHideAppBar) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _showAppBarWithTimer();
+      });
+    }
     // Listen for auto-detected ad hosts coming from the native layer
     if (Platform.isAndroid) {
       _adBlockChannel.setMethodCallHandler((call) async {
@@ -288,7 +299,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
         ..addJavaScriptChannel('AdHostDetector', onMessageReceived: (msg) => _onJsAdHostDetected(msg.message))
         ..addJavaScriptChannel('SelectionChannel', onMessageReceived: (_) {
-          if (Platform.isAndroid && !_showAppBar) _showAppBarWithTimer();
+          if (_autoHideAppBar && !_showAppBar) _showAppBarWithTimer();
+        })
+        // Page-side fallback for app-bar gestures. On macOS the WKWebView is
+        // a native NSView that swallows pointer events before Flutter's
+        // Listener can see them, so the Flutter-level double-tap / long-press
+        // never fires. The injected JS posts here instead.
+        ..addJavaScriptChannel('AppBarToggleChannel', onMessageReceived: (_) {
+          if (_autoHideAppBar) _toggleAppBar();
         })
         ..addJavaScriptChannel('SnippetLogChannel', onMessageReceived: (msg) {
           final raw = msg.message;
@@ -421,6 +439,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _injectSpaHook();
               _injectPageZoom();
               _injectSelectionWatcher();
+              if (Platform.isMacOS) _injectAppBarGestureDetector();
               // Detect PDF by content-type (handles non-.pdf URLs like download links)
               // and defer _injectPdfDetector so it never fires on native PDF pages.
               _detectPdfAndInject(url);
@@ -588,6 +607,42 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             } catch(e) {}
           }, 150);
         });
+      })();
+    ''');
+  }
+
+  /// Page-side double-click + long-press detector used to toggle the app bar
+  /// on macOS, where the native WKWebView swallows pointer events before
+  /// Flutter's Listener can see them. Posts to `AppBarToggleChannel` which
+  /// drives the same `_toggleAppBar()` Android uses, so behavior matches.
+  void _injectAppBarGestureDetector() {
+    _controller.runJavaScript(r'''
+      (function(){
+        if (window.__cupAppBarGestures) return;
+        window.__cupAppBarGestures = true;
+        var lpTimer = null;
+        var downX = 0, downY = 0;
+        var SLOP = 12;
+        var LP_MS = 500;
+        function cancelLp(){ if (lpTimer){ clearTimeout(lpTimer); lpTimer = null; } }
+        document.addEventListener('dblclick', function(){
+          try { AppBarToggleChannel.postMessage('dbl'); } catch(e) {}
+        }, true);
+        document.addEventListener('mousedown', function(e){
+          downX = e.clientX; downY = e.clientY;
+          cancelLp();
+          lpTimer = setTimeout(function(){
+            lpTimer = null;
+            try { AppBarToggleChannel.postMessage('lp'); } catch(e) {}
+          }, LP_MS);
+        }, true);
+        document.addEventListener('mousemove', function(e){
+          if (!lpTimer) return;
+          if (Math.abs(e.clientX - downX) > SLOP || Math.abs(e.clientY - downY) > SLOP) cancelLp();
+        }, true);
+        document.addEventListener('mouseup', cancelLp, true);
+        document.addEventListener('mouseleave', cancelLp, true);
+        window.addEventListener('blur', cancelLp);
       })();
     ''');
   }
@@ -1278,6 +1333,31 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         cookieMgr.setAcceptThirdPartyCookies(platform, true);
       }
     } catch (_) { /* best-effort — fall back to default cookie policy */ }
+    _configureAndroidWebView(controller);
+  }
+
+  /// Extra Android-only WebView configuration required by sites like Spotify
+  /// that need (a) autoplay without a synthetic user gesture, and (b) Widevine
+  /// DRM (which Android exposes via the `PROTECTED_MEDIA_ID` permission). Also
+  /// blanket-grants common media permissions (mic / camera / midi) when a page
+  /// requests them, since the user already had to trust the URL to load it.
+  void _configureAndroidWebView(WebViewController controller) {
+    if (!Platform.isAndroid) return;
+    try {
+      final platform = controller.platform;
+      if (platform is! AndroidWebViewController) return;
+      // Spotify, YouTube embeds, and most modern streaming sites refuse to
+      // start audio if the WebView's `mediaPlaybackRequiresUserGesture` is
+      // left at its default `true` — they treat the missing gesture as an
+      // autoplay-blocked signal and don't even attempt playback.
+      platform.setMediaPlaybackRequiresUserGesture(false);
+      // Grant requested resource permissions (most importantly
+      // `protectedMediaId` for Widevine DRM, which Spotify Web Player
+      // requires; without this the player loads but every track fails).
+      platform.setOnPlatformPermissionRequest((request) {
+        try { request.grant(); } catch (_) {}
+      });
+    } catch (_) { /* best-effort */ }
   }
 
   /// Tell Android's CookieManager to flush its in-memory cookie jar to disk.
@@ -4344,7 +4424,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       setState(() => _isListening = false);
             _isListeningNotifier.value = false;
       // Resume normal app bar timer behavior when voice input stops
-      if (_showAppBar && Platform.isAndroid) {
+      if (_showAppBar && _autoHideAppBar) {
         _showAppBarWithTimer();
       }
       return;
@@ -4360,7 +4440,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               setState(() => _isListening = false);
             _isListeningNotifier.value = false;
               // Resume normal timer behavior when voice input stops
-              if (_showAppBar && Platform.isAndroid) {
+              if (_showAppBar && _autoHideAppBar) {
                 _showAppBarWithTimer();
               }
               if (lastWords.isNotEmpty) {
@@ -4376,7 +4456,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             setState(() => _isListening = false);
             _isListeningNotifier.value = false;
             // Resume normal timer behavior on error
-            if (_showAppBar && Platform.isAndroid) {
+            if (_showAppBar && _autoHideAppBar) {
               _showAppBarWithTimer();
             }
             // Fallback to text input if speech fails
@@ -4399,7 +4479,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             setState(() => _isListening = false);
             _isListeningNotifier.value = false;
             // Resume normal timer behavior when voice input completes
-            if (_showAppBar && Platform.isAndroid) {
+            if (_showAppBar && _autoHideAppBar) {
               _showAppBarWithTimer();
             }
             if (mounted) {
@@ -4416,7 +4496,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         setState(() => _isListening = false);
             _isListeningNotifier.value = false;
         // Resume normal timer behavior on error
-        if (_showAppBar && Platform.isAndroid) {
+        if (_showAppBar && _autoHideAppBar) {
           _showAppBarWithTimer();
         }
       }
@@ -4804,7 +4884,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     setState(() => _showAppBar = true);
     _appBarTimer?.cancel();
     // Don't auto-hide app bar when voice input is active
-    if (Platform.isAndroid && !_isListening) {
+    if (_autoHideAppBar && !_isListening) {
       _appBarTimer = Timer(const Duration(seconds: 10), () {
         if (mounted) setState(() => _showAppBar = false);
       });
@@ -4820,7 +4900,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final appBar = AppBar(
       title: Focus(
         onFocusChange: (focused) {
-          if (Platform.isAndroid) setState(() => _urlBarFocused = focused);
+          if (_autoHideAppBar) setState(() => _urlBarFocused = focused);
           if (focused) { _appBarTimer?.cancel(); }
         },
         child: TextField(
@@ -5014,10 +5094,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 ],
               ),
             ),
-            // Double-tap + long-press detector (Android only — macOS keeps the
-            // app bar always visible). Listener doesn't consume events, so the
-            // WebView still gets the touches for native text selection.
-            if (Platform.isAndroid)
+            // Double-tap + long-press detector for the auto-hiding app bar
+            // (Android + macOS — desktop runs through PointerEvent the same
+            // way, so the same gestures toggle the bar with a mouse). The
+            // Listener doesn't consume events, so the WebView still gets the
+            // input for native text selection.
+            if (_autoHideAppBar)
               Positioned.fill(
                 child: Listener(
                   behavior: HitTestBehavior.translucent,
@@ -5035,8 +5117,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
                 ),
               ),
-            // App bar overlay — always visible on macOS, toggled on Android
-            if (_showAppBar || !Platform.isAndroid)
+            // App bar overlay — auto-hides on Android + macOS, always visible elsewhere
+            if (_showAppBar || !_autoHideAppBar)
               Positioned(
                 top: 0, left: 0, right: 0,
                 child: SafeArea(
