@@ -18,7 +18,14 @@ import 'yt_dlp_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  // Hide the status bar to reclaim vertical space, but leave Android's
+  // bottom navigation bar (back / home / recents) visible. Pure
+  // immersiveSticky also swallows the nav bar, which makes back navigation
+  // require an awkward swipe-from-edge.
+  await SystemChrome.setEnabledSystemUIMode(
+    SystemUiMode.manual,
+    overlays: const [SystemUiOverlay.bottom],
+  );
   runApp(MyApp());
 }
 
@@ -2945,6 +2952,71 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             }
           }
 
+          // --- (c) Currently-playing video bar ---
+          // Insert a block+save bar right above the #player iframe. Reads the
+          // current video id at click-time (filmot swaps the iframe src in
+          // place when the user clicks prev/next), so the buttons always
+          // target whatever's actually on screen.
+          var playerEl = document.getElementById('player');
+          if (playerEl) {
+            var pBar = playerEl.previousElementSibling;
+            if (!pBar || !pBar.classList || !pBar.classList.contains('__cup_player_bar')) {
+              pBar = document.createElement('div');
+              pBar.className = '__cup_player_bar';
+              pBar.style.cssText = 'display:flex;gap:6px;align-items:center;padding:4px 6px;font-size:12px;background:#f8f8f8;border:1px solid #ddd;border-radius:4px;margin:4px 0';
+              var pLabel = document.createElement('span');
+              pLabel.className = '__cup_player_channel_label';
+              pLabel.style.cssText = 'flex:1;color:#444;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+              pBar.appendChild(pLabel);
+              var pBlock = document.createElement('button');
+              pBlock.textContent = '🚫 Block channel';
+              pBlock.title = 'Blacklist this channel';
+              pBlock.style.cssText = 'padding:2px 8px;font-size:11px;border:1px solid #888;background:#fee;cursor:pointer;border-radius:3px;line-height:1.2';
+              pBlock.onclick = function(e) {
+                e.preventDefault(); e.stopPropagation();
+                var vid = currentVideoId();
+                var ch = vid ? (window.__cupitorVideoChannel || {})[vid] : '';
+                if (!ch) { setText(pLabel, '(no channel resolved yet)'); return; }
+                bridge({action:'blockChannel', channel: ch});
+              };
+              pBar.appendChild(pBlock);
+              var pSave = document.createElement('button');
+              pSave.textContent = '💾 Save';
+              pSave.title = 'Save video URL';
+              pSave.style.cssText = 'padding:2px 8px;font-size:11px;border:1px solid #888;background:#efe;cursor:pointer;border-radius:3px;line-height:1.2';
+              pSave.onclick = function(e) {
+                e.preventDefault(); e.stopPropagation();
+                var vid = currentVideoId();
+                if (!vid) return;
+                var ch = (window.__cupitorVideoChannel || {})[vid] || '';
+                bridge({action:'saveVideo', url:'https://www.youtube.com/watch?v=' + vid, channel: ch, title: document.title || ''});
+                pSave.textContent = '✅ Saved';
+                setTimeout(function(){ pSave.textContent = '💾 Save'; }, 1500);
+              };
+              pBar.appendChild(pSave);
+              playerEl.parentNode.insertBefore(pBar, playerEl);
+            }
+            // Refresh label / record channel-seen for the player's current video.
+            var pVid = currentVideoId();
+            var pLbl = pBar.querySelector('.__cup_player_channel_label');
+            if (pLbl) {
+              if (!pVid) {
+                setText(pLbl, '(no video)');
+              } else {
+                var pCh = map[pVid];
+                if (pCh === undefined) {
+                  setText(pLbl, '(resolving channel…)');
+                  unknownIds.push(pVid);
+                } else if (pCh === '') {
+                  setText(pLbl, '(channel unknown)');
+                } else {
+                  setText(pLbl, pCh);
+                  seenChannels[pCh] = true;
+                }
+              }
+            }
+          }
+
           // Keep already-annotated detail-page labels in sync with the map.
           var dLabels = document.querySelectorAll('a[data-cup-ann="1"]');
           for (var dl2 = 0; dl2 < dLabels.length; dl2++) {
@@ -3022,6 +3094,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             if (ifr.src === lastCheckedSrc) return;
             lastCheckedSrc = ifr.src;
             autoSkipIfBlacklisted('iframe-src');
+            // Refresh the player-bar channel label for the new video.
+            scheduleAnnotate();
           });
           srcMo.observe(ifr, {attributes:true, attributeFilter:['src']});
           lastCheckedSrc = ifr.src || '';
@@ -4983,13 +5057,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       child: Column(
         children: [
           Container(
-            padding: EdgeInsets.all(8),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: Theme(
+              // Compact the icon row so the title bar takes less vertical space.
+              // Default IconButton is 48×48 (tap target) — drop padding + use
+              // shrinkWrap to land around ~32×32 per button.
+              data: Theme.of(ctx).copyWith(
+                iconButtonTheme: IconButtonThemeData(
+                  style: IconButton.styleFrom(
+                    padding: const EdgeInsets.all(4),
+                    minimumSize: const Size(32, 32),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                ),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
                 IconButton(
                   tooltip: 'Download YouTube subtitles (translate, send to lookup)',
-                  icon: const Icon(Icons.closed_caption_outlined),
+                  icon: const Icon(Icons.closed_caption_outlined, size: 20),
                   onPressed: () => _startYouTubeSubtitleDownload(ctx),
                 ),
                 ValueListenableBuilder<bool>(
@@ -5007,21 +5094,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   ),
                 ),
                 IconButton(
-                  tooltip: 'Reload (use if dialog appears stuck)',
+                  tooltip: 'Reload page (bypass cache)',
                   icon: Icon(Icons.refresh),
-                  onPressed: () {
-                    // Force-recreate the dialog WebView. We keep dialogController
-                    // alive across closes for fast re-opens, but if the shared
-                    // WebView renderer process gets wedged (e.g. by a heavy page
-                    // loaded in dialog2), this controller's view becomes stuck
-                    // and reopening shows the same wedge. This button is the
-                    // escape hatch.
-                    final old = dialogController;
-                    dialogController = null;
-                    if (old != null) _shutdownDialogWebView(old);
-                    setState(() => _dialog1Minimized = false);
-                    Navigator.of(ctx).pop();
-                    _openDialogWithWebview(_currentDialogText);
+                  onPressed: () async {
+                    // Clear HTTP cache so we actually pick up server changes —
+                    // bare reload() honours cache headers and was returning
+                    // stale pages. We stay on the same dialog route (no pop)
+                    // and just rerun loadRequest against the current language URL.
+                    final ctrl = dialogController;
+                    if (ctrl == null) return;
+                    try { await ctrl.clearCache(); } catch (_) {}
+                    await ctrl.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
                   },
                 ),
                 ValueListenableBuilder<bool>(
@@ -5058,6 +5141,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   },
                 ),
               ],
+              ),
             ),
           ),
           Expanded(
