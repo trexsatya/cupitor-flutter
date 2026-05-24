@@ -13,15 +13,24 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.yausername.youtubedl_android.YoutubeDL
+import com.yausername.youtubedl_android.YoutubeDLRequest
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.io.File
 
 class MainActivity : FlutterActivity() {
 
     companion object {
         private const val CHANNEL = "cupitor/adblock"
+        private const val YTDLP_CHANNEL = "cupitor/ytdlp"
         private const val PREFS_NAME = "cupitor_adblock"
         private const val PREFS_CUSTOM_HOSTS = "custom_ad_hosts"
 
@@ -181,6 +190,193 @@ class MainActivity : FlutterActivity() {
                     result.success(null)
                 }
                 else -> result.notImplemented()
+            }
+        }
+
+        // ---- yt-dlp channel (bundles Python + yt-dlp via youtubedl-android) ----
+        val ytdlpChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, YTDLP_CHANNEL)
+        ytdlpChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "init" -> initYtdlp(result)
+                "listTracks" -> {
+                    val url = call.argument<String>("url")
+                    if (url.isNullOrBlank()) {
+                        result.error("BAD_ARG", "url required", null)
+                    } else {
+                        listTracks(url, result)
+                    }
+                }
+                "downloadSubtitle" -> {
+                    val url = call.argument<String>("url")
+                    val lang = call.argument<String>("lang")
+                    val kind = call.argument<String>("kind") ?: ""
+                    if (url.isNullOrBlank() || lang.isNullOrBlank()) {
+                        result.error("BAD_ARG", "url and lang required", null)
+                    } else {
+                        downloadSubtitle(url, lang, kind, result)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // yt-dlp helpers (Android side). The library bundles a Python interpreter
+    // and yt-dlp itself, exposed via a synchronous JNI API that we wrap in
+    // suspending IO calls so we don't block the Flutter main thread.
+    // ---------------------------------------------------------------------------
+    private val ytdlpScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    @Volatile
+    private var ytdlpInitialized = false
+
+    private fun initYtdlp(result: MethodChannel.Result) {
+        if (ytdlpInitialized) { result.success(true); return }
+        ytdlpScope.launch {
+            try {
+                withContext(Dispatchers.IO) { ensureYtdlpInit() }
+                result.success(true)
+            } catch (t: Throwable) {
+                // YoutubeDLException's top-level message is the generic "failed to
+                // initialize" — the real reason (ABI mismatch, missing libpython,
+                // disk full, etc.) is in the cause chain. Walk it so Dart sees it.
+                android.util.Log.e("Cupitor/ytdlp", "init failed", t)
+                result.error("INIT_FAILED", describeThrowable(t), null)
+            }
+        }
+    }
+
+    private fun describeThrowable(t: Throwable): String {
+        val parts = mutableListOf<String>()
+        var cur: Throwable? = t
+        val seen = mutableSetOf<Throwable>()
+        while (cur != null && cur !in seen) {
+            seen.add(cur)
+            parts.add("${cur::class.java.simpleName}: ${cur.message ?: "(no message)"}")
+            cur = cur.cause
+        }
+        // Include a trimmed stacktrace so unfamiliar failures surface a file:line.
+        val firstFrame = t.stackTrace.firstOrNull()?.toString()
+        if (firstFrame != null) parts.add("at $firstFrame")
+        return parts.joinToString(" → ")
+    }
+
+    /// Idempotent. `YoutubeDL.init()` itself short-circuits on subsequent
+    /// calls, but we wrap with our own flag so we don't pay the dispatcher
+    /// hop / check on every call.
+    private fun ensureYtdlpInit() {
+        if (ytdlpInitialized) return
+        synchronized(this) {
+            if (ytdlpInitialized) return
+            YoutubeDL.init(application)
+            ytdlpInitialized = true
+        }
+    }
+
+    /// Returns `{title, tracks: [{languageCode, name, kind}]}`. ASR tracks
+    /// are tagged with `kind: "asr"`. We can't read subtitles off VideoInfo
+    /// directly (the field is commented out in the upstream mapper), so we
+    /// shell out yt-dlp with `--write-info-json` and parse the dump file.
+    private fun listTracks(url: String, result: MethodChannel.Result) {
+        ytdlpScope.launch {
+            try {
+                val infoJson = withContext(Dispatchers.IO) {
+                    ensureYtdlpInit()
+                    val outDir = File(cacheDir, "ytinfo-${System.currentTimeMillis()}").apply { mkdirs() }
+                    try {
+                        val req = YoutubeDLRequest(url).apply {
+                            addOption("--skip-download")
+                            addOption("--write-info-json")
+                            addOption("-o", "${outDir.absolutePath}/info")
+                        }
+                        YoutubeDL.execute(req)
+                        val jsonFile = outDir.listFiles { f -> f.name.endsWith(".info.json") }?.firstOrNull()
+                            ?: throw RuntimeException("yt-dlp wrote no info.json")
+                        jsonFile.readText()
+                    } finally {
+                        outDir.deleteRecursively()
+                    }
+                }
+                val info = org.json.JSONObject(infoJson)
+                val tracks = mutableListOf<Map<String, Any>>()
+                info.optJSONObject("subtitles")?.let { subs ->
+                    subs.keys().forEach { lang ->
+                        tracks.add(mapOf(
+                            "languageCode" to lang,
+                            "name" to lang,
+                            "kind" to "",
+                        ))
+                    }
+                }
+                info.optJSONObject("automatic_captions")?.let { auto ->
+                    auto.keys().forEach { lang ->
+                        tracks.add(mapOf(
+                            "languageCode" to lang,
+                            "name" to "$lang (auto-generated)",
+                            "kind" to "asr",
+                        ))
+                    }
+                }
+                result.success(mapOf(
+                    "title" to info.optString("title", ""),
+                    "tracks" to tracks,
+                ))
+            } catch (t: Throwable) {
+                android.util.Log.e("Cupitor/ytdlp", "listTracks failed", t)
+                result.error("LIST_FAILED", describeThrowable(t), null)
+            }
+        }
+    }
+
+    /// Downloads the caption track via `yt-dlp --write-subs / --write-auto-subs`,
+    /// preferring json3, falling back to vtt. Returns `{body, format}` so the
+    /// Dart caller can dispatch to the correct parser.
+    private fun downloadSubtitle(
+        url: String, lang: String, kind: String, result: MethodChannel.Result,
+    ) {
+        ytdlpScope.launch {
+            try {
+                val payload = withContext(Dispatchers.IO) {
+                    ensureYtdlpInit()
+                    val outDir = File(cacheDir, "ytsub-${System.currentTimeMillis()}").apply { mkdirs() }
+                    try {
+                        val req = YoutubeDLRequest(url).apply {
+                            addOption("--skip-download")
+                            if (kind == "asr") addOption("--write-auto-subs")
+                            else addOption("--write-subs")
+                            addOption("--sub-langs", lang)
+                            // yt-dlp picks the first available from this slash-list.
+                            addOption("--sub-format", "json3/vtt/best")
+                            addOption("-o", "${outDir.absolutePath}/sub")
+                        }
+                        YoutubeDL.execute(req)
+                        val files = outDir.listFiles { f -> f.name.startsWith("sub") }
+                            ?: emptyArray()
+                        if (files.isEmpty()) {
+                            throw RuntimeException("yt-dlp wrote no subtitle file " +
+                                "(language '$lang'${if (kind == "asr") " (auto)" else ""} may not exist for this video)")
+                        }
+                        // Prefer json3 if multiple formats slipped through.
+                        val file = files.sortedBy {
+                            if (it.name.endsWith(".json3")) 0
+                            else if (it.name.endsWith(".vtt")) 1
+                            else 2
+                        }.first()
+                        val format = when {
+                            file.name.endsWith(".json3") -> "json3"
+                            file.name.endsWith(".vtt") -> "vtt"
+                            else -> "unknown"
+                        }
+                        mapOf("body" to file.readText(), "format" to format)
+                    } finally {
+                        outDir.deleteRecursively()
+                    }
+                }
+                result.success(payload)
+            } catch (t: Throwable) {
+                android.util.Log.e("Cupitor/ytdlp", "downloadSubtitle failed", t)
+                result.error("DOWNLOAD_FAILED", describeThrowable(t), null)
             }
         }
     }

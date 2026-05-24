@@ -24,7 +24,10 @@ android {
         applicationId = "org.satya.cupitor"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // youtubedl-android requires minSdk 24+ (it ships Python + native libs
+        // that only build for Android 7.0+). Flutter's default would be lower
+        // but every device we target is well above this.
+        minSdk = maxOf(flutter.minSdkVersion, 24)
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
@@ -37,8 +40,31 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    // youtubedl-android ships the Python interpreter as a native lib and then
+    // forks/execs it as a regular binary, which only works when the .so files
+    // are extracted to disk. Modern AGP defaults to packaging natives inside
+    // the APK uncompressed (extractNativeLibs=false), which breaks the exec.
+    // Force legacy packaging so they land in /data/.../lib/<abi>/.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // youtubedl-android: bundles yt-dlp + Python so we can fetch YouTube
+    // captions without fighting YouTube's PO-token wall. Adds ~30 MB to the
+    // APK (Python interpreter + yt-dlp). Published on Maven Central by
+    // junkfood02 (the upstream README points here) — bump the version when
+    // YouTube changes break captions; junkfood02 repackages within days.
+    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
+    // Coroutines are required by youtubedl-android internally and we use
+    // them in MainActivity to call YoutubeDL off the main thread.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }

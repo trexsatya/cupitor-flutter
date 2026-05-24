@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:io' show Platform;
 import 'dart:math' as math;
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
@@ -12,6 +13,8 @@ import 'package:pdfrx/pdfrx.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:google_mlkit_translation/google_mlkit_translation.dart' as mlkit;
+import 'package:flutter_tts/flutter_tts.dart';
+import 'yt_dlp_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -133,6 +136,18 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // (e.g. application/pdf). First call = normal navigation; second call = download trigger.
   final Set<String> _androidPendingUrls = {};
   final ValueNotifier<String?> _dialogErrorNotifier = ValueNotifier(null);
+  // Fullscreen toggle for dialog1. Notifier (not bare field) so the showDialog
+  // route — which lives outside the outer State's setState scope — rebuilds.
+  final ValueNotifier<bool> _dialog1FullscreenNotifier = ValueNotifier(false);
+  // Web Speech Synthesis bridge for dialog1. The Android WebView does not
+  // implement window.speechSynthesis, so the dictionary page's TTS calls go
+  // through a JS-side polyfill that posts here. We speak one utterance at a
+  // time via flutter_tts and fire start/end JS events back into the page so
+  // utterance.onstart / .onend work as the page expects.
+  FlutterTts? _dialog1Tts;
+  final List<Map<String, dynamic>> _dialog1TtsQueue = [];
+  int? _dialog1TtsActiveJsId;
+  bool _dialog1TtsBusy = false;
   static const _adBlockChannel = MethodChannel('cupitor/adblock');
   // Hosts auto-detected by the native ad-blocker that haven't been confirmed yet.
   final List<String> _detectedAdHosts = [];
@@ -154,6 +169,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // Channels observed on the currently-loaded filmot page (in-memory only).
   // Keyed by dialog id so multiple filmot dialogs don't clobber each other.
   final Map<String, Set<String>> _filmotChannelsSeen = {};
+  // Per-dialog2 ScaffoldMessenger keys. Dialog2 routes are near-fullscreen
+  // and sit above the root Scaffold, so a SnackBar shown via the root
+  // ScaffoldMessenger renders behind them and the user never sees it. Each
+  // open dialog2 owns its own ScaffoldMessenger via the key below, so
+  // feedback (save-confirm, "already saved", etc.) lands inside the dialog.
+  final Map<String, GlobalKey<ScaffoldMessengerState>> _dialog2ScaffoldKeys = {};
   // Persistent videoId → channelName cache. Populated by oEmbed lookups, used
   // to apply the channel blacklist to Filmot search results (whose HTML does
   // not include the channel name).
@@ -213,6 +234,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _floatingChipsEntry = null;
     _minimizedVersion.dispose();
     _isListeningNotifier.dispose();
+    _dialog1FullscreenNotifier.dispose();
+    _dialog1Tts?.stop();
+    _dialog1Tts = null;
     super.dispose();
   }
 
@@ -2366,6 +2390,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         _everMinimizedDialog2s.remove(dialogId); // Clean up tracking state
         _filmotChannelsSeen.remove(dialogId);
         _chipPositions.remove(dialogId);
+        _dialog2ScaffoldKeys.remove(dialogId);
       }
       _bumpMinimizedVersion();
     });
@@ -2388,7 +2413,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   Widget _buildDialog2Content(BuildContext ctx, String dialogId, String url,
       WebViewController controller, ValueNotifier<String?> errorNotifier,
       double screenWidth, double screenHeight) {
-    return Container(
+    final messengerKey = _dialog2ScaffoldKeys.putIfAbsent(
+      dialogId,
+      () => GlobalKey<ScaffoldMessengerState>(),
+    );
+    return ScaffoldMessenger(
+      key: messengerKey,
+      child: Scaffold(
+        backgroundColor: Colors.transparent,
+        body: Container(
       width: screenWidth * 0.98,
       height: screenHeight,
       child: Column(
@@ -2438,7 +2471,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   IconButton(
                     tooltip: 'Save current video URL',
                     icon: Icon(Icons.save_alt, size: 20),
-                    onPressed: () => _saveCurrentFilmotVideo(controller),
+                    onPressed: () => _saveCurrentFilmotVideo(dialogId, controller),
                   ),
                 ],
                 IconButton(
@@ -2486,6 +2519,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             ),
           ),
         ],
+      ),
+        ),
       ),
     );
   }
@@ -2583,8 +2618,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _minimizedDialog2s.remove(dialogId);
     _everMinimizedDialog2s.remove(dialogId);
     _filmotChannelsSeen.remove(dialogId);
+    _dialog2ScaffoldKeys.remove(dialogId);
     if (mounted) setState(() {});
     _bumpMinimizedVersion();
+  }
+
+  /// Shows a SnackBar inside `dialogId`'s ScaffoldMessenger if one is alive,
+  /// otherwise falls back to the root messenger. Necessary because dialog2
+  /// routes cover the underlying Scaffold — root SnackBars render behind the
+  /// dialog and the user never sees them.
+  void _showDialog2SnackBar(String? dialogId, String message,
+      {Duration duration = const Duration(seconds: 2)}) {
+    final state = (dialogId != null)
+        ? _dialog2ScaffoldKeys[dialogId]?.currentState
+        : null;
+    final snack = SnackBar(content: Text(message), duration: duration);
+    if (state != null) {
+      state.showSnackBar(snack);
+    } else if (mounted) {
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(snack);
+    }
   }
 
   // ---------- Filmot helpers ----------
@@ -3011,28 +3064,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       for (final entry in _dialog2Controllers.entries) {
         if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
       }
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Blacklisted: $channel'), duration: const Duration(seconds: 2)),
-        );
-      }
+      _showDialog2SnackBar(dialogId, 'Blacklisted: $channel');
     } else if (action == 'saveVideo') {
       final url = msg['url']?.toString() ?? '';
       if (url.isEmpty) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Could not detect a video URL on this page'), duration: Duration(seconds: 2)),
-          );
-        }
+        _showDialog2SnackBar(dialogId, 'Could not detect a video URL on this page');
         return;
       }
       final title = msg['title']?.toString() ?? '';
       if (_savedVideos.any((e) => e['url'] == url)) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Already saved: ${title.isNotEmpty ? title : url}'), duration: const Duration(seconds: 2)),
-          );
-        }
+        _showDialog2SnackBar(dialogId, 'Already saved: ${title.isNotEmpty ? title : url}');
         return;
       }
       _savedVideos.add({
@@ -3042,11 +3083,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         'savedAt': DateTime.now().toIso8601String(),
       });
       _saveSavedVideos();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Saved: ${title.isNotEmpty ? title : url} (${_savedVideos.length} total)'), duration: const Duration(seconds: 2)),
-        );
-      }
+      _showDialog2SnackBar(dialogId,
+          'Saved: ${title.isNotEmpty ? title : url} (${_savedVideos.length} total)');
     }
   }
 
@@ -3289,6 +3327,607 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return out.toString();
   }
 
+  // ---------- YouTube subtitle download ----------
+
+  /// Pulls a YouTube video id out of any of the URL forms we support
+  /// (`/watch?v=…`, `/shorts/…`, `/embed/…`, `/live/…`, `youtu.be/…`). Returns
+  /// null if the input doesn't look like a YouTube URL/id at all.
+  String? _extractYouTubeVideoId(String input) {
+    final trimmed = input.trim();
+    if (trimmed.isEmpty) return null;
+    // Bare 11-char id (what users sometimes paste from the share menu).
+    if (RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(trimmed)) return trimmed;
+    final uri = Uri.tryParse(trimmed);
+    if (uri == null) return null;
+    final host = uri.host.toLowerCase();
+    if (host == 'youtu.be') {
+      final seg = uri.pathSegments.isNotEmpty ? uri.pathSegments.first : '';
+      if (RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(seg)) return seg;
+    }
+    if (host.endsWith('youtube.com') || host.endsWith('youtube-nocookie.com')) {
+      final v = uri.queryParameters['v'];
+      if (v != null && RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(v)) return v;
+      // /shorts/<id>, /embed/<id>, /live/<id>, /v/<id>
+      for (final pat in const ['shorts', 'embed', 'live', 'v']) {
+        final idx = uri.pathSegments.indexOf(pat);
+        if (idx >= 0 && idx + 1 < uri.pathSegments.length) {
+          final cand = uri.pathSegments[idx + 1];
+          if (RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(cand)) return cand;
+        }
+      }
+    }
+    return null;
+  }
+
+  // ---------- YouTube subtitle download ----------
+
+  /// Lists available caption tracks via `youtubedl-android` (Android) or a
+  /// `yt-dlp` subprocess (macOS). yt-dlp handles the PO-token wall on its
+  /// side, so we don't see the 0-byte responses we got from every in-app
+  /// HTTP/WebView attempt.
+  Future<Map<String, dynamic>> _fetchYouTubeCaptionTracks(String videoId) async {
+    if (!await YtDlpService.isAvailable()) {
+      throw YtDlpService.installHint();
+    }
+    final result = await YtDlpService.listTracks(
+      'https://www.youtube.com/watch?v=$videoId',
+    );
+    return {
+      'title': result.title,
+      'tracks': result.tracks.map((t) => t.toMap()).toList(),
+    };
+  }
+
+  /// Downloads the chosen caption track via yt-dlp and parses it.
+  /// `baseUrl` is unused (only kept for signature compatibility with the
+  /// old WebView path); yt-dlp constructs whatever URL it needs internally.
+  Future<List<Map<String, dynamic>>> _fetchCaptionsJson3({
+    required String baseUrl,
+    required String videoId,
+    required String languageCode,
+    required String kind,
+  }) async {
+    final sub = await YtDlpService.downloadSubtitle(
+      videoUrl: 'https://www.youtube.com/watch?v=$videoId',
+      languageCode: languageCode,
+      kind: kind,
+    );
+    if (sub.body.isEmpty) {
+      throw 'yt-dlp returned an empty body for $languageCode'
+          '${kind == 'asr' ? ' (auto)' : ''}';
+    }
+    final List<Map<String, dynamic>> lines = switch (sub.format) {
+      'json3' => await compute(_parseYtJson3Captions, sub.body),
+      'vtt'   => await compute(_parseVttCaptions, sub.body),
+      _       => await compute(_parseYtJson3Captions, sub.body),
+    };
+    if (lines.isEmpty) {
+      throw 'yt-dlp returned ${sub.body.length}B (${sub.format}) but parsed 0 lines';
+    }
+    return lines;
+  }
+
+  /// Picks the default caption track to highlight in the picker. Preference
+  /// order: manual track for current `_selectedLanguage` → any manual track
+  /// → auto-generated track for current `_selectedLanguage` → first track.
+  int _defaultCaptionTrackIndex(List<Map<String, dynamic>> tracks) {
+    bool isManual(Map<String, dynamic> t) => (t['kind'] as String? ?? '') != 'asr';
+    bool matchesLang(Map<String, dynamic> t) =>
+        (t['languageCode'] as String? ?? '').toLowerCase() == _selectedLanguage.toLowerCase();
+    for (var i = 0; i < tracks.length; i++) {
+      if (isManual(tracks[i]) && matchesLang(tracks[i])) return i;
+    }
+    for (var i = 0; i < tracks.length; i++) {
+      if (isManual(tracks[i])) return i;
+    }
+    for (var i = 0; i < tracks.length; i++) {
+      if (matchesLang(tracks[i])) return i;
+    }
+    return 0;
+  }
+
+  /// Modal busy overlay used while awaiting an HTTP/parse step. The progress
+  /// indicator is shown alongside `message`; the dialog isn't dismissible so
+  /// the caller can `pop()` it from a known root navigator after the future
+  /// resolves.
+  void _showBusyOverlay(BuildContext ctx, String message) {
+    showDialog<void>(
+      context: ctx,
+      barrierDismissible: false,
+      useRootNavigator: true,
+      builder: (dctx) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          content: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(width: 24, height: 24,
+                  child: CircularProgressIndicator(strokeWidth: 2.5)),
+              const SizedBox(width: 16),
+              Expanded(child: Text(message)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _dismissBusyOverlay(BuildContext ctx) {
+    if (!mounted) return;
+    Navigator.of(ctx, rootNavigator: true).pop();
+  }
+
+  /// Entry point wired to the closed-captions icon in dialog1's header.
+  /// Prompts for a URL → fetches caption tracks → picker → downloads + parses
+  /// the chosen track → opens the full-file dialog. Every long step shows a
+  /// dismissible busy overlay so the rest of the app remains interactive
+  /// (HTTP + parse are awaited, so the UI thread is never blocked).
+  Future<void> _startYouTubeSubtitleDownload(BuildContext ctx) async {
+    // Pre-fill from clipboard if it looks like a YouTube URL — common case
+    // is the user just copied the link from the YouTube share sheet.
+    String initial = '';
+    try {
+      final clip = await Clipboard.getData('text/plain');
+      final t = (clip?.text ?? '').trim();
+      if (_extractYouTubeVideoId(t) != null) initial = t;
+    } catch (_) {}
+    if (!mounted) return;
+
+    final urlCtrl = TextEditingController(text: initial);
+    final urlInput = await showDialog<String>(
+      context: ctx,
+      builder: (dctx) => AlertDialog(
+        title: const Text('YouTube subtitles'),
+        content: TextField(
+          controller: urlCtrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+            hintText: 'https://www.youtube.com/watch?v=…  or  video id',
+          ),
+          keyboardType: TextInputType.url,
+          onSubmitted: (v) => Navigator.of(dctx).pop(v.trim()),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dctx).pop(), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.of(dctx).pop(urlCtrl.text.trim()),
+            child: const Text('Fetch'),
+          ),
+        ],
+      ),
+    );
+    urlCtrl.dispose();
+    if (urlInput == null || urlInput.isEmpty) return;
+    final videoId = _extractYouTubeVideoId(urlInput);
+    if (videoId == null) {
+      _showCaptureError('Not a YouTube URL',
+          'Couldn\'t recognize a YouTube video id in:\n\n$urlInput');
+      return;
+    }
+    if (!mounted) return;
+
+    _showBusyOverlay(ctx, 'Loading caption list…');
+    Map<String, dynamic> meta;
+    try {
+      meta = await _fetchYouTubeCaptionTracks(videoId);
+    } catch (e) {
+      _dismissBusyOverlay(ctx);
+      _showCaptureError('Could not load captions', '$e');
+      return;
+    }
+    _dismissBusyOverlay(ctx);
+
+    final tracks = (meta['tracks'] as List).cast<Map<String, dynamic>>();
+    if (tracks.isEmpty) {
+      _showCaptureError('No captions',
+          'This video has no caption tracks (neither manual nor auto-generated).');
+      return;
+    }
+    if (!mounted) return;
+
+    final pickedIdx = await _pickCaptionTrack(ctx, tracks);
+    if (pickedIdx == null) return;
+    final picked = tracks[pickedIdx];
+    if (!mounted) return;
+
+    _showBusyOverlay(ctx, 'Downloading captions…');
+    List<Map<String, dynamic>> lines;
+    try {
+      lines = await _fetchCaptionsJson3(
+        baseUrl: picked['baseUrl'] as String,
+        videoId: videoId,
+        languageCode: (picked['languageCode'] as String?) ?? '',
+        kind: (picked['kind'] as String?) ?? '',
+      );
+    } catch (e) {
+      _dismissBusyOverlay(ctx);
+      _showCaptureError('Could not download captions', '$e');
+      return;
+    }
+    _dismissBusyOverlay(ctx);
+
+    if (lines.isEmpty) {
+      _showCaptureError('Empty captions',
+          'The selected track returned no lines.');
+      return;
+    }
+    if (!mounted) return;
+
+    _showFullSubtitleDialog(
+      ctx,
+      lines: lines,
+      sourceLang: (picked['languageCode'] as String?) ?? _selectedLanguage,
+      videoUrl: 'https://www.youtube.com/watch?v=$videoId',
+      videoId: videoId,
+      videoTitle: (meta['title'] as String?) ?? '',
+    );
+  }
+
+  /// Caption-track picker. Default-selects the track returned by
+  /// `_defaultCaptionTrackIndex`. Auto-generated tracks are labeled inline so
+  /// the user can spot them without expanding the row.
+  Future<int?> _pickCaptionTrack(
+      BuildContext ctx, List<Map<String, dynamic>> tracks) async {
+    int selected = _defaultCaptionTrackIndex(tracks);
+    return showDialog<int>(
+      context: ctx,
+      builder: (dctx) => StatefulBuilder(
+        builder: (dctx2, setStateDialog) => AlertDialog(
+          title: const Text('Pick caption track'),
+          content: SizedBox(
+            width: 360,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 360),
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: tracks.length,
+                itemBuilder: (_, i) {
+                  final t = tracks[i];
+                  final isAsr = (t['kind'] as String? ?? '') == 'asr';
+                  final name = (t['name'] as String? ?? '').trim();
+                  final lang = (t['languageCode'] as String? ?? '').trim();
+                  final label = [
+                    if (name.isNotEmpty) name,
+                    if (lang.isNotEmpty) '[$lang]',
+                    if (isAsr) '(auto-generated)',
+                  ].join(' ');
+                  return RadioListTile<int>(
+                    value: i,
+                    groupValue: selected,
+                    onChanged: (v) { if (v != null) setStateDialog(() => selected = v); },
+                    title: Text(label.isEmpty ? lang : label),
+                    dense: true,
+                  );
+                },
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(dctx).pop(), child: const Text('Cancel')),
+            TextButton(
+              onPressed: () => Navigator.of(dctx).pop(selected),
+              child: const Text('Download'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Full-file capture dialog: shows the entire cue list (virtualized) with
+  /// a Translate-all action and Send-to-lookup. Translation is batched
+  /// (~30 cues per request) so a typical episode finishes in seconds rather
+  /// than minutes, with a progress counter + Cancel.
+  void _showFullSubtitleDialog(
+    BuildContext ctx, {
+    required List<Map<String, dynamic>> lines,
+    required String sourceLang,
+    required String videoUrl,
+    required String videoId,
+    required String videoTitle,
+  }) {
+    final originals = lines.map((l) => (l['text'] as String)).toList();
+    List<String> translation = List<String>.filled(lines.length, '');
+    bool translating = false;
+    bool translated = false;
+    bool cancelRequested = false;
+    int progressDone = 0;
+    int progressTotal = lines.length;
+    String? translateError;
+
+    showDialog(
+      context: ctx,
+      builder: (dctx) => StatefulBuilder(
+        builder: (dctx2, setStateDialog) {
+          final screenW = MediaQuery.of(dctx2).size.width;
+          final dialogW = (screenW - 32).clamp(320.0, 1100.0);
+          Future<void> startTranslate() async {
+            setStateDialog(() {
+              translating = true;
+              cancelRequested = false;
+              translateError = null;
+              progressDone = 0;
+              progressTotal = originals.length;
+            });
+            try {
+              final result = await _translateLinesBatched(
+                originals,
+                sourceLang,
+                'en',
+                onProgress: (done, total) {
+                  if (!mounted) return;
+                  setStateDialog(() {
+                    progressDone = done;
+                    progressTotal = total;
+                  });
+                },
+                isCancelled: () => cancelRequested,
+              );
+              if (!mounted) return;
+              setStateDialog(() {
+                translation = result;
+                translating = false;
+                translated = !cancelRequested;
+              });
+            } catch (e) {
+              if (!mounted) return;
+              setStateDialog(() {
+                translateError = '$e';
+                translating = false;
+              });
+            }
+          }
+
+          String tsFmt(double s) {
+            final m = (s ~/ 60).toString().padLeft(2, '0');
+            final sec = (s % 60).floor().toString().padLeft(2, '0');
+            return '$m:$sec';
+          }
+
+          return AlertDialog(
+            insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+            titlePadding: const EdgeInsets.fromLTRB(20, 16, 12, 8),
+            title: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        videoTitle.isNotEmpty ? videoTitle : 'YouTube subtitles',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(
+                          '${originals.length} lines  ·  $sourceLang → en',
+                          style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Close',
+                  icon: const Icon(Icons.close, size: 20),
+                  onPressed: () {
+                    cancelRequested = true;
+                    Navigator.of(dctx).pop();
+                  },
+                ),
+              ],
+            ),
+            content: SizedBox(
+              width: dialogW,
+              height: MediaQuery.of(dctx2).size.height * 0.6,
+              child: Column(
+                children: [
+                  if (translating)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Row(
+                        children: [
+                          const SizedBox(width: 16, height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2)),
+                          const SizedBox(width: 12),
+                          Expanded(child: Text(
+                            'Translating $progressDone / $progressTotal…',
+                            style: const TextStyle(fontSize: 12),
+                          )),
+                          TextButton(
+                            onPressed: () => setStateDialog(() => cancelRequested = true),
+                            child: const Text('Cancel'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  if (translateError != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text('Translation failed: $translateError',
+                          style: TextStyle(color: Colors.red.shade700, fontSize: 12)),
+                    ),
+                  Expanded(
+                    child: Container(
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.grey),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: ListView.builder(
+                        itemCount: originals.length,
+                        itemBuilder: (_, i) {
+                          final tr = i < translation.length ? translation[i] : '';
+                          final showTr = translated && tr.isNotEmpty;
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                SizedBox(
+                                  width: 48,
+                                  child: Text(
+                                    tsFmt((lines[i]['start'] as num).toDouble()),
+                                    style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                                  ),
+                                ),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                                    children: [
+                                      Text(originals[i], style: const TextStyle(fontSize: 13)),
+                                      if (showTr)
+                                        Padding(
+                                          padding: const EdgeInsets.only(top: 2),
+                                          child: Text(tr,
+                                              style: TextStyle(
+                                                  fontSize: 12, color: Colors.blue.shade800)),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: translating ? null : startTranslate,
+                child: Text(translated ? 'Re-translate' : 'Translate'),
+              ),
+              TextButton(
+                onPressed: translating ? null : () {
+                  // Build the same payload shape `_jsCodeForCapturedSubtitle`
+                  // expects: parallel `lines` + `translation` arrays keyed by
+                  // index/start/end.
+                  final outLines = <Map<String, dynamic>>[];
+                  final outTr = <Map<String, dynamic>>[];
+                  for (var i = 0; i < lines.length; i++) {
+                    outLines.add({
+                      'index': i,
+                      'start': lines[i]['start'],
+                      'end': lines[i]['end'],
+                      'text': originals[i],
+                    });
+                    outTr.add({
+                      'index': i,
+                      'start': lines[i]['start'],
+                      'end': lines[i]['end'],
+                      'text': i < translation.length ? translation[i] : '',
+                    });
+                  }
+                  Navigator.of(dctx).pop();
+                  _sendCapturedSubtitleToDialog1(<String, dynamic>{
+                    'query': '',
+                    'sourceLang': sourceLang,
+                    'targetLang': 'en',
+                    'matchIndex': 0,
+                    'lines': outLines,
+                    'translation': outTr,
+                    'videoUrl': videoUrl,
+                    'videoId': videoId,
+                    'videoTitle': videoTitle,
+                  });
+                },
+                child: const Text('Send to lookup'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// Translates a full-file cue list by joining cues into batches separated
+  /// by newlines (cheap, terminator that Google's translator preserves in
+  /// practice), translating each batch in one round trip, and splitting the
+  /// response back. Falls back to per-line translation for any batch whose
+  /// line count comes back wrong. 4-way concurrent across batches.
+  ///
+  /// Yields cooperatively after every batch completes so a long-running
+  /// translation never starves the event loop / UI thread.
+  Future<List<String>> _translateLinesBatched(
+    List<String> lines,
+    String sourceLang,
+    String targetLang, {
+    required void Function(int done, int total) onProgress,
+    required bool Function() isCancelled,
+  }) async {
+    final out = List<String>.filled(lines.length, '');
+    if (lines.isEmpty) return out;
+
+    // Pack indices into batches by character budget — Google's `gtx` accepts
+    // ~5 KB per `q=` once URL-encoded, so cap at ~3500 raw chars to leave
+    // headroom for multi-byte characters.
+    const maxChars = 3500;
+    const batchSep = '\n';
+    final batches = <List<int>>[];
+    var current = <int>[];
+    var currentChars = 0;
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].trim().isEmpty) continue;
+      final cost = lines[i].length + batchSep.length;
+      if (current.isNotEmpty && currentChars + cost > maxChars) {
+        batches.add(current);
+        current = [];
+        currentChars = 0;
+      }
+      current.add(i);
+      currentChars += cost;
+    }
+    if (current.isNotEmpty) batches.add(current);
+
+    Future<void> translateBatch(List<int> batch) async {
+      final joined = batch.map((i) => lines[i]).join(batchSep);
+      try {
+        final translated = await _translateText(joined, sourceLang, targetLang);
+        final parts = translated.split(batchSep);
+        if (parts.length == batch.length) {
+          for (var k = 0; k < batch.length; k++) {
+            out[batch[k]] = parts[k];
+          }
+          return;
+        }
+        // Line-count drift — Google occasionally merges/splits cues. Fall
+        // back to per-line for this batch only so the rest of the file
+        // still benefits from batching.
+      } catch (_) {}
+      for (final i in batch) {
+        if (isCancelled()) return;
+        try {
+          out[i] = await _translateText(lines[i], sourceLang, targetLang);
+        } catch (_) {
+          out[i] = '';
+        }
+      }
+    }
+
+    var done = 0;
+    const concurrency = 4;
+    for (var bi = 0; bi < batches.length; bi += concurrency) {
+      if (isCancelled()) break;
+      final group = batches.sublist(
+        bi,
+        (bi + concurrency).clamp(0, batches.length),
+      );
+      await Future.wait(group.map(translateBatch));
+      done += group.fold<int>(0, (a, b) => a + b.length);
+      onProgress(done, lines.length);
+      // Yield to the event loop between batch groups so the UI stays smooth.
+      await Future<void>.delayed(Duration.zero);
+    }
+    return out;
+  }
+
   /// Surfaces capture-time errors above the open Filmot dialog2 via a small
   /// AlertDialog — the root ScaffoldMessenger's snackbars sit *behind* the
   /// dialog and look like "nothing happened" to the user.
@@ -3298,8 +3937,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       context: context,
       builder: (dctx) => AlertDialog(
         title: Text(title),
-        content: Text(message),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 360, maxWidth: 520),
+          child: SingleChildScrollView(
+            child: SelectableText(
+              message,
+              style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+            ),
+          ),
+        ),
         actions: [
+          TextButton(
+            onPressed: () { Clipboard.setData(ClipboardData(text: message)); },
+            child: const Text('Copy'),
+          ),
           TextButton(onPressed: () => Navigator.of(dctx).pop(), child: const Text('OK')),
         ],
       ),
@@ -3957,7 +4608,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     );
   }
 
-  Future<void> _saveCurrentFilmotVideo(WebViewController controller) async {
+  Future<void> _saveCurrentFilmotVideo(String dialogId, WebViewController controller) async {
     // Filmot's search-results page hosts the player at the top and a list of
     // result cards in a sidebar. Clicking "Next video" swaps the iframe `src`
     // and the `#divVideoDetails` content via JS — the page URL does not
@@ -4029,25 +4680,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       final data = jsonDecode(s) as Map<String, dynamic>;
       final url = data['url']?.toString() ?? '';
       if (url.isEmpty) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('No video URL found on screen'), duration: const Duration(seconds: 2)),
-          );
-        }
+        _showDialog2SnackBar(dialogId, 'No video URL found on screen');
         return;
       }
-      _handleFilmotMessage('__manual__', jsonEncode({
+      _handleFilmotMessage(dialogId, jsonEncode({
         'action': 'saveVideo',
         'url': url,
         'channel': data['channel']?.toString() ?? '',
         'title': data['title']?.toString() ?? '',
       }));
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Save failed: $e'), duration: const Duration(seconds: 2)),
-        );
-      }
+      _showDialog2SnackBar(dialogId, 'Save failed: $e');
     }
   }
 
@@ -4218,6 +4861,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(_userAgent)
         ..addJavaScriptChannel('GitHubProxy', onMessageReceived: _handleGitHubProxyRequest)
+        ..addJavaScriptChannel('TtsBridge', onMessageReceived: _handleTtsBridge)
         ..setNavigationDelegate(
           NavigationDelegate(
             onPageStarted: (url) {
@@ -4249,6 +4893,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             },
             onPageFinished: (url) {
               _injectAdBlocker(dialogController);
+              // Polyfill window.speechSynthesis before the page tries to use
+              // it. Safe to inject every page-finished — re-entry is gated.
+              dialogController?.runJavaScript(_ttsPolyfillJs);
               dialogController?.runJavaScript(jsCodeToFilterData(_currentDialogText));
               final pending = _pendingCapturedSubtitle;
               if (pending != null) {
@@ -4286,9 +4933,23 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     showDialog(
       context: context,
       barrierDismissible: !hasBeenMinimized, // Prevent outside tap closing if ever minimized
-      builder: (ctx) => hasBeenMinimized
-        ? GestureDetector(
-            // Custom barrier tap handler - minimizes instead of closing
+      builder: (ctx) => ValueListenableBuilder<bool>(
+        // Fullscreen toggle lives outside the outer State's setState scope
+        // (this is a separate Navigator route), so we drive it from a notifier.
+        valueListenable: _dialog1FullscreenNotifier,
+        builder: (_, fullscreen, __) {
+          final dialog = Dialog(
+            insetPadding: fullscreen
+                ? EdgeInsets.zero
+                : EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: 0),
+            shape: fullscreen
+                ? const RoundedRectangleBorder(borderRadius: BorderRadius.zero)
+                : null,
+            child: _buildDialog1Content(ctx, screenWidth, screenHeight),
+          );
+          if (!hasBeenMinimized) return dialog;
+          // Custom barrier tap handler — minimizes instead of closing.
+          return GestureDetector(
             onTap: () {
               setState(() => _dialog1Minimized = true);
               Navigator.of(ctx).pop();
@@ -4299,23 +4960,19 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               child: Center(
                 child: GestureDetector(
                   onTap: () {}, // Prevent tap propagation from dialog content
-                  child: Dialog(
-                    insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: 0),
-                    child: _buildDialog1Content(ctx, screenWidth, screenHeight),
-                  ),
+                  child: dialog,
                 ),
               ),
             ),
-          )
-        : Dialog(
-            insetPadding: EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: 0),
-            child: _buildDialog1Content(ctx, screenWidth, screenHeight),
-          ),
+          );
+        },
+      ),
     ).then((_) {
       // Dialog closed - but keep controller alive to avoid reloading.
       // Controller will be cleaned up only when app is disposed or language changes.
       // This prevents unnecessary reloads when reopening the dialog.
       _dialog1Visible = false;
+      _dialog1FullscreenNotifier.value = false;
     });
   }
 
@@ -4330,6 +4987,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
+                IconButton(
+                  tooltip: 'Download YouTube subtitles (translate, send to lookup)',
+                  icon: const Icon(Icons.closed_caption_outlined),
+                  onPressed: () => _startYouTubeSubtitleDownload(ctx),
+                ),
                 ValueListenableBuilder<bool>(
                   // The mic state changes async inside _speech callbacks, so
                   // the outer State's setState() doesn't repaint the dialog
@@ -4361,6 +5023,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     Navigator.of(ctx).pop();
                     _openDialogWithWebview(_currentDialogText);
                   },
+                ),
+                ValueListenableBuilder<bool>(
+                  valueListenable: _dialog1FullscreenNotifier,
+                  builder: (_, fullscreen, __) => IconButton(
+                    tooltip: fullscreen ? 'Exit fullscreen' : 'Enter fullscreen',
+                    icon: Icon(
+                      fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                      size: 20,
+                    ),
+                    onPressed: () => _dialog1FullscreenNotifier.value = !fullscreen,
+                  ),
                 ),
                 IconButton(
                   tooltip: 'Minimize',
@@ -4745,6 +5418,243 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ],
       ),
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // window.speechSynthesis bridge for dialog1
+  //
+  // Android WebView ships without the Web Speech Synthesis API — pages that
+  // call `new SpeechSynthesisUtterance(...)` + `speechSynthesis.speak(...)`
+  // silently no-op. macOS WKWebView has it natively, but we install the same
+  // shim everywhere so utterance.onstart / .onend semantics are identical.
+  //
+  // The shim replaces `window.speechSynthesis` (and the Utterance constructor)
+  // with objects that post a JSON envelope to the `TtsBridge` channel. Flutter
+  // drives a queue against flutter_tts and pokes start/end/error callbacks
+  // back into the page via runJavaScript on globals it exposed itself.
+  // -------------------------------------------------------------------------
+  static const String _ttsPolyfillJs = r'''
+(function() {
+  if (window.__cupitorTtsInstalled) return;
+  window.__cupitorTtsInstalled = true;
+  var bridge = window.TtsBridge;
+  if (!bridge || typeof bridge.postMessage !== 'function') return;
+
+  var pending = new Map();
+  var nextId = 1;
+
+  function post(obj) {
+    try { bridge.postMessage(JSON.stringify(obj)); } catch (_) {}
+  }
+
+  function Utterance(text) {
+    this.text = text == null ? '' : String(text);
+    this.lang = document.documentElement.lang || '';
+    this.voice = null;
+    this.volume = 1.0;
+    this.rate = 1.0;
+    this.pitch = 1.0;
+    this.onstart = null;
+    this.onend = null;
+    this.onerror = null;
+    this.onpause = null;
+    this.onresume = null;
+    this.onmark = null;
+    this.onboundary = null;
+    var listeners = {};
+    this.addEventListener = function(t, fn) { (listeners[t] = listeners[t] || []).push(fn); };
+    this.removeEventListener = function(t, fn) {
+      var arr = listeners[t]; if (!arr) return;
+      var i = arr.indexOf(fn); if (i >= 0) arr.splice(i, 1);
+    };
+    this.dispatchEvent = function(ev) {
+      var arr = listeners[ev.type]; if (!arr) return true;
+      for (var i = 0; i < arr.length; i++) {
+        try { arr[i].call(this, ev); } catch (_) {}
+      }
+      return true;
+    };
+  }
+  window.SpeechSynthesisUtterance = Utterance;
+
+  function fire(u, name, extra) {
+    var handler = u['on' + name];
+    if (typeof handler === 'function') {
+      try { handler.call(u, Object.assign({ type: name, utterance: u }, extra || {})); } catch (_) {}
+    }
+    try {
+      var ev = new Event(name);
+      Object.assign(ev, extra || {});
+      u.dispatchEvent(ev);
+    } catch (_) {}
+  }
+
+  var synth = {
+    paused: false,
+    pending: false,
+    speaking: false,
+    onvoiceschanged: null,
+    speak: function(u) {
+      if (!u) return;
+      var id = nextId++;
+      pending.set(id, u);
+      synth.speaking = true;
+      synth.pending = pending.size > 1;
+      post({
+        type: 'speak',
+        id: id,
+        text: String(u.text || ''),
+        lang: String(u.lang || ''),
+        rate: Number(u.rate) || 1,
+        pitch: Number(u.pitch) || 1,
+        volume: Number(u.volume) || 1,
+      });
+    },
+    cancel: function() {
+      var ids = Array.from(pending.keys());
+      pending.clear();
+      synth.speaking = false;
+      synth.paused = false;
+      synth.pending = false;
+      post({ type: 'cancel' });
+      ids.forEach(function(id) {
+        // best-effort: the host already stopped, so synthesise an `end` on
+        // the JS side so the page's promise chains resolve.
+      });
+    },
+    pause: function() { synth.paused = true; post({ type: 'pause' }); },
+    resume: function() { synth.paused = false; post({ type: 'resume' }); },
+    getVoices: function() { return []; },
+    addEventListener: function() {},
+    removeEventListener: function() {},
+    dispatchEvent: function() { return true; },
+  };
+
+  window.__cupitorTtsStart = function(id) {
+    var u = pending.get(id); if (!u) return;
+    synth.speaking = true;
+    fire(u, 'start');
+  };
+  window.__cupitorTtsEnd = function(id) {
+    var u = pending.get(id); pending.delete(id);
+    synth.pending = pending.size > 0;
+    if (pending.size === 0) synth.speaking = false;
+    if (!u) return;
+    fire(u, 'end');
+  };
+  window.__cupitorTtsError = function(id, msg) {
+    var u = pending.get(id); pending.delete(id);
+    synth.pending = pending.size > 0;
+    if (pending.size === 0) synth.speaking = false;
+    if (!u) return;
+    fire(u, 'error', { error: msg || 'tts-error' });
+  };
+
+  try {
+    Object.defineProperty(window, 'speechSynthesis', {
+      value: synth, writable: false, configurable: false,
+    });
+  } catch (_) {
+    window.speechSynthesis = synth;
+  }
+})();
+''';
+
+  Future<void> _ensureDialog1Tts() async {
+    if (_dialog1Tts != null) return;
+    final tts = FlutterTts();
+    _dialog1Tts = tts;
+    try {
+      // Speak/stop one utterance at a time and rely on these callbacks to
+      // advance the queue. awaitSpeakCompletion would also work but blocks
+      // the speak call — handlers keep us reactive to cancel().
+      tts.setStartHandler(() {
+        final id = _dialog1TtsActiveJsId;
+        if (id != null) {
+          dialogController?.runJavaScript('window.__cupitorTtsStart && window.__cupitorTtsStart($id);');
+        }
+      });
+      tts.setCompletionHandler(() {
+        _ttsFinishCurrent(error: null);
+      });
+      tts.setCancelHandler(() {
+        // System cancelled (e.g. another app took audio focus). Treat as end.
+        _ttsFinishCurrent(error: null);
+      });
+      tts.setErrorHandler((msg) {
+        _ttsFinishCurrent(error: msg?.toString() ?? 'tts-error');
+      });
+    } catch (_) { /* best-effort */ }
+  }
+
+  void _ttsFinishCurrent({String? error}) {
+    final id = _dialog1TtsActiveJsId;
+    _dialog1TtsActiveJsId = null;
+    _dialog1TtsBusy = false;
+    if (id != null) {
+      if (error == null) {
+        dialogController?.runJavaScript('window.__cupitorTtsEnd && window.__cupitorTtsEnd($id);');
+      } else {
+        final esc = jsonEncode(error);
+        dialogController?.runJavaScript('window.__cupitorTtsError && window.__cupitorTtsError($id, $esc);');
+      }
+    }
+    _ttsPumpQueue();
+  }
+
+  Future<void> _ttsPumpQueue() async {
+    if (_dialog1TtsBusy) return;
+    if (_dialog1TtsQueue.isEmpty) return;
+    final next = _dialog1TtsQueue.removeAt(0);
+    _dialog1TtsBusy = true;
+    _dialog1TtsActiveJsId = next['id'] as int;
+    final tts = _dialog1Tts;
+    if (tts == null) { _ttsFinishCurrent(error: 'tts-unavailable'); return; }
+    try {
+      final lang = (next['lang'] as String?)?.trim();
+      if (lang != null && lang.isNotEmpty) {
+        try { await tts.setLanguage(lang); } catch (_) {}
+      }
+      // Web rate is 0.1–10 with 1.0 = normal. flutter_tts rate on Android maps
+      // 0.0–1.0 with ~0.5 being normal; iOS/macOS uses 0.0–1.0 with ~0.5
+      // normal too. Halving keeps "normal" at "normal" and clamps to [0.1, 1.0].
+      final webRate = (next['rate'] as num?)?.toDouble() ?? 1.0;
+      final ttsRate = (webRate / 2.0).clamp(0.1, 1.0);
+      try { await tts.setSpeechRate(ttsRate); } catch (_) {}
+      final pitch = ((next['pitch'] as num?)?.toDouble() ?? 1.0).clamp(0.5, 2.0);
+      try { await tts.setPitch(pitch); } catch (_) {}
+      final volume = ((next['volume'] as num?)?.toDouble() ?? 1.0).clamp(0.0, 1.0);
+      try { await tts.setVolume(volume); } catch (_) {}
+      await tts.speak((next['text'] as String?) ?? '');
+    } catch (e) {
+      _ttsFinishCurrent(error: e.toString());
+    }
+  }
+
+  void _handleTtsBridge(JavaScriptMessage msg) {
+    Map<String, dynamic> req;
+    try { req = jsonDecode(msg.message) as Map<String, dynamic>; }
+    catch (_) { return; }
+    final type = req['type'] as String?;
+    if (type == null) return;
+    _ensureDialog1Tts();
+    switch (type) {
+      case 'speak':
+        _dialog1TtsQueue.add(req);
+        _ttsPumpQueue();
+        break;
+      case 'cancel':
+        _dialog1TtsQueue.clear();
+        _dialog1Tts?.stop();
+        _ttsFinishCurrent(error: null);
+        break;
+      case 'pause':
+        _dialog1Tts?.pause();
+        break;
+      case 'resume':
+        // flutter_tts has no resume on Android — best-effort no-op.
+        break;
+    }
   }
 
   String jsCodeToFilterData(String text) {
@@ -5188,6 +6098,164 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 }
 
+// ---------- YouTube subtitle isolate helpers ----------
+// Top-level so they can be passed to `compute()`. The json3 cue blob can hit
+// ~1 MB on hour-long videos — parsing on the UI isolate would jank the frame,
+// so we hand it off to a background isolate.
+
+
+/// Parses a YouTube `fmt=json3` caption body into `[{index, start, end, text}]`.
+/// Empty / timing-only events are dropped; multi-segment events are flattened
+/// by concatenating their `utf8` parts. `start`/`end` are in seconds.
+List<Map<String, dynamic>> _parseYtJson3Captions(String body) {
+  Map<String, dynamic> root;
+  try {
+    root = jsonDecode(body) as Map<String, dynamic>;
+  } catch (_) {
+    return const [];
+  }
+  final events = root['events'];
+  if (events is! List) return const [];
+  final out = <Map<String, dynamic>>[];
+  for (final e in events) {
+    if (e is! Map) continue;
+    final segs = e['segs'];
+    if (segs is! List) continue;
+    final buf = StringBuffer();
+    for (final s in segs) {
+      if (s is Map && s['utf8'] is String) buf.write(s['utf8']);
+    }
+    final text = buf.toString().replaceAll('\n', ' ').trim();
+    if (text.isEmpty) continue;
+    final tStart = (e['tStartMs'] as num?)?.toDouble() ?? 0;
+    final dDur = (e['dDurationMs'] as num?)?.toDouble() ?? 0;
+    out.add({
+      'index': out.length,
+      'start': tStart / 1000.0,
+      'end': (tStart + dDur) / 1000.0,
+      'text': text,
+    });
+  }
+  return out;
+}
+
+/// Fallback parser for YouTube's default (`srv1`) timed-text XML, used when
+/// `fmt=json3` comes back empty (happens on some non-English ASR tracks).
+/// Shape we accept:
+/// ```xml
+/// <transcript>
+///   <text start="0.42" dur="3.12">Hello &amp;amp; world</text>
+///   ...
+/// </transcript>
+/// ```
+/// Returns the same `[{index, start, end, text}]` shape as the json3 parser
+/// so the caller path is identical.
+List<Map<String, dynamic>> _parseYtTimedTextXml(String body) {
+  if (body.isEmpty) return const [];
+  // Regex parsing is fine here — the schema is fixed and shallow.
+  final re = RegExp(
+    r'<text\s+([^>]*?)>([\s\S]*?)<\/text>',
+    multiLine: true,
+  );
+  final out = <Map<String, dynamic>>[];
+  for (final m in re.allMatches(body)) {
+    final attrs = m.group(1) ?? '';
+    final raw = m.group(2) ?? '';
+    double parseAttr(String name) {
+      final am = RegExp('$name="([^"]*)"').firstMatch(attrs);
+      if (am == null) return 0;
+      return double.tryParse(am.group(1) ?? '') ?? 0;
+    }
+    final start = parseAttr('start');
+    final dur = parseAttr('dur');
+    final text = _decodeXmlEntities(raw).replaceAll('\n', ' ').trim();
+    if (text.isEmpty) continue;
+    out.add({
+      'index': out.length,
+      'start': start,
+      'end': start + dur,
+      'text': text,
+    });
+  }
+  return out;
+}
+
+String _decodeXmlEntities(String s) {
+  return s
+      // Two-pass for nested entities (`&amp;amp;` → `&amp;` → `&`).
+      .replaceAll('&amp;', '&')
+      .replaceAll('&lt;', '<')
+      .replaceAll('&gt;', '>')
+      .replaceAll('&quot;', '"')
+      .replaceAll('&#39;', "'")
+      .replaceAllMapped(RegExp(r'&#(\d+);'),
+          (m) => String.fromCharCode(int.parse(m.group(1)!)))
+      .replaceAllMapped(RegExp(r'&#x([0-9A-Fa-f]+);'),
+          (m) => String.fromCharCode(int.parse(m.group(1)!, radix: 16)));
+}
+
+/// Parses a WebVTT caption body into `[{index, start, end, text}]`. Used as
+/// a fallback when yt-dlp can't produce json3 (some non-English ASR tracks).
+/// Cue format:
+/// ```
+/// WEBVTT
+///
+/// 00:00:01.500 --> 00:00:04.000
+/// Hello <c.colorE5E5E5>world</c>
+/// ```
+/// Inline tags (`<c>…</c>`, `<i>`, timestamp tags) are stripped — we only
+/// keep the text payload.
+List<Map<String, dynamic>> _parseVttCaptions(String body) {
+  if (body.isEmpty) return const [];
+  final tsRe = RegExp(
+    r'(\d{1,2}):(\d{2}):(\d{2})[\.,](\d{1,3})\s+-->\s+'
+    r'(\d{1,2}):(\d{2}):(\d{2})[\.,](\d{1,3})',
+  );
+  final tagRe = RegExp(r'<[^>]*>');
+  final lines = body.split(RegExp(r'\r?\n'));
+  final out = <Map<String, dynamic>>[];
+  var i = 0;
+  while (i < lines.length) {
+    final m = tsRe.firstMatch(lines[i]);
+    if (m == null) { i++; continue; }
+    double parseTs(int h, int mm, int s, int ms) =>
+        h * 3600 + mm * 60 + s + ms / 1000.0;
+    final start = parseTs(
+      int.parse(m.group(1)!), int.parse(m.group(2)!),
+      int.parse(m.group(3)!), int.parse(m.group(4)!.padRight(3, '0')),
+    );
+    final end = parseTs(
+      int.parse(m.group(5)!), int.parse(m.group(6)!),
+      int.parse(m.group(7)!), int.parse(m.group(8)!.padRight(3, '0')),
+    );
+    i++;
+    final buf = StringBuffer();
+    while (i < lines.length && lines[i].trim().isNotEmpty) {
+      final stripped = lines[i].replaceAll(tagRe, '').trim();
+      if (stripped.isNotEmpty) {
+        if (buf.isNotEmpty) buf.write(' ');
+        buf.write(stripped);
+      }
+      i++;
+    }
+    final text = buf.toString().trim();
+    if (text.isEmpty) continue;
+    // De-dupe consecutive identical lines — YouTube's ASR VTT often repeats
+    // each cue at finer granularity (rolling karaoke style).
+    if (out.isNotEmpty && (out.last['text'] as String) == text) {
+      out.last['end'] = end;
+      continue;
+    }
+    out.add({
+      'index': out.length,
+      'start': start,
+      'end': end,
+      'text': text,
+    });
+  }
+  return out;
+}
+
 /// A small draggable chip shown on the root overlay to represent a minimized
 /// dialog. Tap to restore; the trailing "×" closes the dialog entirely.
 class _FloatingDraggableChip extends StatefulWidget {
@@ -5285,3 +6353,4 @@ class _FloatingDraggableChipState extends State<_FloatingDraggableChip> {
     );
   }
 }
+
