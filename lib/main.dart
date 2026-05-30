@@ -18,14 +18,12 @@ import 'yt_dlp_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // Hide the status bar to reclaim vertical space, but leave Android's
-  // bottom navigation bar (back / home / recents) visible. Pure
-  // immersiveSticky also swallows the nav bar, which makes back navigation
-  // require an awkward swipe-from-edge.
-  await SystemChrome.setEnabledSystemUIMode(
-    SystemUiMode.manual,
-    overlays: const [SystemUiOverlay.bottom],
-  );
+  // Hide both system bars for maximum reading area, but rely on
+  // `immersiveSticky` so the user can swipe from any edge to transiently
+  // reveal them (status bar top, back / home / recents bottom). They
+  // auto-hide again after a few seconds. This is the standard Android
+  // immersive UX — no custom in-app gesture needed.
+  await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   runApp(MyApp());
 }
 
@@ -75,6 +73,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   Map<String, String> _dialog2Urls = {};
   Set<String> _minimizedDialog2s = {};
   Set<String> _everMinimizedDialog2s = {}; // Track dialogs that have ever been minimized
+  // ---- Wiktionary "collect words" feature ----
+  // When ON: clicks on the Wiktionary page are intercepted — links don't
+  // navigate, and the clicked word is appended to _wiktCollectedWords (joined
+  // by '|' when copied out). Global so a single list spans multiple open
+  // Wiktionary dialogs, persisted to SharedPreferences across sessions.
+  final ValueNotifier<bool> _wiktCollectMode = ValueNotifier(false);
+  final ValueNotifier<List<String>> _wiktCollectedWords = ValueNotifier(<String>[]);
   String _currentDialogText = '';
   String? _cachedRemoteSnippet;
   final Set<String> _handledPdfUrls = {};
@@ -156,6 +161,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   int? _dialog1TtsActiveJsId;
   bool _dialog1TtsBusy = false;
   static const _adBlockChannel = MethodChannel('cupitor/adblock');
+  // Headset / Bluetooth media-key bridge. Native (MediaSessionCompat) sends
+  // play/pause/next/prev events here; we forward each as a `cupitorMediaKey`
+  // CustomEvent into dialog1's WebView so the language page can run custom
+  // playback behavior (replay previous video, etc.). The page can also push
+  // its current playing state back via the `MediaState` JS channel so the
+  // lockscreen and Bluetooth car UI show the right title.
+  static const _mediaKeysChannel = MethodChannel('cupitor/mediakeys');
+  bool _mediaSessionActive = false;
   // Hosts auto-detected by the native ad-blocker that haven't been confirmed yet.
   final List<String> _detectedAdHosts = [];
   bool _adBlockEnabled = true;
@@ -205,6 +218,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       'Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36';
 
+
   static const List<String> _youtubeFrontendInstances = [
     'piped.video',
     'yewtu.be',
@@ -219,6 +233,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     _adBlockChannel.setMethodCallHandler(null); // stop receiving callbacks
+    _mediaKeysChannel.setMethodCallHandler(null);
+    if (_mediaSessionActive) {
+      // Best-effort deactivation; ignore failures during teardown.
+      _mediaKeysChannel.invokeMethod<void>('setActive', {'active': false});
+      _mediaSessionActive = false;
+    }
     // Save scroll position of the current page before disposing
     final url = _urlController.text.trim();
     if (url.isNotEmpty) _saveScrollPosition(url);
@@ -244,6 +264,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _dialog1FullscreenNotifier.dispose();
     _dialog1Tts?.stop();
     _dialog1Tts = null;
+    // Close any open ML Kit translators in the snippet-bridge pool.
+    for (final t in _translatorPool.values) {
+      try { t.close(); } catch (_) {}
+    }
+    _translatorPool.clear();
     super.dispose();
   }
 
@@ -280,7 +305,18 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           if (host != null && mounted) _showDetectedAdHostBanner(host);
         }
       });
+      _mediaKeysChannel.setMethodCallHandler((call) async {
+        if (call.method == 'onKey') {
+          final key = (call.arguments as Map?)?['key']?.toString();
+          if (key != null) _dispatchMediaKeyToDialog1(key);
+        }
+      });
     }
+    // Warm the remote-snippet cache in parallel with prefs/init so the very
+    // first navigation can already inject hooks at onPageStarted (instead of
+    // waiting for onPageFinished). Critical for the Netflix manifest case —
+    // autoplay fires before onPageFinished otherwise.
+    _warmRemoteSnippetCache();
     SharedPreferences.getInstance().then((prefs) {
       final savedUrl = prefs.getString('lastUrl') ?? _urlController.text;
       _urlController.text = savedUrl;
@@ -322,6 +358,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           _videoChannelCache = decoded.map((k, v) => MapEntry(k, v.toString()));
         } catch (_) {}
       }
+      // Wiktionary collect-words list. Persisted across sessions; toggle state
+      // is intentionally NOT persisted (default off on each launch so a stale
+      // "collect mode" doesn't silently swallow real clicks).
+      _wiktCollectedWords.value = prefs.getStringList('wiktCollectedWords') ?? <String>[];
       _controller = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(_userAgent)
@@ -348,6 +388,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             _appendSnippetLog(raw.substring(0, pipe), raw.substring(pipe + 1));
           }
         })
+        ..addJavaScriptChannel('TranslateRequest', onMessageReceived: _handleTranslateRequest)
         ..setNavigationDelegate(
           NavigationDelegate(
             onNavigationRequest: (request) async {
@@ -449,6 +490,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // YouTube's inline assignment script. The script is hostname-
               // gated and idempotent, so it's safe to call on every navigation.
               _injectYouTubeAdBlocker();
+              // Inject the cached remote snippet here too — onPageFinished is
+              // too late for hooks that need to be in place before the page's
+              // own scripts run (e.g. Netflix XHR/fetch override on the
+              // manifest endpoint). The snippet self-guards against duplicate
+              // installs, so re-running on every navigation is safe.
+              _injectRemoteSnippetEarly();
             },
             onPageFinished: (url) {
               if (_isShowingOurHtml) {
@@ -1267,6 +1314,30 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         _controller.runJavaScript(_wrapSnippetWithLogShim(_cachedRemoteSnippet!));
       }
     });
+  }
+
+  /// Inject the cached snippet at onPageStarted — i.e. before the page's
+  /// own scripts run. This is what lets hooks like the Netflix XHR / fetch
+  /// override land in time to catch the first manifest request (Netflix
+  /// autoplays as soon as the SPA shell is ready, so onPageFinished is too
+  /// late for that first call). No network — if the cache is empty (first
+  /// run after install), this no-ops and onPageFinished does the full fetch.
+  /// The snippet self-guards against double-install via __cup* flags.
+  void _injectRemoteSnippetEarly() {
+    final cached = _cachedRemoteSnippet;
+    if (cached == null) return;
+    try { _controller.runJavaScript(_wrapSnippetWithLogShim(cached)); } catch (_) {}
+  }
+
+  /// Fire-and-forget cache warm so the first navigation after launch can
+  /// still inject early. Runs in parallel with everything else in initState.
+  void _warmRemoteSnippetCache() {
+    if (_cachedRemoteSnippet != null) return;
+    http.get(
+      Uri.parse('https://raw.githubusercontent.com/trexsatya/trexsatya.github.io/refs/heads/gh-pages/db/js/snippet.js'),
+    ).timeout(const Duration(seconds: 8)).then((response) {
+      if (response.statusCode == 200) _cachedRemoteSnippet = response.body;
+    }).catchError((_) { /* offline / down — handled by the runtime fetch */ });
   }
 
   // Wraps the remote snippet in an outer IIFE that shadows `console` with a
@@ -2281,6 +2352,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setUserAgent(_userAgent)
       ..addJavaScriptChannel('FilmotBridge', onMessageReceived: (msg) => _handleFilmotMessage(dialogIdForBridge, msg.message))
+      ..addJavaScriptChannel('WiktCollect', onMessageReceived: (msg) => _handleWiktCollectMessage(msg.message))
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (request) {
           if (!request.isMainFrame) return NavigationDecision.navigate;
@@ -2304,6 +2376,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           _injectAdBlocker(dialog2Controller);
           if (_isFilmotUrl(finishedUrl)) {
             _injectFilmotHelper(dialog2Controller);
+          }
+          if (_isWiktionaryUrl(finishedUrl)) {
+            // Install (idempotent) the click interceptor, then sync the
+            // current toggle state — flipping the toggle later only needs
+            // _pushWiktCollectMode(); no re-injection.
+            dialog2Controller.runJavaScript(_wiktCollectJs);
+            _pushWiktCollectMode(dialog2Controller);
           }
           // Detect wiktionary 404: /wiki/{word} page that doesn't exist
           final uri = Uri.tryParse(finishedUrl);
@@ -2459,6 +2538,66 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
+                if (_isWiktionaryUrl(url)) ...[
+                  // Toggle: collect-clicked-words mode. When ON, the injected
+                  // JS preventDefault()s link clicks and ships clicked words
+                  // to Dart over the WiktCollect channel.
+                  ValueListenableBuilder<bool>(
+                    valueListenable: _wiktCollectMode,
+                    builder: (_, on, __) => IconButton(
+                      tooltip: on
+                          ? 'Collect mode ON — links disabled; clicks append words'
+                          : 'Collect mode OFF',
+                      icon: Icon(
+                        on ? Icons.touch_app : Icons.touch_app_outlined,
+                        size: 20,
+                        color: on ? Colors.amber : null,
+                      ),
+                      onPressed: () {
+                        _wiktCollectMode.value = !on;
+                        // Push the new flag into every open dialog2 (the
+                        // listener reads it at click time, so this is enough
+                        // — no re-injection needed).
+                        for (final e in _dialog2Controllers.entries) {
+                          if (_isWiktionaryUrl(_dialog2Urls[e.key])) {
+                            _pushWiktCollectMode(e.value);
+                          }
+                        }
+                      },
+                    ),
+                  ),
+                  ValueListenableBuilder<List<String>>(
+                    valueListenable: _wiktCollectedWords,
+                    builder: (_, words, __) => Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        IconButton(
+                          tooltip: 'Review collected words (${words.length})',
+                          icon: const Icon(Icons.list_alt, size: 20),
+                          onPressed: () => _showWiktCollectedDialog(ctx),
+                        ),
+                        if (words.isNotEmpty)
+                          Positioned(
+                            right: 4,
+                            top: 4,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                              decoration: BoxDecoration(
+                                color: Colors.redAccent,
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              constraints: const BoxConstraints(minWidth: 14, minHeight: 14),
+                              child: Text(
+                                words.length > 99 ? '99+' : '${words.length}',
+                                style: const TextStyle(color: Colors.white, fontSize: 9, height: 1),
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
                 if (_isFilmotUrl(url)) ...[
                   IconButton(
                     tooltip: 'Capture subtitle (with context, translate, send to lookup)',
@@ -2652,6 +2791,270 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   bool _isFilmotUrl(String? url) {
     final host = Uri.tryParse(url ?? '')?.host ?? '';
     return host.endsWith('filmot.com');
+  }
+
+  bool _isWiktionaryUrl(String? url) {
+    final host = Uri.tryParse(url ?? '')?.host ?? '';
+    return host.endsWith('.wiktionary.org') || host == 'wiktionary.org';
+  }
+
+  /// JS the WebView runs on every Wiktionary page load. Defines a single
+  /// document-level click listener (capture phase) that reads the global
+  /// `__cupWiktCollectActive` flag at click time — so flipping the toggle
+  /// takes effect without re-injecting. Sends the clicked word to Dart via
+  /// the `WiktCollect` channel, and preventDefault()s link navigation.
+  static const String _wiktCollectJs = r'''
+(function () {
+  if (window.__cupWiktInstalled) return;
+  window.__cupWiktInstalled = true;
+  window.__cupWiktCollectActive = window.__cupWiktCollectActive || false;
+
+  function wordAt(target, x, y) {
+    // Prefer an explicit selection if the user double-tapped to select.
+    try {
+      var sel = window.getSelection && window.getSelection();
+      if (sel && sel.toString && sel.toString().trim()) {
+        return sel.toString().trim().split(/\s+/)[0];
+      }
+    } catch (e) {}
+    // Otherwise use the caret position at the click point to extract one word.
+    var node = null, offset = 0;
+    if (document.caretRangeFromPoint) {
+      var r = document.caretRangeFromPoint(x, y);
+      if (r) { node = r.startContainer; offset = r.startOffset; }
+    } else if (document.caretPositionFromPoint) {
+      var p = document.caretPositionFromPoint(x, y);
+      if (p) { node = p.offsetNode; offset = p.offset; }
+    }
+    if (node && node.nodeType === 3) {
+      var t = node.textContent || '';
+      var s = offset, e = offset;
+      var re = /[\p{L}\p{N}\-']/u;
+      while (s > 0 && re.test(t[s - 1])) s--;
+      while (e < t.length && re.test(t[e])) e++;
+      var w = t.substring(s, e).trim();
+      if (w) return w;
+    }
+    // Last resort: the clicked element's text (single word only).
+    var txt = (target && (target.innerText || target.textContent) || '').trim();
+    return txt.split(/\s+/)[0] || '';
+  }
+
+  document.addEventListener('click', function (ev) {
+    if (!window.__cupWiktCollectActive) return;
+    // Block link navigation + any other default click handling.
+    ev.preventDefault();
+    ev.stopPropagation();
+    ev.stopImmediatePropagation();
+    var w = wordAt(ev.target, ev.clientX, ev.clientY);
+    if (w && window.WiktCollect && window.WiktCollect.postMessage) {
+      try { window.WiktCollect.postMessage(w); } catch (e) {}
+    }
+  }, true);
+
+  // Visual cue: a tiny banner so the user knows clicks are being captured.
+  function syncBanner() {
+    var id = '__cup-wikt-banner';
+    var el = document.getElementById(id);
+    if (window.__cupWiktCollectActive) {
+      if (!el) {
+        el = document.createElement('div');
+        el.id = id;
+        el.style.cssText =
+          'position:fixed;top:0;left:0;right:0;z-index:2147483647;'
+          + 'background:#f59e0b;color:#000;font:600 12px/1.6 system-ui;'
+          + 'text-align:center;padding:2px 8px;pointer-events:none;';
+        el.textContent = 'Collect mode — links disabled, clicks add to word list';
+        (document.body || document.documentElement).appendChild(el);
+      }
+    } else if (el) {
+      el.remove();
+    }
+  }
+  // Poll-light: keep the banner in sync if the flag is flipped while the
+  // page is loaded. Cheap (every 500 ms, no DOM work when state matches).
+  setInterval(syncBanner, 500);
+  syncBanner();
+})();
+''';
+
+  void _pushWiktCollectMode(WebViewController c) {
+    final on = _wiktCollectMode.value;
+    try {
+      c.runJavaScript('window.__cupWiktCollectActive = $on;');
+    } catch (_) {}
+  }
+
+  void _handleWiktCollectMessage(String word) {
+    final cleaned = word.trim();
+    if (cleaned.isEmpty) return;
+    final list = List<String>.from(_wiktCollectedWords.value);
+    // Append even if duplicate — the user can dedup in the review dialog.
+    // (Most language-study notes want each occurrence recorded.)
+    list.add(cleaned);
+    _wiktCollectedWords.value = list;
+    SharedPreferences.getInstance().then((prefs) {
+      prefs.setStringList('wiktCollectedWords', list);
+    });
+  }
+
+  void _persistWiktCollectedWords() {
+    final snapshot = List<String>.from(_wiktCollectedWords.value);
+    SharedPreferences.getInstance().then((prefs) {
+      prefs.setStringList('wiktCollectedWords', snapshot);
+    });
+  }
+
+  void _showWiktCollectedDialog(BuildContext rootCtx) {
+    showDialog(
+      context: rootCtx,
+      builder: (ctx) => Dialog(
+        insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 60),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: ValueListenableBuilder<List<String>>(
+            valueListenable: _wiktCollectedWords,
+            builder: (_, words, __) {
+              final joined = words.join('|');
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Collected words (${words.length})',
+                            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Close',
+                          icon: const Icon(Icons.close),
+                          onPressed: () => Navigator.of(ctx).pop(),
+                        ),
+                      ],
+                    ),
+                  ),
+                  // Joined-output preview (the actual thing the user wants to
+                  // copy). Read-only TextField so they can also long-press to
+                  // select a subset.
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: TextField(
+                      controller: TextEditingController(text: joined),
+                      readOnly: true,
+                      maxLines: 3,
+                      style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                        labelText: 'Joined output ( | separated )',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  // The list itself — each word has a remove button.
+                  Flexible(
+                    child: words.isEmpty
+                        ? const Padding(
+                            padding: EdgeInsets.all(24),
+                            child: Text('No words collected yet. Turn on collect mode and tap words.',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(color: Colors.grey)),
+                          )
+                        : ListView.builder(
+                            shrinkWrap: true,
+                            itemCount: words.length,
+                            itemBuilder: (_, i) => ListTile(
+                              dense: true,
+                              visualDensity: VisualDensity.compact,
+                              leading: SizedBox(
+                                width: 28,
+                                child: Text('${i + 1}.', textAlign: TextAlign.right),
+                              ),
+                              title: Text(words[i]),
+                              trailing: IconButton(
+                                tooltip: 'Remove',
+                                icon: const Icon(Icons.close, size: 18),
+                                onPressed: () {
+                                  final next = List<String>.from(words)..removeAt(i);
+                                  _wiktCollectedWords.value = next;
+                                  _persistWiktCollectedWords();
+                                },
+                              ),
+                            ),
+                          ),
+                  ),
+                  const Divider(height: 1),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+                    child: Row(
+                      children: [
+                        TextButton.icon(
+                          icon: const Icon(Icons.delete_sweep, size: 18),
+                          label: const Text('Clear all'),
+                          onPressed: words.isEmpty
+                              ? null
+                              : () async {
+                                  final confirm = await showDialog<bool>(
+                                    context: ctx,
+                                    builder: (c) => AlertDialog(
+                                      content: Text('Clear all ${words.length} collected words?'),
+                                      actions: [
+                                        TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+                                        TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Clear')),
+                                      ],
+                                    ),
+                                  );
+                                  if (confirm == true) {
+                                    _wiktCollectedWords.value = <String>[];
+                                    _persistWiktCollectedWords();
+                                  }
+                                },
+                        ),
+                        TextButton.icon(
+                          icon: const Icon(Icons.delete_outline, size: 18),
+                          label: const Text('Dedup'),
+                          onPressed: words.isEmpty
+                              ? null
+                              : () {
+                                  final seen = <String>{};
+                                  final next = <String>[];
+                                  for (final w in words) {
+                                    if (seen.add(w)) next.add(w);
+                                  }
+                                  _wiktCollectedWords.value = next;
+                                  _persistWiktCollectedWords();
+                                },
+                        ),
+                        const Spacer(),
+                        FilledButton.icon(
+                          icon: const Icon(Icons.copy, size: 18),
+                          label: const Text('Copy'),
+                          onPressed: words.isEmpty
+                              ? null
+                              : () async {
+                                  await Clipboard.setData(ClipboardData(text: joined));
+                                  if (ctx.mounted) {
+                                    ScaffoldMessenger.of(ctx).showSnackBar(
+                                      SnackBar(content: Text('Copied ${words.length} words'), duration: const Duration(seconds: 1)),
+                                    );
+                                  }
+                                },
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _saveFilmotBlacklist() async {
@@ -2953,17 +3356,22 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           }
 
           // --- (c) Currently-playing video bar ---
-          // Insert a block+save bar right above the #player iframe. Reads the
-          // current video id at click-time (filmot swaps the iframe src in
-          // place when the user clicks prev/next), so the buttons always
-          // target whatever's actually on screen.
+          // Insert a block+save bar above the player. Filmot wraps #player
+          // (an iframe) in #playerTop, which uses Bootstrap's
+          // embed-responsive-16by9 — that gives the iframe `position:absolute`
+          // inside its parent, so inserting a sibling there makes the bar
+          // invisible. We anchor on #playerTop instead (or fall back to
+          // #playerparrent's first child) and insert in the normal flow.
           var playerEl = document.getElementById('player');
           if (playerEl) {
-            var pBar = playerEl.previousElementSibling;
-            if (!pBar || !pBar.classList || !pBar.classList.contains('__cup_player_bar')) {
+            var anchor = document.getElementById('playerTop') || playerEl.parentNode;
+            var anchorParent = anchor && anchor.parentNode;
+            var prev = anchor && anchor.previousElementSibling;
+            var pBar = (prev && prev.classList && prev.classList.contains('__cup_player_bar')) ? prev : null;
+            if (!pBar && anchorParent) {
               pBar = document.createElement('div');
               pBar.className = '__cup_player_bar';
-              pBar.style.cssText = 'display:flex;gap:6px;align-items:center;padding:4px 6px;font-size:12px;background:#f8f8f8;border:1px solid #ddd;border-radius:4px;margin:4px 0';
+              pBar.style.cssText = 'display:flex;gap:6px;align-items:center;padding:6px 8px;font-size:13px;background:#fffbe6;border:1px solid #e0c060;border-radius:4px;margin:6px 0';
               var pLabel = document.createElement('span');
               pLabel.className = '__cup_player_channel_label';
               pLabel.style.cssText = 'flex:1;color:#444;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
@@ -2994,11 +3402,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 setTimeout(function(){ pSave.textContent = '💾 Save'; }, 1500);
               };
               pBar.appendChild(pSave);
-              playerEl.parentNode.insertBefore(pBar, playerEl);
+              anchorParent.insertBefore(pBar, anchor);
             }
             // Refresh label / record channel-seen for the player's current video.
             var pVid = currentVideoId();
-            var pLbl = pBar.querySelector('.__cup_player_channel_label');
+            var pLbl = pBar && pBar.querySelector('.__cup_player_channel_label');
             if (pLbl) {
               if (!pVid) {
                 setText(pLbl, '(no video)');
@@ -3064,9 +3472,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               var an = mu.addedNodes[ai];
               if (!an || an.nodeType !== 1) continue;
               if (an.id && an.id.indexOf('vcard_') === 0) return true;
+              if (an.id === 'player') return true;
               // Skip the bars we insert ourselves
-              if (an.className === '__cup_bar' || an.className === '__cup_channel_label') continue;
-              if (an.querySelector && (an.querySelector('[id^="vcard_"]') || an.querySelector('a[href*="/channel/"]') || an.querySelector('a[href*="youtube.com/@"]'))) return true;
+              if (an.className === '__cup_bar' || an.className === '__cup_player_bar' || an.className === '__cup_channel_label') continue;
+              if (an.querySelector && (an.querySelector('[id^="vcard_"]') || an.querySelector('#player') || an.querySelector('a[href*="/channel/"]') || an.querySelector('a[href*="youtube.com/@"]'))) return true;
             }
             for (var ri = 0; ri < mu.removedNodes.length; ri++) {
               var rn = mu.removedNodes[ri];
@@ -3090,6 +3499,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           var ifr = document.getElementById('player');
           if (!ifr || ifr.__cupWatched) return;
           ifr.__cupWatched = true;
+          // Annotate now that the iframe is in the DOM — this is what makes
+          // the player-bar (block / save buttons) actually appear when the
+          // iframe was added after the page's initial parse.
+          scheduleAnnotate();
           var srcMo = new MutationObserver(function(){
             if (ifr.src === lastCheckedSrc) return;
             lastCheckedSrc = ifr.src;
@@ -3252,6 +3665,65 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// current Filmot page, then saves it. "Focused" = the row currently nearest
   /// the viewport center, which works for both the search-results layout (many
   /// rows) and the single-video layout (one row).
+  // Long-lived translator pool keyed by "src-tgt" so the snippet bridge
+  // doesn't pay the open/close + model-check cost per cue. Closed in dispose.
+  final Map<String, mlkit.OnDeviceTranslator> _translatorPool = {};
+
+  Future<mlkit.OnDeviceTranslator?> _getOrOpenTranslator(String src, String tgt) async {
+    final key = '$src-$tgt';
+    final cached = _translatorPool[key];
+    if (cached != null) return cached;
+    final sl = _toMlKitLang(src);
+    final tl = _toMlKitLang(tgt);
+    if (sl == null || tl == null) return null;
+    final mm = mlkit.OnDeviceTranslatorModelManager();
+    if (!await mm.isModelDownloaded(sl.bcpCode)) await mm.downloadModel(sl.bcpCode);
+    if (!await mm.isModelDownloaded(tl.bcpCode)) await mm.downloadModel(tl.bcpCode);
+    final t = mlkit.OnDeviceTranslator(sourceLanguage: sl, targetLanguage: tl);
+    _translatorPool[key] = t;
+    return t;
+  }
+
+  /// Page → Dart translation bridge for snippet.js. Payload:
+  ///   { id: <int>, text: <string>, source: <ISO>, target: <ISO> }
+  /// Tries the Google translate endpoint first (sentence-level quality,
+  /// works without per-language model downloads). On network / HTTP error,
+  /// falls back to on-device ML Kit (offline, slower first-use because of
+  /// the ~30 MB per-language model download). Result is delivered to the
+  /// page via window.__cupTranslated(id, result).
+  Future<void> _handleTranslateRequest(JavaScriptMessage msg) async {
+    Map<String, dynamic> req;
+    try { req = jsonDecode(msg.message) as Map<String, dynamic>; } catch (_) { return; }
+    final id = req['id'];
+    final text = (req['text'] as String? ?? '').trim();
+    final src = (req['source'] as String? ?? 'sv').trim();
+    final tgt = (req['target'] as String? ?? 'en').trim();
+    if (id == null || text.isEmpty) return;
+
+    String? result;
+    String? errMsg;
+    // Path 1: Google translate API (free, public).
+    try {
+      result = await _translateText(text, src, tgt);
+    } catch (e) {
+      errMsg = 'api: $e';
+    }
+    // Path 2: ML Kit fallback (on-device).
+    if (result == null) {
+      try {
+        final tr = await _getOrOpenTranslator(src, tgt);
+        if (tr != null) result = await tr.translateText(text);
+        else errMsg = (errMsg ?? '') + '; mlkit: language unsupported';
+      } catch (e) {
+        errMsg = (errMsg ?? '') + '; mlkit: $e';
+      }
+    }
+    final js = result != null
+        ? 'window.__cupTranslated && window.__cupTranslated($id, ${jsonEncode(result)});'
+        : 'window.__cupTranslated && window.__cupTranslated($id, null, ${jsonEncode(errMsg ?? 'translate failed')});';
+    try { _controller.runJavaScript(js); } catch (_) {}
+  }
+
   // Maps our ISO-639-1 codes to ML Kit's TranslateLanguage enum. Returns null
   // if the language isn't supported on-device.
   mlkit.TranslateLanguage? _toMlKitLang(String code) {
@@ -3608,7 +4080,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     List<Map<String, dynamic>> lines;
     try {
       lines = await _fetchCaptionsJson3(
-        baseUrl: picked['baseUrl'] as String,
+        // `baseUrl` is only set on the legacy macOS WebView path; the Android
+        // yt-dlp path never populates it (and `_fetchCaptionsJson3` doesn't
+        // read it). Default to empty so a missing field doesn't crash.
+        baseUrl: (picked['baseUrl'] as String?) ?? '',
         videoId: videoId,
         languageCode: (picked['languageCode'] as String?) ?? '',
         kind: (picked['kind'] as String?) ?? '',
@@ -4895,14 +5370,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       };
       http.Response response;
       switch (method) {
+        case 'GET':
+          response = await http.get(uri, headers: headers).timeout(const Duration(seconds: 15));
+          break;
         case 'PUT':
           response = await http.put(uri, headers: headers, body: bodyStr).timeout(const Duration(seconds: 15));
           break;
         case 'POST':
           response = await http.post(uri, headers: headers, body: bodyStr).timeout(const Duration(seconds: 15));
           break;
+        case 'PATCH':
+          response = await http.patch(uri, headers: headers, body: bodyStr).timeout(const Duration(seconds: 15));
+          break;
+        case 'DELETE':
+          response = await http.delete(uri, headers: headers, body: bodyStr).timeout(const Duration(seconds: 15));
+          break;
         default:
-          response = await http.get(uri, headers: headers).timeout(const Duration(seconds: 15));
+          // Previously fell through to GET, which silently turned PATCH /
+          // DELETE writes into reads — proxy returned 200 with the
+          // current resource and the actual write never happened.
+          throw Exception('GitHubProxy: unsupported HTTP method "$method"');
       }
       responseBody = response.body;
       statusCode = response.statusCode;
@@ -4936,6 +5423,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..setUserAgent(_userAgent)
         ..addJavaScriptChannel('GitHubProxy', onMessageReceived: _handleGitHubProxyRequest)
         ..addJavaScriptChannel('TtsBridge', onMessageReceived: _handleTtsBridge)
+        ..addJavaScriptChannel('MediaState', onMessageReceived: _handleMediaStateBridge)
         ..setNavigationDelegate(
           NavigationDelegate(
             onPageStarted: (url) {
@@ -4970,6 +5458,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // Polyfill window.speechSynthesis before the page tries to use
               // it. Safe to inject every page-finished — re-entry is gated.
               dialogController?.runJavaScript(_ttsPolyfillJs);
+              // Media-key shim: forwards headset events to YT IFrame API and
+              // reports YT player state back to native MediaSession.
+              dialogController?.runJavaScript(_mediaKeysShimJs);
+              // Activate the MediaSession while we're on our language page
+              // (where the YT iframe lives). Other hosts deactivate so we
+              // don't steal media keys from other apps in the background.
+              final onLanguagePage = url.startsWith(_dialogUrl);
+              _setMediaSessionActive(onLanguagePage);
               dialogController?.runJavaScript(jsCodeToFilterData(_currentDialogText));
               final pending = _pendingCapturedSubtitle;
               if (pending != null) {
@@ -5079,18 +5575,46 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   icon: const Icon(Icons.closed_caption_outlined, size: 20),
                   onPressed: () => _startYouTubeSubtitleDownload(ctx),
                 ),
-                ValueListenableBuilder<bool>(
-                  // The mic state changes async inside _speech callbacks, so
-                  // the outer State's setState() doesn't repaint the dialog
-                  // route — listen to the mirrored notifier instead.
-                  valueListenable: _isListeningNotifier,
-                  builder: (_, listening, __) => IconButton(
-                    tooltip: listening ? 'Stop listening' : 'Voice input',
-                    icon: Icon(
-                      listening ? Icons.mic : Icons.mic_none,
-                      color: listening ? Colors.red : null,
+                GestureDetector(
+                  // Long-press = enter continuous-listen mode (until next tap
+                  // to stop). Tap = original one-shot voice input. Mirrors the
+                  // main app bar's mic at the bottom of this file.
+                  //
+                  // Android-only: the inner IconButton must NOT set tooltip:
+                  // Flutter's Tooltip claims the touch long-press to show
+                  // itself and, being the inner gesture detector, wins the
+                  // arena over this outer onLongPress.
+                  onLongPress: () {
+                    if (Platform.isAndroid && !_isListening) {
+                      HapticFeedback.mediumImpact();
+                    }
+                    _startContinuousVoiceCapture();
+                  },
+                  child: ValueListenableBuilder<bool>(
+                    // The mic state changes async inside _speech callbacks, so
+                    // the outer State's setState() doesn't repaint the dialog
+                    // route — listen to the mirrored notifier instead.
+                    valueListenable: _isListeningNotifier,
+                    builder: (_, listening, __) => IconButton(
+                      tooltip: Platform.isAndroid
+                          ? null
+                          : (listening
+                              ? (_continuousVoiceActive ? 'Stop continuous capture' : 'Stop listening')
+                              : 'Voice input (long-press for continuous)'),
+                      icon: Icon(
+                        listening ? Icons.mic : Icons.mic_none,
+                        color: listening
+                            ? (_continuousVoiceActive ? Colors.red : Colors.redAccent)
+                            : null,
+                      ),
+                      onPressed: () {
+                        if (_continuousVoiceActive) {
+                          _stopContinuousVoiceCapture();
+                        } else {
+                          _toggleVoiceInput();
+                        }
+                      },
                     ),
-                    onPressed: _toggleVoiceInput,
                   ),
                 ),
                 IconButton(
@@ -5505,6 +6029,126 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   // -------------------------------------------------------------------------
+  // Headset / Bluetooth media-key bridge for dialog1
+  //
+  // Native MainActivity owns a MediaSessionCompat that, while active, claims
+  // headset play/pause/next/prev. Each press is forwarded here over a
+  // MethodChannel; we synthesise a `cupitorMediaKey` CustomEvent and inject it
+  // into dialog1's WebView. The language page can listen for it directly to
+  // run custom behavior — replay current item, jump to previous video in the
+  // record queue, etc. Default behaviors (forward to YT IFrame API) are wired
+  // by the small shim injected on every page load.
+  // -------------------------------------------------------------------------
+  void _setMediaSessionActive(bool active) {
+    if (!Platform.isAndroid) return;
+    if (active == _mediaSessionActive) return;
+    _mediaSessionActive = active;
+    _mediaKeysChannel.invokeMethod<void>('setActive', {'active': active});
+  }
+
+  void _setMediaSessionState({required bool playing, String? title, String? artist}) {
+    if (!Platform.isAndroid) return;
+    _mediaKeysChannel.invokeMethod<void>('setState', {
+      'playing': playing,
+      if (title != null) 'title': title,
+      if (artist != null) 'artist': artist,
+    });
+  }
+
+  void _dispatchMediaKeyToDialog1(String key) {
+    final ctrl = dialogController;
+    if (ctrl == null) return;
+    final escaped = jsonEncode(key);
+    ctrl.runJavaScript(
+      "window.dispatchEvent(new CustomEvent('cupitorMediaKey', { detail: { key: $escaped } }));"
+    );
+  }
+
+  /// Page → Dart: page reports its playback state so we can keep the system
+  /// MediaSession (and therefore lockscreen / car / BT) in sync with what's
+  /// actually playing.
+  void _handleMediaStateBridge(JavaScriptMessage msg) {
+    Map<String, dynamic> req;
+    try { req = jsonDecode(msg.message) as Map<String, dynamic>; }
+    catch (_) { return; }
+    final playing = req['playing'] as bool? ?? false;
+    final title = req['title'] as String?;
+    final artist = req['artist'] as String?;
+    _setMediaSessionState(playing: playing, title: title, artist: artist);
+  }
+
+  /// Default handlers + state pump injected on every dialog1 page load.
+  /// - Forwards play/pause/next/previous/fast_forward/rewind to YouTube's
+  ///   IFrame API (`window.ytPlayer`) when the page doesn't preventDefault.
+  /// - Reflects YT player state changes to native MediaSessionCompat via the
+  ///   `MediaState` channel so the lockscreen + Bluetooth display stay synced.
+  static const String _mediaKeysShimJs = r'''
+(function() {
+  if (window.__cupitorMediaKeysInstalled) return;
+  window.__cupitorMediaKeysInstalled = true;
+  var bridge = window.MediaState;
+  function postState() {
+    if (!bridge || typeof bridge.postMessage !== 'function') return;
+    var p = window.ytPlayer;
+    var playing = !!window.ytPlaying;
+    var title = '';
+    try {
+      if (p && typeof p.getVideoData === 'function') {
+        var d = p.getVideoData();
+        title = (d && d.title) || '';
+      }
+    } catch (e) {}
+    if (!title) title = document.title || 'Cupitor';
+    try { bridge.postMessage(JSON.stringify({ playing: playing, title: title })); } catch (e) {}
+  }
+  // Wrap onPlayerStateChange so we don't replace the page's handler. Any
+  // future PLAYING / non-PLAYING transition pushes state.
+  var origStateCb = window.onPlayerStateChange;
+  window.onPlayerStateChange = function(ev) {
+    try { if (typeof origStateCb === 'function') origStateCb(ev); } catch (e) {}
+    setTimeout(postState, 0);
+  };
+  // Also poll briefly after install in case the player became ready earlier.
+  var pollN = 0;
+  var poll = setInterval(function() {
+    pollN++;
+    postState();
+    if (pollN > 10) clearInterval(poll);
+  }, 1000);
+
+  // Default media-key behavior — fires only if the page didn't preventDefault.
+  // The page may install its own listener via:
+  //   window.addEventListener('cupitorMediaKey', function(e) { e.preventDefault(); … });
+  window.addEventListener('cupitorMediaKey', function(ev) {
+    if (ev.defaultPrevented) return;
+    var key = ev.detail && ev.detail.key;
+    var p = window.ytPlayer;
+    if (!p) return;
+    try {
+      switch (key) {
+        case 'play': p.playVideo(); break;
+        case 'pause': p.pauseVideo(); break;
+        case 'play_pause':
+          if (window.ytPlaying) p.pauseVideo(); else p.playVideo();
+          break;
+        case 'fast_forward':
+          if (typeof p.getCurrentTime === 'function')
+            p.seekTo((p.getCurrentTime() || 0) + 10, true);
+          break;
+        case 'rewind':
+          if (typeof p.getCurrentTime === 'function')
+            p.seekTo(Math.max(0, (p.getCurrentTime() || 0) - 10), true);
+          break;
+        // next / previous have no sensible default for a single video —
+        // leave them for the page to handle (record-queue navigation).
+      }
+    } catch (e) {}
+    setTimeout(postState, 100);
+  });
+})();
+''';
+
+  // -------------------------------------------------------------------------
   // window.speechSynthesis bridge for dialog1
   //
   // Android WebView ships without the Web Speech Synthesis API — pages that
@@ -5595,15 +6239,18 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       });
     },
     cancel: function() {
-      var ids = Array.from(pending.keys());
+      // Snapshot the utterances BEFORE clearing pending — Flutter has already
+      // been told to stop, but the host's setCancelHandler only fires for the
+      // active one. Without these synthetic `end` events the page's promise
+      // chains (e.g. _speakWordBrowser.onend) wait the full safety timeout.
+      var utterances = Array.from(pending.values());
       pending.clear();
       synth.speaking = false;
       synth.paused = false;
       synth.pending = false;
       post({ type: 'cancel' });
-      ids.forEach(function(id) {
-        // best-effort: the host already stopped, so synthesise an `end` on
-        // the JS side so the page's promise chains resolve.
+      utterances.forEach(function(u) {
+        try { fire(u, 'end'); } catch (_) {}
       });
     },
     pause: function() { synth.paused = true; post({ type: 'pause' }); },
@@ -5842,6 +6489,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   void _toggleAppBar() {
+    // Never hide the bar while voice input is active — the user needs to see
+    // the live mic state and the Stop control for as long as recording runs.
+    if (_isListening) {
+      if (!_showAppBar) _showAppBarWithTimer();
+      return;
+    }
     if (_showAppBar) {
       _appBarTimer?.cancel();
       setState(() => _showAppBar = false);
@@ -5950,6 +6603,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         GestureDetector(
           // Long-press = enter continuous-listen mode (until next tap to stop).
           // Tap = original one-shot voice input.
+          //
+          // NOTE: on Android the inner IconButton must NOT set `tooltip:`.
+          // Flutter's Tooltip claims the touch long-press to show itself, and
+          // being the inner gesture detector it wins the arena over this outer
+          // onLongPress — so the popup appeared but recording never started.
+          // macOS shows tooltips on hover (no long-press conflict), so we keep
+          // the hint there.
           onLongPress: () {
             if (Platform.isAndroid && !_isListening) {
               HapticFeedback.mediumImpact();
@@ -5959,9 +6619,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           child: ValueListenableBuilder<bool>(
             valueListenable: _isListeningNotifier,
             builder: (_, listening, __) => IconButton(
-              tooltip: listening
-                  ? (_continuousVoiceActive ? 'Stop continuous capture' : 'Stop listening')
-                  : 'Voice input (long-press for continuous)',
+              tooltip: Platform.isAndroid
+                  ? null
+                  : (listening
+                      ? (_continuousVoiceActive ? 'Stop continuous capture' : 'Stop listening')
+                      : 'Voice input (long-press for continuous)'),
               icon: Icon(
                 listening ? Icons.mic : Icons.mic_none,
                 color: listening

@@ -13,6 +13,10 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
+import android.view.KeyEvent
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import io.flutter.embedding.android.FlutterActivity
@@ -31,6 +35,7 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val CHANNEL = "cupitor/adblock"
         private const val YTDLP_CHANNEL = "cupitor/ytdlp"
+        private const val MEDIA_KEYS_CHANNEL = "cupitor/mediakeys"
         private const val PREFS_NAME = "cupitor_adblock"
         private const val PREFS_CUSTOM_HOSTS = "custom_ad_hosts"
 
@@ -219,6 +224,164 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        // ---- media-keys channel ----
+        // Lets Dart (a) activate / deactivate our MediaSession, (b) push the
+        // current playback state into the system so lockscreen / BT car / etc
+        // reflect what's actually playing. Native fires `onKey` back at Dart
+        // when the user presses play/pause/next/prev on a headset.
+        val mediaKeysChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, MEDIA_KEYS_CHANNEL)
+        this.mediaKeysChannel = mediaKeysChannel
+        mediaKeysChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "setActive" -> {
+                    val active = call.argument<Boolean>("active") ?: false
+                    setMediaSessionActive(active)
+                    result.success(null)
+                }
+                "setState" -> {
+                    val playing = call.argument<Boolean>("playing") ?: false
+                    val title = call.argument<String>("title")
+                    val artist = call.argument<String>("artist")
+                    setMediaSessionState(playing, title, artist)
+                    result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // MediaSession — captures wired/Bluetooth headset media buttons while a
+    // YouTube iframe is playing inside dialog1. The session is only kept
+    // active while Dart explicitly enables it (i.e. while the language page
+    // is loaded), so we don't steal media keys from other apps the rest of
+    // the time. Callbacks forward to Dart via `onKey`; Dart in turn dispatches
+    // a `cupitorMediaKey` CustomEvent into the page so the page can choose
+    // custom behavior (replay previous video, etc.).
+    // ---------------------------------------------------------------------------
+    private var mediaSession: MediaSessionCompat? = null
+    private var mediaKeysChannel: MethodChannel? = null
+    private var mediaSessionActive = false
+    private var lastPlaying = false
+    private var lastTitle: String? = null
+    private var lastArtist: String? = null
+
+    private fun ensureMediaSession(): MediaSessionCompat {
+        mediaSession?.let { return it }
+        val session = MediaSessionCompat(this, "CupitorMediaSession")
+        // Allow the session to receive media buttons + transport controls.
+        session.setFlags(
+            MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
+            MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS
+        )
+        session.setCallback(object : MediaSessionCompat.Callback() {
+            override fun onPlay() { dispatchKey("play") }
+            override fun onPause() { dispatchKey("pause") }
+            override fun onSkipToNext() { dispatchKey("next") }
+            override fun onSkipToPrevious() { dispatchKey("previous") }
+            override fun onFastForward() { dispatchKey("fast_forward") }
+            override fun onRewind() { dispatchKey("rewind") }
+            override fun onStop() { dispatchKey("stop") }
+            override fun onMediaButtonEvent(intent: android.content.Intent): Boolean {
+                // Cover the raw KEYCODE path too — some Bluetooth headsets send
+                // multi-function clicks that the framework doesn't route to the
+                // typed callbacks above (e.g. play_pause toggle).
+                val key = intent.getParcelableExtra<KeyEvent>(android.content.Intent.EXTRA_KEY_EVENT)
+                if (key != null && key.action == KeyEvent.ACTION_DOWN) {
+                    when (key.keyCode) {
+                        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+                        KeyEvent.KEYCODE_HEADSETHOOK -> { dispatchKey("play_pause"); return true }
+                        KeyEvent.KEYCODE_MEDIA_PLAY -> { dispatchKey("play"); return true }
+                        KeyEvent.KEYCODE_MEDIA_PAUSE -> { dispatchKey("pause"); return true }
+                        KeyEvent.KEYCODE_MEDIA_NEXT -> { dispatchKey("next"); return true }
+                        KeyEvent.KEYCODE_MEDIA_PREVIOUS -> { dispatchKey("previous"); return true }
+                        KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { dispatchKey("fast_forward"); return true }
+                        KeyEvent.KEYCODE_MEDIA_REWIND -> { dispatchKey("rewind"); return true }
+                        KeyEvent.KEYCODE_MEDIA_STOP -> { dispatchKey("stop"); return true }
+                    }
+                }
+                return super.onMediaButtonEvent(intent)
+            }
+        })
+        // A non-zero state with at least one action is required for headsets
+        // to consider this session "playing" and route buttons here. We update
+        // it again every time Dart pushes new playback state.
+        session.setPlaybackState(buildPlaybackState(playing = false))
+        mediaSession = session
+        return session
+    }
+
+    private fun buildPlaybackState(playing: Boolean): PlaybackStateCompat {
+        val actions = (
+            PlaybackStateCompat.ACTION_PLAY or
+            PlaybackStateCompat.ACTION_PAUSE or
+            PlaybackStateCompat.ACTION_PLAY_PAUSE or
+            PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+            PlaybackStateCompat.ACTION_FAST_FORWARD or
+            PlaybackStateCompat.ACTION_REWIND or
+            PlaybackStateCompat.ACTION_STOP
+        )
+        val state = if (playing) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
+        return PlaybackStateCompat.Builder()
+            .setActions(actions)
+            // Position is unknown without a callback per-second; report 0 with
+            // 1x speed so the system doesn't try to extrapolate.
+            .setState(state, 0L, 1.0f)
+            .build()
+    }
+
+    private fun setMediaSessionActive(active: Boolean) {
+        runOnUiThread {
+            if (active) {
+                val session = ensureMediaSession()
+                if (!mediaSessionActive) {
+                    session.isActive = true
+                    mediaSessionActive = true
+                }
+            } else {
+                mediaSession?.let {
+                    if (mediaSessionActive) {
+                        it.isActive = false
+                        mediaSessionActive = false
+                    }
+                }
+            }
+        }
+    }
+
+    private fun setMediaSessionState(playing: Boolean, title: String?, artist: String?) {
+        runOnUiThread {
+            val session = ensureMediaSession()
+            lastPlaying = playing
+            lastTitle = title ?: lastTitle
+            lastArtist = artist ?: lastArtist
+            session.setPlaybackState(buildPlaybackState(playing = playing))
+            val md = MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, lastTitle ?: "Cupitor")
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, lastArtist ?: "")
+                .build()
+            session.setMetadata(md)
+        }
+    }
+
+    private fun dispatchKey(key: String) {
+        runOnUiThread {
+            try {
+                mediaKeysChannel?.invokeMethod("onKey", mapOf("key" to key))
+            } catch (_: Throwable) {}
+        }
+    }
+
+    override fun onDestroy() {
+        try {
+            mediaSession?.isActive = false
+            mediaSession?.release()
+        } catch (_: Throwable) {}
+        mediaSession = null
+        mediaSessionActive = false
+        super.onDestroy()
     }
 
     // ---------------------------------------------------------------------------

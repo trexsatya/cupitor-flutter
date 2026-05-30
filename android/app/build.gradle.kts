@@ -38,6 +38,25 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // R8 OFF for release.
+            //
+            // youtubedl-android bundles three layers that R8 can't reason
+            // about statically: jackson polymorphic deserializers, the
+            // jackson-kotlin-module (kotlin.reflect-driven), and apache
+            // commons-compress for unpacking the Python interpreter tarball.
+            // Each of these does reflective concrete-class lookups inside
+            // a static initializer, so any single missed keep rule reproduces
+            // the same crash: "INIT_FAILED ... is not a concrete class".
+            // Iterating keep rules round-by-round is fragile; the AAR is
+            // already ~30 MB (Python + yt-dlp), so the marginal size win from
+            // R8 is negligible. proguard-rules.pro is retained as a safety
+            // net should anyone re-enable minification later.
+            isMinifyEnabled = false
+            isShrinkResources = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 
@@ -67,4 +86,11 @@ dependencies {
     // Coroutines are required by youtubedl-android internally and we use
     // them in MainActivity to call YoutubeDL off the main thread.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    // androidx.media — MediaSessionCompat lets us claim media key events from
+    // wired/Bluetooth headsets while the dialog1 language page is playing
+    // YouTube videos in its iframe. Without an active session, headset
+    // play/pause/next/prev are routed to whichever app the system thinks
+    // owns audio (often the YT iframe's own internal session), and we have no
+    // hook to add custom behavior like "repeat previous video".
+    implementation("androidx.media:media:1.7.0")
 }
