@@ -1,7 +1,8 @@
 import 'dart:convert';
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'dart:io' show Platform, File, Directory;
 import 'dart:math' as math;
+import 'package:path_provider/path_provider.dart';
 import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -15,6 +16,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:google_mlkit_translation/google_mlkit_translation.dart' as mlkit;
 import 'package:flutter_tts/flutter_tts.dart';
 import 'yt_dlp_service.dart';
+import 'epub_reader.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -168,6 +170,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // its current playing state back via the `MediaState` JS channel so the
   // lockscreen and Bluetooth car UI show the right title.
   static const _mediaKeysChannel = MethodChannel('cupitor/mediakeys');
+  // Runtime-permissions bridge. Android's `RECORD_AUDIO` is a *dangerous*
+  // permission — manifest-declared but not auto-granted; the user has to
+  // accept the OS prompt. WebView's per-resource grant in
+  // `_configureAndroidWebView` is meaningless without this, so any path
+  // that needs the mic goes through `_ensureMicPermission` first.
+  static const _permsChannel = MethodChannel('cupitor/perms');
   bool _mediaSessionActive = false;
   // Hosts auto-detected by the native ad-blocker that haven't been confirmed yet.
   final List<String> _detectedAdHosts = [];
@@ -402,6 +410,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 return NavigationDecision.prevent;
               }
               final url = request.url;
+              // .epub link clicked anywhere in the main WebView: download
+              // through the EPUB reader's helper (so it lands in the
+              // app's cache with a stable name) and push the reader.
+              // Intercepts on all platforms — the WebView would otherwise
+              // either download or show a "this format can't be displayed"
+              // error.
+              if (_looksLikeEpubUrl(url)) {
+                _downloadAndOpenEpub(url);
+                return NavigationDecision.prevent;
+              }
               // Always intercept .pdf extension URLs on Android before WebView touches them.
               if (Platform.isAndroid && _looksLikePdfUrl(url)) {
                 if (mounted) setState(() {
@@ -1453,13 +1471,67 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // left at its default `true` — they treat the missing gesture as an
       // autoplay-blocked signal and don't even attempt playback.
       platform.setMediaPlaybackRequiresUserGesture(false);
-      // Grant requested resource permissions (most importantly
-      // `protectedMediaId` for Widevine DRM, which Spotify Web Player
-      // requires; without this the player loads but every track fails).
+      // Grant requested resource permissions. `protectedMediaId` is needed
+      // for Widevine DRM (Spotify Web Player); `microphone` is needed for
+      // the manual-entry audio recorder. For mic specifically we ALSO have
+      // to make sure Android's runtime `RECORD_AUDIO` is granted to the
+      // host app — granting the WebView resource without the OS-level
+      // permission still results in `getUserMedia` rejecting silently.
       platform.setOnPlatformPermissionRequest((request) {
-        try { request.grant(); } catch (_) {}
+        final needsMic = request.types.contains(WebViewPermissionResourceType.microphone);
+        if (needsMic) {
+          // Fire-and-forget — grant() / deny() are themselves async.
+          () async {
+            final ok = await _ensureMicPermission();
+            try {
+              if (ok) await request.grant();
+              else    await request.deny();
+            } catch (_) {}
+          }();
+        } else {
+          try { request.grant(); } catch (_) {}
+        }
       });
     } catch (_) { /* best-effort */ }
+  }
+
+  /// Ensure Android's `RECORD_AUDIO` runtime permission is granted to the
+  /// host app, prompting the user if needed. Returns true on grant, false
+  /// on denial / any error. iOS/macOS are no-ops (mic permission there is
+  /// handled at the OS level when WKWebView calls into AVCaptureSession,
+  /// and prompted via the app's Info.plist usage descriptions).
+  Future<bool> _ensureMicPermission() async {
+    if (!Platform.isAndroid) return true;
+    try {
+      final ok = await _permsChannel.invokeMethod<bool>('requestMicrophone');
+      return ok ?? false;
+    } catch (e) {
+      debugPrint('mic permission request failed: $e');
+      return false;
+    }
+  }
+
+  /// Release the mic from `speech_to_text` so a subsequent
+  /// `getUserMedia({audio:true})` inside dialog1's WebView can open it.
+  /// AudioRecord can only be held by one consumer at a time on Android,
+  /// and if continuous voice capture is still active (or even just settling
+  /// after a one-shot listen), getUserMedia rejects with NotReadableError.
+  ///
+  /// Always issue stop+cancel — we've seen cases where `_continuousVoiceActive`
+  /// is false but `_speech` still holds the SpeechRecognizer (e.g. a partial
+  /// onError that never updated our flag). stop+cancel are no-ops when STT
+  /// isn't running, so the unconditional call is safe.
+  Future<void> _releaseMicFromSpeechToText() async {
+    _continuousVoiceActive = false;
+    try { await _speech.stop(); } catch (_) {}
+    try { await _speech.cancel(); } catch (_) {}
+    if (mounted && _isListening) setState(() => _isListening = false);
+    _isListeningNotifier.value = false;
+    // The underlying AudioRecord teardown is async at the OS layer — give
+    // it a beat to actually let go before the WebView tries to claim it.
+    // 500 ms covers SpeechRecognizer's own settle time on slower devices;
+    // below that getUserMedia can still race with NotReadableError.
+    await Future<void>.delayed(const Duration(milliseconds: 500));
   }
 
   /// Tell Android's CookieManager to flush its in-memory cookie jar to disk.
@@ -2004,6 +2076,25 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         _showYoutubeFrontendPicker();
                       },
                     ),
+                    const Divider(height: 1),
+                    ListTile(
+                      leading: const Icon(Icons.menu_book_outlined),
+                      title: const Text('Open EPUB'),
+                      subtitle: const Text('From device storage or a URL'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showEpubSourcePicker();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.history_edu_outlined),
+                      title: const Text('EPUB library'),
+                      subtitle: const Text('Resume a recent book'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showEpubLibrary();
+                      },
+                    ),
                   ],
                 ),
               ),
@@ -2012,6 +2103,262 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ),
       ),
     );
+  }
+
+  // ─── EPUB reader integration ────────────────────────────────────────────
+  // The reader lives in [lib/epub_reader.dart]. We pull EPUB files from
+  // three sources (device storage, an HTTP/HTTPS URL, a link in the main
+  // WebView that ends in .epub), cache them under <docs>/epubs/, and push
+  // the reader screen. Word-tap and selection callbacks from the reader
+  // route into the existing dictionary flow via [_openDialogWithWebview],
+  // so the EPUB inherits all of Cupitor's lookup machinery for free.
+
+  EpubLibrary? _epubLibrary;
+
+  Future<EpubLibrary> _ensureEpubLibrary() async {
+    return _epubLibrary ??= await EpubLibrary.load();
+  }
+
+  Future<void> _launchEpubReader(File file) async {
+    final lib = await _ensureEpubLibrary();
+    if (!mounted) return;
+    await openEpubReader(
+      context,
+      file: file,
+      library: lib,
+      onLookup: (word, _) {
+        // Send the looked-up word into the existing lookup flow. The
+        // surrounding context is discarded for now — dialog1 only takes
+        // a query string. Could be threaded through later if we want to
+        // pre-fill a "context" field.
+        _openDialogWithWebview(word);
+      },
+    );
+  }
+
+  void _showEpubSourcePicker() {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text('Open EPUB',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            ),
+            ListTile(
+              leading: const Icon(Icons.folder_open),
+              title: const Text('From device storage'),
+              subtitle: const Text('Pick a .epub file'),
+              onTap: () async {
+                Navigator.of(ctx).pop();
+                try {
+                  final f = await pickEpubFromDevice();
+                  if (f != null) await _launchEpubReader(f);
+                } catch (e) {
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Could not pick file: $e')),
+                  );
+                }
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.link),
+              title: const Text('From URL'),
+              subtitle: const Text('Download and open'),
+              onTap: () async {
+                Navigator.of(ctx).pop();
+                await _promptEpubUrlAndOpen();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _promptEpubUrlAndOpen() async {
+    final ctrl = TextEditingController();
+    final url = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Open EPUB from URL'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          keyboardType: TextInputType.url,
+          decoration: const InputDecoration(
+            hintText: 'https://example.com/book.epub',
+            border: OutlineInputBorder(),
+          ),
+          onSubmitted: (v) => Navigator.of(ctx).pop(v.trim()),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.of(ctx).pop(ctrl.text.trim()),
+            child: const Text('Open'),
+          ),
+        ],
+      ),
+    );
+    if (url == null || url.isEmpty) return;
+    await _downloadAndOpenEpub(url);
+  }
+
+  Future<void> _downloadAndOpenEpub(String url) async {
+    // Show an indeterminate progress dialog while the file downloads. It's
+    // dismissed in `finally` so a network error doesn't leave it stuck.
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Padding(
+          padding: EdgeInsets.symmetric(vertical: 8),
+          child: Row(
+            children: [
+              CircularProgressIndicator(strokeWidth: 2),
+              SizedBox(width: 16),
+              Text('Downloading EPUB…'),
+            ],
+          ),
+        ),
+      ),
+    );
+    try {
+      final f = await downloadEpubFromUrl(url);
+      if (!mounted) return;
+      Navigator.of(context, rootNavigator: true).pop();
+      if (f != null) await _launchEpubReader(f);
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.of(context, rootNavigator: true).pop();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not download EPUB: $e')),
+      );
+    }
+  }
+
+  Future<void> _showEpubLibrary() async {
+    final lib = await _ensureEpubLibrary();
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) => DraggableScrollableSheet(
+          initialChildSize: 0.6,
+          minChildSize: 0.3,
+          maxChildSize: 0.95,
+          expand: false,
+          builder: (_, scrollController) => Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(
+                  children: const [
+                    Text('EPUB library',
+                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: lib.entries.isEmpty
+                    ? const Center(
+                        child: Padding(
+                          padding: EdgeInsets.all(24),
+                          child: Text('No books yet. Use Open EPUB to add one.'),
+                        ),
+                      )
+                    : ListView.separated(
+                        controller: scrollController,
+                        itemCount: lib.entries.length,
+                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        itemBuilder: (_, i) {
+                          final e = lib.entries[i];
+                          return ListTile(
+                            leading: SizedBox(
+                              width: 40,
+                              height: 56,
+                              child: _epubCoverThumbnail(e),
+                            ),
+                            title: Text(e.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                            subtitle: Text(e.author ?? e.path,
+                                maxLines: 1, overflow: TextOverflow.ellipsis),
+                            trailing: IconButton(
+                              icon: const Icon(Icons.delete_outline),
+                              tooltip: 'Remove from library',
+                              onPressed: () async {
+                                await lib.remove(e.key);
+                                setSheet(() {});
+                              },
+                            ),
+                            onTap: () async {
+                              Navigator.of(ctx).pop();
+                              final f = File(e.path);
+                              if (!await f.exists()) {
+                                if (!mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text('File missing: ${e.path}')),
+                                );
+                                return;
+                              }
+                              await _launchEpubReader(f);
+                            },
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Library-row thumbnail — book cover if present, fallback icon otherwise.
+  /// Wrapped in a small frame so the row layout is stable even when the
+  /// cover file is missing (e.g. an old library entry from before covers
+  /// were stored).
+  Widget _epubCoverThumbnail(EpubLibraryEntry e) {
+    final p = e.coverPath;
+    if (p != null) {
+      final f = File(p);
+      if (f.existsSync()) {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(3),
+          child: Image.file(
+            f,
+            fit: BoxFit.cover,
+            errorBuilder: (_, __, ___) => _epubCoverPlaceholder(),
+          ),
+        );
+      }
+    }
+    return _epubCoverPlaceholder();
+  }
+
+  Widget _epubCoverPlaceholder() => Container(
+        decoration: BoxDecoration(
+          color: Colors.grey[300],
+          borderRadius: BorderRadius.circular(3),
+        ),
+        child: const Icon(Icons.menu_book_outlined, size: 22, color: Colors.grey),
+      );
+
+  // True if a URL likely points to an EPUB. Cheap path-extension check —
+  // mirrors `_looksLikePdfUrl` so the navigation delegate can short-circuit
+  // before WebView opens the file as a download.
+  bool _looksLikeEpubUrl(String url) {
+    final lower = url.toLowerCase();
+    final qPos = lower.indexOf('?');
+    final path = qPos >= 0 ? lower.substring(0, qPos) : lower;
+    return path.endsWith('.epub');
   }
 
   void _showYoutubeFrontendPicker() {
@@ -2341,6 +2688,19 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // Pre-rewrite YouTube URLs to the chosen front-end. Cheap to call when no
     // front-end is configured (returns null).
     url = _rewriteYouTubeUrl(url) ?? url;
+    // Every fresh Wiktionary dialog starts with collect mode OFF — a stale
+    // toggle from a previous dialog would silently swallow normal clicks here.
+    // Also reset the captured-words list so a new lookup session starts with
+    // a clean slate; the user explicitly opted into capture for the previous
+    // session, and silently mixing those words into a new one would surprise
+    // them. Persist immediately so the empty state survives an app restart.
+    if (_isWiktionaryUrl(url)) {
+      if (_wiktCollectMode.value) _wiktCollectMode.value = false;
+      if (_wiktCollectedWords.value.isNotEmpty) {
+        _wiktCollectedWords.value = <String>[];
+        _persistWiktCollectedWords();
+      }
+    }
     // Create unique dialog ID based on URL and timestamp
     final dialogId = '${Uri.parse(url).host}_${DateTime.now().millisecondsSinceEpoch}';
 
@@ -2896,6 +3256,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     SharedPreferences.getInstance().then((prefs) {
       prefs.setStringList('wiktCollectedWords', list);
     });
+    // Mirror the running list onto the system clipboard after every capture
+    // so the user can paste the latest accumulated list anywhere without
+    // opening the review dialog first. Pipe-separated to match the review
+    // dialog's "Copy" button format (`words.join('|')`).
+    Clipboard.setData(ClipboardData(text: list.join('|')));
   }
 
   void _persistWiktCollectedWords() {
@@ -5424,6 +5789,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('GitHubProxy', onMessageReceived: _handleGitHubProxyRequest)
         ..addJavaScriptChannel('TtsBridge', onMessageReceived: _handleTtsBridge)
         ..addJavaScriptChannel('MediaState', onMessageReceived: _handleMediaStateBridge)
+        ..addJavaScriptChannel('AudioBridge', onMessageReceived: _handleAudioBridge)
         ..setNavigationDelegate(
           NavigationDelegate(
             onPageStarted: (url) {
@@ -5503,12 +5869,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     showDialog(
       context: context,
       barrierDismissible: !hasBeenMinimized, // Prevent outside tap closing if ever minimized
+      // Allow the dialog to extend behind the status / nav bars so it
+      // covers the full screen height; otherwise the system insets clip
+      // about ~50 px off the top + bottom on Android.
+      useSafeArea: false,
       builder: (ctx) => ValueListenableBuilder<bool>(
         // Fullscreen toggle lives outside the outer State's setState scope
         // (this is a separate Navigator route), so we drive it from a notifier.
         valueListenable: _dialog1FullscreenNotifier,
         builder: (_, fullscreen, __) {
           final dialog = Dialog(
+            // vertical: 0 in both modes — the user wants the dialog edge
+            // to reach the top and bottom of the device. The non-
+            // fullscreen mode keeps a tiny 1 % horizontal inset so the
+            // close/minimize chrome sits inside the rounded corners.
             insetPadding: fullscreen
                 ? EdgeInsets.zero
                 : EdgeInsets.symmetric(horizontal: screenWidth * 0.01, vertical: 0),
@@ -5543,6 +5917,18 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // This prevents unnecessary reloads when reopening the dialog.
       _dialog1Visible = false;
       _dialog1FullscreenNotifier.value = false;
+      // Notify the page running inside dialog1 that the dialog just
+      // closed — useful for the language page to pause TTS, stop a
+      // running clip, or persist state before the user comes back.
+      // Dispatched as a CustomEvent on `window`; pages listen with
+      //   window.addEventListener('cupitorDialog1Closed', ...)
+      // The controller stays alive across opens, so a fresh listener
+      // isn't required after every show.
+      try {
+        dialogController?.runJavaScript(
+          "window.dispatchEvent(new CustomEvent('cupitorDialog1Closed'));",
+        );
+      } catch (_) { /* page may not have finished loading — ignore */ }
     });
   }
 
@@ -5570,6 +5956,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
+                IconButton(
+                  tooltip: 'Close',
+                  icon: const Icon(Icons.close, size: 20),
+                  onPressed: () {
+                    setState(() => _dialog1Minimized = false);
+                    Navigator.of(ctx).pop();
+                    _bumpMinimizedVersion();
+                  },
+                ),
+                const Spacer(),  
                 IconButton(
                   tooltip: 'Download YouTube subtitles (translate, send to lookup)',
                   icon: const Icon(Icons.closed_caption_outlined, size: 20),
@@ -6075,6 +6471,185 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final title = req['title'] as String?;
     final artist = req['artist'] as String?;
     _setMediaSessionState(playing: playing, title: title, artist: artist);
+  }
+
+  // ---- AudioBridge: persist manual-entry recordings on disk ----
+  //
+  // The dialog1 WebView can't write to the device file system itself, so the
+  // editor's recorder pipes audio bytes (base64 data URL) through this bridge.
+  // We save to <app_documents>/manual_audio/<id>.<ext> and hand back a
+  // `file://...` URL. The reverse — loading audio for playback — returns the
+  // bytes as a base64 data URL so JS can play them via `new Audio(...)` or
+  // `URL.createObjectURL(blob)` without needing direct file:// access (which
+  // Android WebView blocks for security).
+  //
+  // Wire format (JS → Flutter), JSON envelope:
+  //   {op:'save',   rid, id, dataUrl}            → __cupAudio('save',   rid, fileUrl|null, err|null)
+  //   {op:'load',   rid, url}                    → __cupAudio('load',   rid, dataUrl|null, err|null)
+  //   {op:'delete', rid, url}                    → __cupAudio('delete', rid, true|false,   err|null)
+  //
+  // `rid` is a JS-supplied request id used only to resolve the corresponding
+  // Promise on the JS side — the Dart side echoes it back unchanged.
+  Future<Directory> _manualAudioDir() async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docs.path}/manual_audio');
+    if (!await dir.exists()) await dir.create(recursive: true);
+    return dir;
+  }
+
+  String _safeFileId(String id) {
+    // Restrict to filename-safe characters; collapses anything weird from JS.
+    return id.replaceAll(RegExp(r'[^A-Za-z0-9_\-]'), '_');
+  }
+
+  String _extFromDataUrl(String dataUrl) {
+    // data:audio/webm;codecs=opus;base64,XXXX → 'webm'.
+    final m = RegExp(r'^data:audio/([a-zA-Z0-9.+-]+)').firstMatch(dataUrl);
+    final raw = (m?.group(1) ?? 'webm').toLowerCase();
+    // Strip codec descriptors after a `+` if any, keep core type.
+    return raw.split('+').first;
+  }
+
+  /// Build the `file://...` URL we hand back to JS. We use a `cupitor-file://`
+  /// prefix in addition to `file://` callers, but the canonical form is plain
+  /// `file://<absolute path>`, since the user asked for "url like file://...".
+  String _fileUrlForPath(String path) => 'file://$path';
+
+  /// Map a `file://...` URL the WebView gave us back to an on-disk path,
+  /// confined to our manual_audio directory (defensive — refuse paths outside
+  /// it so a malicious page can't read random files).
+  Future<File?> _resolveAudioUrl(String url) async {
+    if (!url.startsWith('file://')) return null;
+    final path = url.substring('file://'.length);
+    final dir = await _manualAudioDir();
+    final canonicalDir = dir.path.endsWith('/') ? dir.path : '${dir.path}/';
+    if (!path.startsWith(canonicalDir)) return null;
+    return File(path);
+  }
+
+  void _audioReply(String op, String rid, String? result, String? err) {
+    // Stringify safely. result/err are short strings or JSON-encodable.
+    final payload = jsonEncode({
+      'op': op, 'rid': rid,
+      if (result != null) 'result': result,
+      if (err != null) 'error': err,
+    });
+    try {
+      dialogController?.runJavaScript(
+        'window.__cupAudio && window.__cupAudio($payload);',
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _handleAudioBridge(JavaScriptMessage msg) async {
+    Map<String, dynamic> req;
+    try { req = jsonDecode(msg.message) as Map<String, dynamic>; }
+    catch (_) { return; }
+    final op = (req['op'] as String?) ?? '';
+    final rid = (req['rid'] as String?) ?? '';
+    try {
+      if (op == 'save') {
+        final id = _safeFileId((req['id'] as String?) ?? '');
+        final dataUrl = (req['dataUrl'] as String?) ?? '';
+        final comma = dataUrl.indexOf(',');
+        if (id.isEmpty || !dataUrl.startsWith('data:') || comma < 0) {
+          _audioReply('save', rid, null, 'bad-payload');
+          return;
+        }
+        final ext = _extFromDataUrl(dataUrl);
+        final bytes = base64Decode(dataUrl.substring(comma + 1));
+        final dir = await _manualAudioDir();
+        final f = File('${dir.path}/$id.$ext');
+        await f.writeAsBytes(bytes, flush: true);
+        _audioReply('save', rid, _fileUrlForPath(f.path), null);
+      } else if (op == 'load') {
+        final url = (req['url'] as String?) ?? '';
+        final f = await _resolveAudioUrl(url);
+        if (f == null || !await f.exists()) {
+          _audioReply('load', rid, null, 'not-found');
+          return;
+        }
+        final bytes = await f.readAsBytes();
+        final ext = f.path.split('.').last.toLowerCase();
+        final mime = ext == 'mp4' ? 'audio/mp4'
+                   : ext == 'm4a' ? 'audio/mp4'
+                   : ext == 'ogg' ? 'audio/ogg'
+                   : ext == 'wav' ? 'audio/wav'
+                   : ext == 'mp3' ? 'audio/mpeg'
+                   : 'audio/webm';
+        final dataUrl = 'data:$mime;base64,${base64Encode(bytes)}';
+        _audioReply('load', rid, dataUrl, null);
+      } else if (op == 'delete') {
+        final url = (req['url'] as String?) ?? '';
+        final f = await _resolveAudioUrl(url);
+        if (f != null && await f.exists()) await f.delete();
+        _audioReply('delete', rid, 'ok', null);
+      } else if (op == 'ensureMicPerm') {
+        // Pre-flight for JS — let it know whether the Android `RECORD_AUDIO`
+        // grant is in place (asking the user if not) BEFORE it calls
+        // `navigator.mediaDevices.getUserMedia`. Without this, the first
+        // tap-Record after install hits getUserMedia → silent rejection →
+        // confusing "permission denied" alert, with no OS prompt ever
+        // shown.
+        //
+        // ALSO release the mic from `speech_to_text` here. STT and the
+        // WebView's `getUserMedia` both want to open `AudioRecord`; only
+        // one can hold the source at a time. If STT is running (long-press
+        // continuous capture left active) getUserMedia rejects with
+        // `NotReadableError: Could not start audio source` until STT lets
+        // go. Stopping it here is the right time — JS is about to record.
+        await _releaseMicFromSpeechToText();
+        final ok = await _ensureMicPermission();
+        _audioReply('ensureMicPerm', rid, ok ? 'granted' : 'denied', null);
+      } else if (op == 'recordStart') {
+        // Native recording path: JS hands us an id, we open MediaRecorder
+        // and write to <docs>/manual_audio/<id>.m4a directly. Bypasses the
+        // WebView's getUserMedia entirely — same AudioRecord plumbing used
+        // by speech_to_text and any native voice recorder. Released by
+        // `recordStop` (keep the file) or `recordCancel` (delete it).
+        final id = _safeFileId((req['id'] as String?) ?? '');
+        if (id.isEmpty) { _audioReply('recordStart', rid, null, 'bad-id'); return; }
+        await _releaseMicFromSpeechToText();
+        final permOk = await _ensureMicPermission();
+        if (!permOk) { _audioReply('recordStart', rid, null, 'permission-denied'); return; }
+        final dir = await _manualAudioDir();
+        final path = '${dir.path}/$id.m4a';
+        try {
+          final ok = await _permsChannel.invokeMethod<bool>(
+            'startNativeRecording', {'path': path},
+          );
+          if (ok == true) {
+            _audioReply('recordStart', rid, _fileUrlForPath(path), null);
+          } else {
+            _audioReply('recordStart', rid, null, 'start-failed');
+          }
+        } on PlatformException catch (e) {
+          _audioReply('recordStart', rid, null, '${e.code}: ${e.message ?? ''}');
+        }
+      } else if (op == 'recordStop') {
+        try {
+          final path = await _permsChannel.invokeMethod<String>('stopNativeRecording');
+          if (path == null) {
+            _audioReply('recordStop', rid, null, 'no-recording');
+          } else {
+            _audioReply('recordStop', rid, _fileUrlForPath(path), null);
+          }
+        } on PlatformException catch (e) {
+          _audioReply('recordStop', rid, null, '${e.code}: ${e.message ?? ''}');
+        }
+      } else if (op == 'recordCancel') {
+        try {
+          await _permsChannel.invokeMethod<void>('cancelNativeRecording');
+          _audioReply('recordCancel', rid, 'ok', null);
+        } on PlatformException catch (e) {
+          _audioReply('recordCancel', rid, null, '${e.code}: ${e.message ?? ''}');
+        }
+      } else {
+        _audioReply(op, rid, null, 'unknown-op');
+      }
+    } catch (e) {
+      _audioReply(op, rid, null, e.toString());
+    }
   }
 
   /// Default handlers + state pump injected on every dialog1 page load.

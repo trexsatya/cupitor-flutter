@@ -34,6 +34,10 @@ dependencies:
   shared_preferences: ^2.2.2
   http: ^1.2.0
   pdfrx: ^1.0.0
+  # AudioBridge persists manual-entry recordings via the host app: JS in
+  # dialog1's WebView sends base64 audio, Flutter writes it under
+  # <docs>/manual_audio/<id>.<ext>, JS holds the resulting file:// URL.
+  path_provider: ^2.1.0
   wakelock_plus: ^1.1.0
   speech_to_text: ^7.0.0
   google_mlkit_translation: ^0.13.1
@@ -42,6 +46,15 @@ dependencies:
   # TTS calls would otherwise no-op. macOS WKWebView supports it natively, but
   # we route through this on every platform for behavior parity.
   flutter_tts: ^4.2.0
+  # EPUB reader stack:
+  #   archive    — unzip the .epub container (EPUB is a renamed zip).
+  #   xml        — parse container.xml / OPF (manifest+spine) / NCX/nav (TOC).
+  #   crypto     — SHA-1 of file bytes → resume-state key (survives a rename).
+  #   file_picker — device-storage source for "Open EPUB" in the Tools sheet.
+  archive: ^3.4.0
+  xml: ^6.5.0
+  crypto: ^3.0.3
+  file_picker: ^8.0.0
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8

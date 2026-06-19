@@ -251,12 +251,166 @@
         let t = e.target && e.target.closest && e.target.closest('.clickable-word');
         if (t) {
           try {
-             CaptionHandler.postMessage(t.dataset.word);
+             const base = (t.dataset && t.dataset.word) || t.textContent || '';
+             const looked = joinHyphenatedWord(t);
+             // Diagnostic — viewable via Tools → "View snippet logs".
+             // Logs only when there's a dash anywhere near the tapped
+             // word (the only case where a join is even possible), so
+             // it doesn't spam the log on every routine lookup.
+             try {
+               logTapDiag(t, base, looked);
+             } catch (_) {}
+             CaptionHandler.postMessage(looked);
           } catch(e) {}
         }
       }, true);
       window.myCustomerListenerAttached = true;
     }
+  }
+
+  // Emits a one-line tap log when there's a dash in the immediate neighborhood
+  // of the tapped word — captures the codepoint(s) of the dash so the user
+  // can tell us what character the page is using if the join still misfires.
+  // Routed through SnippetLogChannel (already registered on the main WebView)
+  // so the existing "View snippet logs" UI surfaces it.
+  function logTapDiag(span, base, looked) {
+    if (!window.SnippetLogChannel || !window.SnippetLogChannel.postMessage) return;
+    // Pull ~30 chars on each side from the block parent's textContent so
+    // the log entry shows the actual neighborhood and any dash char(s).
+    let blk = span.parentNode;
+    while (blk && blk.nodeType === 1 && blk.tagName
+           && !/^(P|LI|BLOCKQUOTE|DIV|H[1-6]|SECTION|ARTICLE|TD|TH|MAIN|ASIDE|HEADER|FOOTER|BODY)$/i.test(blk.tagName)) {
+      blk = blk.parentNode;
+    }
+    if (!blk) return;
+    const txt = (blk.textContent || '');
+    const idx = txt.indexOf(base);
+    if (idx < 0) return;
+    const ctx = txt.substring(Math.max(0, idx - 30), Math.min(txt.length, idx + base.length + 30));
+    // Only emit if the neighborhood contains any dash-like char — every
+    // other tap is uninteresting and would just fill the log.
+    if (!/[-‐‑‒–—−­]/.test(ctx)) return;
+    // Hex of any dash chars near the word — so user can tell us "the dash
+    // is U+2013" without needing DevTools.
+    const dashCodes = [];
+    for (const c of ctx) {
+      if (/[-‐‑‒–—−­]/.test(c)) {
+        const cp = c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0');
+        if (!dashCodes.includes(cp)) dashCodes.push(cp);
+      }
+    }
+    const msg = 'word-tap base=' + JSON.stringify(base)
+              + ' look=' + JSON.stringify(looked)
+              + ' dash=[' + dashCodes.map(c => 'U+' + c).join(',') + ']'
+              + ' ctx=' + JSON.stringify(ctx);
+    try { window.SnippetLogChannel.postMessage('info|' + msg); } catch (_) {}
+  }
+
+  // Line-wrap hyphenation: when the page renders something as "trans-\nlation"
+  // or "well- known" (two halves separated by a dash + whitespace), tapping
+  // either half should look up the joined word.
+  //
+  // The earlier version walked only IMMEDIATE siblings of the clicked span,
+  // which broke whenever the EPUB / web page nested halves inside different
+  // wrappers (per-line spans, <i>, <em>, footnote markers — common on sites
+  // like litteraturbanken.se that wrap each rendered line in its own span).
+  // Instead we now read the block-parent's flattened textContent and locate
+  // the clicked word's occurrence within it; the hyphen pattern lives in
+  // that flat string regardless of wrapping. Disambiguation when the same
+  // word appears multiple times in the block: count how many same-word
+  // clickable-word spans precede the clicked one and pick that occurrence.
+  function joinHyphenatedWord(span) {
+    const base = (span.dataset && span.dataset.word) || span.textContent || '';
+    if (!base) return '';
+    // Walk up to a sensible block-ish parent. `BODY` is the failsafe — a
+    // text run with no <p>/<div>/<li> ancestor still gets joined.
+    let blk = span.parentNode;
+    while (blk && blk.nodeType === 1
+           && blk.tagName
+           && !/^(P|LI|BLOCKQUOTE|DIV|H[1-6]|SECTION|ARTICLE|TD|TH|MAIN|ASIDE|HEADER|FOOTER|BODY)$/i.test(blk.tagName)) {
+      blk = blk.parentNode;
+    }
+    if (!blk) return base;
+    // Soft hyphens (U+00AD) are invisible line-break hints; drop them so
+    // they don't end up in the lookup. Various Unicode hyphens are all
+    // treated as line-break dashes for the join.
+    const blockText = (blk.textContent || '').replace(/­/g, '');
+    // Find the Nth occurrence of `base` in blockText, where N = number of
+    // earlier `.clickable-word` spans with the same data-word inside the
+    // block (DOM order). Lets us key the same string appearing 5 times.
+    const all = blk.querySelectorAll('.clickable-word');
+    let occurrence = 0;
+    for (let i = 0; i < all.length; i++) {
+      if (all[i] === span) break;
+      if (((all[i].dataset && all[i].dataset.word) || '') === base) occurrence++;
+    }
+    let idx = -1;
+    let cursor = 0;
+    for (let k = 0; k <= occurrence; k++) {
+      idx = blockText.indexOf(base, cursor);
+      if (idx < 0) break;
+      cursor = idx + base.length;
+    }
+    if (idx < 0) return base;
+    const endIdx = idx + base.length;
+    const WORD_RE = /[\p{L}\p{M}\p{N}'’-]/u;
+    // Recognise every common dash codepoint as a hyphenation marker — the
+    // page might use any of:
+    //   U+002D HYPHEN-MINUS          (ASCII)
+    //   U+2010 HYPHEN                (typographic, looks like a thin hyphen)
+    //   U+2011 NON-BREAKING HYPHEN
+    //   U+2012 FIGURE DASH
+    //   U+2013 EN DASH               (European typography — common in
+    //                                 older Swedish prints for compounds
+    //                                 and line breaks)
+    //   U+2014 EM DASH
+    //   U+2212 MINUS SIGN
+    // The "no whitespace before the dash" check below filters out the
+    // false-positive case of en/em dashes acting as parenthetical
+    // separators ("foo — bar") — those have whitespace on BOTH sides.
+    const isDash = (c) =>
+      c === '-' || c === '‐' || c === '‑' || c === '‒' ||
+      c === '–' || c === '—' || c === '−';
+    // Case A: tapped word ends with a dash (Intl.Segmenter kept it attached,
+    // regex-fallback wrapper, or a non-Latin script split that included it).
+    if (isDash(base[base.length - 1])) {
+      let i = endIdx;
+      while (i < blockText.length && /\s/.test(blockText[i])) i++;
+      const ws = i;
+      while (i < blockText.length && WORD_RE.test(blockText[i])) i++;
+      if (i > ws) return base.slice(0, -1) + blockText.substring(ws, i);
+    }
+    // Case B: a dash sits IMMEDIATELY after our word (no whitespace between),
+    // then optional whitespace, then the continuation word. The "no
+    // whitespace before the dash" requirement is what distinguishes line-
+    // break hyphenation ("foo-\nbar") from a parenthetical em dash
+    // ("foo — bar") that we DO NOT want to collapse to "foobar".
+    {
+      let i = endIdx;
+      if (i < blockText.length && isDash(blockText[i])) {
+        let j = i + 1;
+        while (j < blockText.length && /\s/.test(blockText[j])) j++;
+        const ws = j;
+        while (j < blockText.length && WORD_RE.test(blockText[j])) j++;
+        if (j > ws) return base + blockText.substring(ws, j);
+      }
+    }
+    // Case C: walking back across whitespace before our word, the previous
+    // char is a dash. Symmetric mirror of Case B from the continuation
+    // half's point of view: pattern "first- <whitespace> us".
+    {
+      let k = idx;
+      while (k > 0 && /\s/.test(blockText[k - 1])) k--;
+      if (k > 0 && isDash(blockText[k - 1])) {
+        let endPrev = k - 1;
+        let startPrev = endPrev;
+        while (startPrev > 0 && WORD_RE.test(blockText[startPrev - 1])) startPrev--;
+        if (endPrev > startPrev) {
+          return blockText.substring(startPrev, endPrev) + base;
+        }
+      }
+    }
+    return base;
   }
 
   if (document.readyState === 'loading') {

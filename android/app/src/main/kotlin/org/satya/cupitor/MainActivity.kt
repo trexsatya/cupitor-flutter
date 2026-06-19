@@ -36,6 +36,11 @@ class MainActivity : FlutterActivity() {
         private const val CHANNEL = "cupitor/adblock"
         private const val YTDLP_CHANNEL = "cupitor/ytdlp"
         private const val MEDIA_KEYS_CHANNEL = "cupitor/mediakeys"
+        private const val PERMS_CHANNEL = "cupitor/perms"
+        // Arbitrary request code for ActivityCompat.requestPermissions —
+        // matched against onRequestPermissionsResult so we route the answer
+        // back to the correct pending MethodChannel.Result.
+        private const val PERM_REQ_MIC = 4001
         private const val PREFS_NAME = "cupitor_adblock"
         private const val PREFS_CUSTOM_HOSTS = "custom_ad_hosts"
 
@@ -134,6 +139,19 @@ class MainActivity : FlutterActivity() {
 
     // Whether network-level ad blocking is active (toggled from Dart).
     @Volatile var adBlockEnabled = true
+
+    // Pending result for an in-flight RECORD_AUDIO request. Only one can be
+    // outstanding at a time — a second request while one is pending is
+    // resolved to false immediately so the caller can retry.
+    private var pendingMicPermResult: MethodChannel.Result? = null
+
+    // Native MediaRecorder session for the manual-entry recorder. We capture
+    // through this path (instead of WebView's getUserMedia) because the
+    // WebView audio stack races with `speech_to_text` and has been observed
+    // to surface `NotReadableError` even when no other app holds the mic.
+    // Outputs AAC-in-MP4 directly to the path Dart hands us.
+    private var nativeRecorder: android.media.MediaRecorder? = null
+    private var nativeRecorderPath: String? = null
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
@@ -248,6 +266,145 @@ class MainActivity : FlutterActivity() {
                 }
                 else -> result.notImplemented()
             }
+        }
+
+        // ---- Runtime-permission channel ----
+        // Android's `RECORD_AUDIO` is a dangerous permission — declaring it
+        // in the manifest is not enough, the user must approve it via the
+        // OS prompt. WebView's `onPermissionRequest` (handled in Dart) only
+        // controls the per-WebView resource flag; without the OS-level
+        // permission `getUserMedia({audio:true})` silently rejects and the
+        // recorder appears broken. Dart calls into here to make sure the
+        // OS-level grant is in place before granting the WebView request.
+        val permsChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PERMS_CHANNEL)
+        permsChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "requestMicrophone" -> requestMicPermission(result)
+                "startNativeRecording" -> {
+                    val path = call.argument<String>("path")
+                    if (path.isNullOrBlank()) { result.error("BAD_ARG", "path required", null); return@setMethodCallHandler }
+                    startNativeRecording(path, result)
+                }
+                "stopNativeRecording" -> stopNativeRecording(result)
+                "cancelNativeRecording" -> cancelNativeRecording(result)
+                "isNativeRecording" -> result.success(nativeRecorder != null)
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    // ---- Native MediaRecorder ----
+    // start: open AudioRecord through MediaRecorder, write AAC/MP4 to `path`.
+    //        Returns true on a successful start, errors otherwise.
+    // stop:  finish writing the file and return the path. Returns null if
+    //        nothing was recording.
+    // cancel: stop without keeping the file; deletes any partial output.
+    private fun startNativeRecording(path: String, result: MethodChannel.Result) {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(
+                this, android.Manifest.permission.RECORD_AUDIO
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            result.error("PERMISSION", "RECORD_AUDIO not granted", null); return
+        }
+        if (nativeRecorder != null) {
+            result.error("BUSY", "another recording is already in progress", null); return
+        }
+        // MediaRecorder(Context) ctor is API 31+; on older platforms the
+        // no-arg ctor is still the supported path. Build error-safe.
+        val rec = if (android.os.Build.VERSION.SDK_INT >= 31) {
+            android.media.MediaRecorder(this)
+        } else {
+            @Suppress("DEPRECATION")
+            android.media.MediaRecorder()
+        }
+        try {
+            rec.setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
+            rec.setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
+            rec.setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
+            // 64 kbps mono is plenty for spoken-word pronunciation cards and
+            // keeps the on-disk file ≲ 1 KB per second.
+            rec.setAudioChannels(1)
+            rec.setAudioSamplingRate(44100)
+            rec.setAudioEncodingBitRate(64_000)
+            rec.setOutputFile(path)
+            rec.prepare()
+            rec.start()
+        } catch (e: Exception) {
+            try { rec.release() } catch (_: Exception) {}
+            // Clean up the half-written file if `setOutputFile` already created it.
+            try { java.io.File(path).delete() } catch (_: Exception) {}
+            result.error("START_FAILED", e.message ?: e.toString(), null)
+            return
+        }
+        nativeRecorder = rec
+        nativeRecorderPath = path
+        result.success(true)
+    }
+
+    private fun stopNativeRecording(result: MethodChannel.Result) {
+        val rec = nativeRecorder
+        if (rec == null) { result.success(null); return }
+        val path = nativeRecorderPath
+        nativeRecorder = null
+        nativeRecorderPath = null
+        // stop() can throw RuntimeException("stop failed.") if called too
+        // quickly after start (no audio captured yet). Treat that as a
+        // cancelled recording — delete the (likely-empty/invalid) file
+        // and return null so Dart can surface a clean "nothing recorded".
+        try {
+            rec.stop()
+        } catch (e: RuntimeException) {
+            try { rec.release() } catch (_: Exception) {}
+            if (!path.isNullOrEmpty()) { try { java.io.File(path).delete() } catch (_: Exception) {} }
+            result.success(null)
+            return
+        }
+        try { rec.release() } catch (_: Exception) {}
+        result.success(path)
+    }
+
+    private fun cancelNativeRecording(result: MethodChannel.Result) {
+        val rec = nativeRecorder
+        val path = nativeRecorderPath
+        nativeRecorder = null
+        nativeRecorderPath = null
+        if (rec != null) {
+            try { rec.stop() } catch (_: Exception) {}
+            try { rec.release() } catch (_: Exception) {}
+        }
+        if (!path.isNullOrEmpty()) { try { java.io.File(path).delete() } catch (_: Exception) {} }
+        result.success(null)
+    }
+
+    // Returns true via `result` if RECORD_AUDIO is granted (now or after the
+    // user accepts the prompt). The OS prompt is async — we stash the result
+    // until onRequestPermissionsResult fires and then deliver the answer.
+    private fun requestMicPermission(result: MethodChannel.Result) {
+        val alreadyGranted = androidx.core.content.ContextCompat.checkSelfPermission(
+            this, android.Manifest.permission.RECORD_AUDIO
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (alreadyGranted) { result.success(true); return }
+        // Another request is in flight — bounce. The caller can retry once
+        // the first prompt resolves.
+        if (pendingMicPermResult != null) { result.success(false); return }
+        pendingMicPermResult = result
+        androidx.core.app.ActivityCompat.requestPermissions(
+            this,
+            arrayOf(android.Manifest.permission.RECORD_AUDIO),
+            PERM_REQ_MIC
+        )
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == PERM_REQ_MIC) {
+            val ok = grantResults.isNotEmpty() &&
+                     grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
+            pendingMicPermResult?.success(ok)
+            pendingMicPermResult = null
         }
     }
 
