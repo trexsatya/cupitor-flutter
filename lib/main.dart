@@ -30,6 +30,7 @@ import 'notif/notif_channel.dart';
 import 'notif/notification_channel.dart';
 import 'notif/notification_service.dart';
 import 'notif/notif_settings.dart';
+import 'notif/notif_timer.dart';
 import 'playlist_service.dart';
 import 'profile_service.dart';
 import 'tag_browser.dart';
@@ -305,6 +306,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     now: () => tz.TZDateTime.now(tz.local),
     onMutated: () => notifService.rearm(),
   );
+  // Best-effort desktop/web delivery: no OS wake there, so an in-process
+  // timer periodically sweeps while the app is open (spec §Platform
+  // specifics). Started conditionally in initState.
+  late final NotifSweepTimer _notifTimer =
+      NotifSweepTimer(sweep: notifService.sweep);
   // Web Speech Synthesis bridge for dialog1. The Android WebView does not
   // implement window.speechSynthesis, so the dictionary page's TTS calls go
   // through a JS-side polyfill that posts here. We speak one utterance at a
@@ -392,6 +398,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _appBarTimer?.cancel();
     ProfileService.active.removeListener(_onProfileChanged);
     WidgetsBinding.instance.removeObserver(this);
+    _notifTimer.stop();
     WakelockPlus.disable();
     _adBlockChannel.setMethodCallHandler(null); // stop receiving callbacks
     _mediaKeysChannel.setMethodCallHandler(null);
@@ -505,6 +512,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             }
           }
           await notifService.sweep(); // launch catch-up (spec: sweep callers)
+          if (kIsWeb ||
+              defaultTargetPlatform == TargetPlatform.windows ||
+              defaultTargetPlatform == TargetPlatform.linux ||
+              defaultTargetPlatform == TargetPlatform.macOS) {
+            _notifTimer.start();
+          }
           if (!mounted) return;
           await _loadProfileScopedPrefs();
           ProfileService.active.addListener(_onProfileChanged);
