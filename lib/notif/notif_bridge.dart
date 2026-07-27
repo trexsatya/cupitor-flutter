@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'package:timezone/timezone.dart' as tz;
 
 import 'notif_dao.dart';
-import 'recurring_scheduler.dart';
+import 'notif_ops.dart';
 import 'schedules.dart';
 import 'series_scheduler.dart';
 import 'waking_clock.dart';
@@ -175,9 +175,7 @@ class NotifBridge {
   /// doubles as "items get no per-item due time" (recurring lists).
   Future<List<double>?> _offsetsFor(NotifDao d, int? scheduleId) async {
     if (scheduleId == null) return null;
-    final s = await d.scheduleById(scheduleId);
-    if (s == null || s.kind != 'series') return null;
-    return seriesOffsets(jsonDecode(s.config) as Map<String, dynamic>);
+    return offsetsIfSeries(await d.scheduleById(scheduleId));
   }
 
   // ── list payloads ──────────────────────────────────────────────────
@@ -270,15 +268,8 @@ class NotifBridge {
     }
     final w = window();
     final t = now();
-    final config = jsonDecode(schedule.config) as Map<String, dynamic>;
-    int? nextFireAt;
-    List<double>? offsets;
-    if (schedule.kind == 'recurring') {
-      nextFireAt =
-          nextRecurringFire(parseRecurring(config), t, w).millisecondsSinceEpoch;
-    } else {
-      offsets = seriesOffsets(config);
-    }
+    final nextFireAt = initialNextFireMs(schedule, t, w);
+    final offsets = offsetsIfSeries(schedule);
     final list = await d.createList(
         profileId: profileId, name: name, source: 'webpage',
         externalKey: key, scheduleId: schedule.id, nextFireAt: nextFireAt);
@@ -426,32 +417,7 @@ class NotifBridge {
       _ack(reqId, op, false, error: 'unknown_schedule');
       return;
     }
-    final w = window();
-    final t = now();
-    final config = jsonDecode(schedule.config) as Map<String, dynamic>;
-    if (schedule.kind == 'recurring') {
-      // Series → recurring: per-item state stays in place, unread (spec:
-      // lossless round trip).
-      await d.updateList(list.id, {
-        'schedule_id': schedule.id,
-        'next_fire_at': nextRecurringFire(parseRecurring(config), t, w)
-            .millisecondsSinceEpoch,
-      });
-    } else {
-      final offsets = seriesOffsets(config);
-      await d.updateList(list.id, {'schedule_id': schedule.id, 'next_fire_at': null});
-      for (final i in await d.itemsForList(list.id)) {
-        // Only items with no series state get initialised — items that
-        // carry state from an earlier stint keep it (spec: lossless).
-        if (i.status == 'active' && i.nextDueAt == null) {
-          await d.updateItem(i.id, {
-            'step': 0,
-            'next_due_at':
-                addWakingHours(t, offsets[0], w).millisecondsSinceEpoch,
-          });
-        }
-      }
-    }
+    await applyScheduleToList(d, list, schedule, now(), window());
     _ack(reqId, op, true);
     await _afterMutation(d);
   }
@@ -460,26 +426,14 @@ class NotifBridge {
     const op = 'setStatus';
     final d = await _daoOrAck(reqId, op);
     if (d == null) return;
-    final status = m['status'] as String?;
-    if (status != 'active' && status != 'paused') {
+    final status = m['status'];
+    if (status is! String || (status != 'active' && status != 'paused')) {
       _ack(reqId, op, false, error: 'bad_payload');
       return;
     }
     final list = await _listOrAck(d, reqId, op, m['external_key']);
     if (list == null) return;
-    final fields = <String, Object?>{'status': status};
-    if (status == 'active' && list.scheduleId != null) {
-      final schedule = await d.scheduleById(list.scheduleId!);
-      if (schedule != null && schedule.kind == 'recurring') {
-        // Resuming a recurring list re-anchors its fire time to now — the
-        // stale pre-pause slot may be long past.
-        fields['next_fire_at'] = nextRecurringFire(
-                parseRecurring(jsonDecode(schedule.config) as Map<String, dynamic>),
-                now(), window())
-            .millisecondsSinceEpoch;
-      }
-    }
-    await d.updateList(list.id, fields);
+    await setListStatus(d, list, status, now(), window());
     _ack(reqId, op, true);
     await _afterMutation(d);
   }

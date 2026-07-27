@@ -186,6 +186,41 @@ class NotifDao {
         config: normalized, createdAt: now);
   }
 
+  /// Every list (any profile) still pointing at [scheduleId] — the editor's
+  /// delete guard and its re-anchor-after-edit pass both need the full set.
+  Future<List<NotifListRow>> listsUsingSchedule(int scheduleId) async =>
+      (await db.query('notif_lists',
+              where: 'schedule_id = ?', whereArgs: [scheduleId],
+              orderBy: 'id ASC'))
+          .map(NotifListRow.fromMap)
+          .toList(growable: false);
+
+  /// Rewrite a CUSTOM schedule. Built-ins are immutable (spec: visible and
+  /// clonable, not editable), so a builtin or missing row returns false.
+  /// Throws [ScheduleConfigError] on an invalid config.
+  Future<bool> updateCustomSchedule(int id,
+      {required String name,
+      required String kind,
+      required Map<String, Object?> config}) async {
+    final s = await scheduleById(id);
+    if (s == null || s.builtinKey != null) return false;
+    final normalized = jsonEncode(validateScheduleConfig(kind, config));
+    await db.update(
+        'notif_schedules', {'name': name, 'kind': kind, 'config': normalized},
+        where: 'id = ?', whereArgs: [id]);
+    return true;
+  }
+
+  /// Delete a CUSTOM schedule. The caller must first verify no list uses it
+  /// (spec: deletion is blocked until those lists are reassigned). Builtin
+  /// or missing rows return false.
+  Future<bool> deleteCustomSchedule(int id) async {
+    final s = await scheduleById(id);
+    if (s == null || s.builtinKey != null) return false;
+    await db.delete('notif_schedules', where: 'id = ?', whereArgs: [id]);
+    return true;
+  }
+
   // ── lists ──────────────────────────────────────────────────────────
 
   Future<NotifListRow> createList({
