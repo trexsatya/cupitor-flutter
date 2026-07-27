@@ -146,6 +146,13 @@ next fire to now.
 | `cupitorNotifGraded` | `{external_key, item_external_id, grade, source}` | any grade: `source` ∈ `'webpage'` \| `'action'` (notification button) \| `'auto'` |
 | `cupitorNotificationOpened` | `{external_key, item_external_id, payload}` | user tapped a notification body; dialog1 is opened at the item's `open_url` first |
 
+Deep-link choice per item: when `open_url` is set, the tap NAVIGATES dialog1
+there — the page reloads, so encode everything you need in the URL (the
+`cupitorNotificationOpened` event fires into the page being replaced and is
+effectively lost). When `open_url` is omitted, no navigation happens and the
+already-loaded page receives the event to handle in place — the better fit
+for SPA-style view switching.
+
 `cupitorNotifGraded` with `source:'action'` is how you learn about grades made
 from notification buttons while your page wasn't looking; a grade made while
 the app was killed arrives via the warm-push state on next launch instead.
