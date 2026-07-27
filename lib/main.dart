@@ -2,8 +2,10 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:io' show Platform, File, Directory;
 import 'dart:math' as math;
+import 'dart:ui' show DartPluginRegistrant;
 import 'package:path_provider/path_provider.dart';
-import 'package:flutter/foundation.dart' show compute, debugPrint, defaultTargetPlatform;
+import 'package:flutter/foundation.dart'
+    show compute, debugPrint, defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
@@ -23,6 +25,9 @@ import 'epub_reader.dart';
 import 'db.dart';
 import 'memory_manager.dart';
 import 'notif/notif_bridge.dart';
+import 'notif/notif_channel.dart';
+import 'notif/notification_channel.dart';
+import 'notif/notification_service.dart';
 import 'notif/notif_settings.dart';
 import 'playlist_service.dart';
 import 'profile_service.dart';
@@ -32,6 +37,47 @@ import 'tag_capture.dart';
 import 'tag_filter.dart';
 import 'tag_settings.dart';
 import 'text_transform.dart';
+
+/// Feature-wide singletons. Channel choice: real plugin adapter where it
+/// delivers, noop shim on Windows/web (spec §Platform specifics).
+final NotifChannel notifChannel = FlutterNotifChannel.platformSupported
+    ? FlutterNotifChannel()
+    : NoopNotifChannel();
+
+final NotificationService notifService = NotificationService(
+  channel: notifChannel,
+  dao: () => CupitorDb.instance.notifDao(),
+  window: () => NotifSettings.window,
+  perFireCap: () => NotifSettings.perFireCap,
+  now: () => tz.TZDateTime.now(tz.local),
+  maxArmed: !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS ? 60 : 200,
+);
+
+/// Background isolate action handler (app may be dead). Boots just enough
+/// of the world — bindings, tz, db — grades, and rearms. No webview here;
+/// the webpage learns about the grade from the lists warm-push next launch.
+@pragma('vm:entry-point')
+Future<void> notifBackgroundActionHandler(
+    String actionId, String payloadJson) async {
+  try {
+    WidgetsFlutterBinding.ensureInitialized();
+    DartPluginRegistrant.ensureInitialized();
+    tzdata.initializeTimeZones();
+    try {
+      final zoneName = await FlutterTimezone.getLocalTimezone()
+          .timeout(const Duration(seconds: 2));
+      tz.setLocalLocation(tz.getLocation(zoneName));
+    } catch (_) {/* UTC */}
+    await NotifSettings.init();
+    await notifChannel.init(NotifCallbacks(
+      onOpened: (_) async {/* taps never route here */},
+      onAction: (_, __) async {},
+    ));
+    await notifService.handleAction(actionId, payloadJson);
+  } catch (e) {
+    debugPrint('notif background action failed: $e');
+  }
+}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -45,6 +91,8 @@ void main() async {
   } catch (e) {
     debugPrint('tz init failed, staying on UTC: $e');
   }
+  FlutterNotifChannel.backgroundHandler =
+      (actionId, payload) => notifBackgroundActionHandler(actionId, payload);
   // Hide both system bars for maximum reading area, but rely on
   // `immersiveSticky` so the user can swipe from any edge to transiently
   // reveal them (status bar top, back / home / recents bottom). They
@@ -197,22 +245,27 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   final ValueNotifier<bool> _dialog1FullscreenNotifier = ValueNotifier(false);
   // Language-app ↔ Cupitor bridge for the notification feature (spec:
   // docs/superpowers/specs/2026-07-27-notifications-design.md §Bridge).
-  // Permission/exact-alarm/action capabilities are stubbed until the
-  // delivery layer (Plan 2) supplies real ones through these callbacks.
+  // Permission/exact-alarm/action capabilities are backed by the real
+  // delivery layer (Plan 2) via notifChannel/notifService.
   late final NotifBridge _notifBridge = NotifBridge(
     dao: () => CupitorDb.instance.notifDao(),
     activeProfileId: () => ProfileService.currentId,
     emit: _emitNotifEvent,
     capabilities: () async => NotifCapabilities(
       supported: await CupitorDb.instance.isReady(),
-      permission: 'unknown',
-      exactAlarms: false,
-      actions: false,
+      permission: await notifChannel.permissionStatus(),
+      exactAlarms: await notifChannel.exactAlarmsAllowed(),
+      actions: notifChannel.supportsActions,
       platform: defaultTargetPlatform.name,
     ),
-    requestPermission: () async => 'unknown',
+    requestPermission: () async {
+      final r = await notifChannel.requestPermission();
+      await notifService.rearm(); // permission may have just been granted
+      return r;
+    },
     window: () => NotifSettings.window,
     now: () => tz.TZDateTime.now(tz.local),
+    onMutated: () => notifService.rearm(),
   );
   // Web Speech Synthesis bridge for dialog1. The Android WebView does not
   // implement window.speechSynthesis, so the dictionary page's TTS calls go
@@ -346,6 +399,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       WakelockPlus.enable();
+      notifService.sweep(); // resume catch-up + rearm (spec: sweep callers)
     } else if (state == AppLifecycleState.paused) {
       WakelockPlus.disable();
       // Flush WebView cookies to disk so logins survive a force-kill that
@@ -398,6 +452,21 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           await ProfileService.init();
           await PlaylistService.init();
           await NotifSettings.init();
+          await notifChannel.init(NotifCallbacks(
+            onOpened: _onNotificationOpened,
+            onAction: _onNotificationAction,
+          ));
+          // Terminated-tap: app was launched from a notification.
+          final nc = notifChannel;
+          if (nc is FlutterNotifChannel) {
+            final launch = await nc.launchPayload();
+            if (launch != null) {
+              // Defer until the first frame so dialog1 infrastructure exists.
+              WidgetsBinding.instance.addPostFrameCallback(
+                  (_) => _onNotificationOpened(launch));
+            }
+          }
+          await notifService.sweep(); // launch catch-up (spec: sweep callers)
           if (!mounted) return;
           await _loadProfileScopedPrefs();
           ProfileService.active.addListener(_onProfileChanged);
@@ -7815,6 +7884,47 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   Future<void> _pushNotifStateToDialog() async {
     await _notifBridge.handle('{"op":"getSchedules"}');
     await _notifBridge.handle('{"op":"getLists"}');
+  }
+
+  /// Notification body tap → record response, open dialog1 at the item's
+  /// open_url (fallback: plain dialog1), and tell the webpage
+  /// (spec: cupitorNotificationOpened event; external ids only).
+  Future<void> _onNotificationOpened(String payloadJson) async {
+    await notifService.recordOpened(payloadJson);
+    Map<String, dynamic> p;
+    try {
+      p = jsonDecode(payloadJson) as Map<String, dynamic>;
+    } catch (_) {
+      return;
+    }
+    final openUrl = p['open_url'] as String?;
+    if (openUrl != null && openUrl.isNotEmpty) {
+      _openDialogWithWebview(openUrl);
+    } else {
+      _showDialog1();
+    }
+    _emitNotifEvent('cupitorNotificationOpened', {
+      'external_key': p['list_ek'],
+      'item_external_id': p['item_eid'],
+      'payload': p['echo'],
+    });
+  }
+
+  /// Foreground action button → grade via the shared service path, then
+  /// mirror to the webpage so its state doesn't drift (spec:
+  /// cupitorNotifGraded) and refresh the lists push.
+  Future<void> _onNotificationAction(
+      String actionId, String payloadJson) async {
+    final graded = await notifService.handleAction(actionId, payloadJson);
+    if (graded == null) return;
+    final ((listEk, itemEid), grade) = graded;
+    _emitNotifEvent('cupitorNotifGraded', {
+      'external_key': listEk,
+      'item_external_id': itemEid,
+      'grade': grade,
+      'source': 'action',
+    });
+    await _pushNotifStateToDialog();
   }
 
   /// Handle a JSON message from the language app via the
