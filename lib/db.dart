@@ -5,6 +5,8 @@ import 'package:crypto/crypto.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 
+import 'notif/schedules.dart' show builtinSchedules;
+
 /// First SQLite store in Cupitor. Phase 1: tags, pages, sentences,
 /// sentence_tags only — existing prefs/JSON state stays put. See
 /// docs/superpowers/specs/2026-06-24-sentence-tagging-design.md for the
@@ -34,7 +36,13 @@ class CupitorDb {
   // inside dialog1 via a JS channel. Items are snapshots (denormalised
   // book/chapter labels) so cards keep displaying even if the EPUB is
   // re-imported and its sentence ids change.
-  static const int _schemaVersion = 6;
+  // v6 → v7: notification feature (spec:
+  // docs/superpowers/specs/2026-07-27-notifications-design.md). Four tables:
+  // notif_schedules (built-in + custom), notif_lists, notif_items (snapshots
+  // with per-item Leitner state), notif_events (fire/response history for
+  // dedupe, the catch-up sweep, and the manager's history view). Seeds the
+  // seven built-in schedules. Additive only — no existing table is touched.
+  static const int _schemaVersion = 7;
   static const String _fileName = 'cupitor.db';
   static const int defaultProfileId = 1;
 
@@ -166,6 +174,7 @@ class CupitorDb {
               created_at    INTEGER NOT NULL
             )''');
     await db.execute('CREATE INDEX idx_playlist_items_playlist ON playlist_items(playlist_id)');
+    await createNotifTables(db);
   }
 
   /// All version-stepped migrations. Public + static for the same reason —
@@ -276,6 +285,88 @@ class CupitorDb {
                 created_at    INTEGER NOT NULL
               )''');
       await db.execute('CREATE INDEX idx_playlist_items_playlist ON playlist_items(playlist_id)');
+    }
+    if (oldV < 7) {
+      await createNotifTables(db);
+    }
+  }
+
+  /// v7 notification tables. Shared by createSchema (fresh install) and the
+  /// oldV<7 migration step. Spec: data-model section. Additive only: creates
+  /// notif_* tables and indexes, never alters pre-existing tables.
+  static Future<void> createNotifTables(Database db) async {
+    await db.execute('''
+      CREATE TABLE notif_schedules (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        builtin_key TEXT UNIQUE,
+        config      TEXT NOT NULL,
+        created_at  INTEGER NOT NULL
+      )''');
+    await db.execute('''
+      CREATE TABLE notif_lists (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id    INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        name          TEXT NOT NULL,
+        source        TEXT NOT NULL,
+        external_key  TEXT,
+        schedule_id   INTEGER REFERENCES notif_schedules(id),
+        status        TEXT NOT NULL,
+        cursor        INTEGER NOT NULL DEFAULT 0,
+        next_fire_at  INTEGER,
+        last_fired_at INTEGER,
+        created_at    INTEGER NOT NULL,
+        updated_at    INTEGER NOT NULL,
+        UNIQUE(profile_id, external_key)
+      )''');
+    await db.execute(
+        'CREATE INDEX idx_notif_lists_profile ON notif_lists(profile_id)');
+    await db.execute('''
+      CREATE TABLE notif_items (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        list_id       INTEGER NOT NULL REFERENCES notif_lists(id) ON DELETE CASCADE,
+        external_id   TEXT,
+        title         TEXT NOT NULL,
+        body          TEXT,
+        open_url      TEXT,
+        payload       TEXT,
+        position      INTEGER NOT NULL,
+        step          INTEGER NOT NULL DEFAULT 0,
+        next_due_at   INTEGER,
+        last_fired_at INTEGER,
+        last_grade    INTEGER,
+        status        TEXT NOT NULL DEFAULT 'active',
+        created_at    INTEGER NOT NULL,
+        UNIQUE(list_id, external_id)
+      )''');
+    await db.execute('''
+      CREATE INDEX idx_notif_items_due ON notif_items(next_due_at)
+        WHERE status = 'active' ''');
+    await db.execute('''
+      CREATE TABLE notif_events (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id      INTEGER NOT NULL REFERENCES notif_items(id) ON DELETE CASCADE,
+        fired_at     INTEGER NOT NULL,
+        responded_at INTEGER,
+        grade        INTEGER,
+        source       TEXT
+      )''');
+    await db.execute(
+        'CREATE INDEX idx_notif_events_item ON notif_events(item_id, fired_at)');
+    await seedBuiltinSchedules(db);
+  }
+
+  /// Idempotent (INSERT OR IGNORE on the UNIQUE builtin_key): safe to re-run
+  /// as a repair pass without duplicating rows.
+  static Future<void> seedBuiltinSchedules(Database db) async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    for (final b in builtinSchedules) {
+      await db.rawInsert(
+        'INSERT OR IGNORE INTO notif_schedules '
+        '(name, kind, builtin_key, config, created_at) VALUES (?, ?, ?, ?, ?)',
+        [b.name, b.kind, b.key, jsonEncode(b.config), now],
+      );
     }
   }
 
