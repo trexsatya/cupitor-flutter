@@ -83,8 +83,8 @@ class NotifBridge {
       _ack(null, 'unknown', false, error: 'bad_json');
       return;
     }
-    final op = m['op'] as String?;
-    final reqId = m['request_id'] as String?;
+    final op = m['op'] is String ? m['op'] as String : null;
+    final reqId = m['request_id'] is String ? m['request_id'] as String : null;
     if (op == null) {
       _ack(reqId, 'unknown', false, error: 'unknown_op');
       return;
@@ -221,9 +221,26 @@ class NotifBridge {
     emit('cupitorNotifLists', await _listsPayload(d));
   }
 
+  Future<void> _insertParsedItem(NotifDao d, int listId, _ItemInput it,
+      int position, List<double>? offsets, tz.TZDateTime t, WakingWindow w) {
+    return d.insertItem(
+      listId: listId, externalId: it.externalId, title: it.title,
+      body: it.body, openUrl: it.openUrl, payloadJson: it.payloadJson,
+      position: position,
+      nextDueAt: offsets == null
+          ? null
+          : addWakingHours(t, offsets[0], w).millisecondsSinceEpoch,
+    );
+  }
+
   Future<void> _afterMutation(NotifDao d) async {
     await _pushLists(d);
-    await onMutated?.call();
+    try {
+      await onMutated?.call();
+    } catch (_) {
+      // The mutation itself committed and was already acked ok; a rearm
+      // failure must not surface as a second, contradictory ack.
+    }
   }
 
   // ── ops ────────────────────────────────────────────────────────────
@@ -267,14 +284,7 @@ class NotifBridge {
         externalKey: key, scheduleId: schedule.id, nextFireAt: nextFireAt);
     var pos = 0;
     for (final it in items) {
-      await d.insertItem(
-        listId: list.id, externalId: it.externalId, title: it.title,
-        body: it.body, openUrl: it.openUrl, payloadJson: it.payloadJson,
-        position: pos++,
-        nextDueAt: offsets == null
-            ? null
-            : addWakingHours(t, offsets[0], w).millisecondsSinceEpoch,
-      );
+      await _insertParsedItem(d, list.id, it, pos++, offsets, t, w);
     }
     _ack(reqId, op, true);
     await _afterMutation(d);
@@ -284,18 +294,14 @@ class NotifBridge {
     const op = 'syncItems';
     final d = await _daoOrAck(reqId, op);
     if (d == null) return;
-    final key = m['external_key'] as String?;
     final items = _parseItems(m['items']);
     final mode = (m['mode'] as String?) ?? 'merge';
-    if (key == null || items == null || (mode != 'merge' && mode != 'replace')) {
+    if (items == null || (mode != 'merge' && mode != 'replace')) {
       _ack(reqId, op, false, error: 'bad_payload');
       return;
     }
-    final list = await d.listByExternalKey(activeProfileId(), key);
-    if (list == null) {
-      _ack(reqId, op, false, error: 'unknown_list');
-      return;
-    }
+    final list = await _listOrAck(d, reqId, op, m['external_key']);
+    if (list == null) return;
     final offsets = await _offsetsFor(d, list.scheduleId);
     final existing = await d.itemsForList(list.id);
     final byExt = {
@@ -310,14 +316,7 @@ class NotifBridge {
       seen.add(it.externalId);
       final cur = byExt[it.externalId];
       if (cur == null) {
-        await d.insertItem(
-          listId: list.id, externalId: it.externalId, title: it.title,
-          body: it.body, openUrl: it.openUrl, payloadJson: it.payloadJson,
-          position: pos,
-          nextDueAt: offsets == null
-              ? null
-              : addWakingHours(t, offsets[0], w).millisecondsSinceEpoch,
-        );
+        await _insertParsedItem(d, list.id, it, pos, offsets, t, w);
       } else {
         // Merge semantics (spec): content updates, SRS state (step,
         // next_due_at, status, history) survives.
@@ -365,7 +364,8 @@ class NotifBridge {
     final d = await _daoOrAck(reqId, op);
     if (d == null) return;
     final itemExt = m['item_external_id'] as String?;
-    final grade = (m['grade'] as num?)?.toInt();
+    final gradeRaw = m['grade'];
+    final grade = gradeRaw is int ? gradeRaw : null;
     if (itemExt == null || itemExt.isEmpty) {
       _ack(reqId, op, false, error: 'bad_payload');
       return;

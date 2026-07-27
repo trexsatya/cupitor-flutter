@@ -386,4 +386,52 @@ void main() {
       expect(lastAck()['error'], 'unknown_list');
     });
   });
+
+  group('review fixes', () {
+    test('non-string op → unknown_op ack, nothing thrown', () async {
+      await bridge.handle('{"op":5}');
+      expect(lastAck()['error'], 'unknown_op');
+    });
+    test('non-string request_id treated as absent', () async {
+      await bridge.handle('{"op":"getLists","request_id":7}');
+      expect(lastAck()['ok'], true);
+      expect(lastAck()['request_id'], isNull);
+    });
+    test('onMutated throwing does not produce a second ack', () async {
+      final local = NotifBridge(
+        dao: () async => dao,
+        activeProfileId: () => 1,
+        emit: (e, d) => events.add((e, d)),
+        capabilities: () async => const NotifCapabilities(
+            supported: true, permission: 'unknown', exactAlarms: false,
+            actions: false, platform: 'test'),
+        requestPermission: () async => 'unknown',
+        window: () => WakingWindow.defaults,
+        now: () => now,
+        onMutated: () async => throw StateError('boom'),
+      );
+      await local.handle(jsonEncode({
+        'op': 'createList', 'request_id': 'r-boom',
+        'external_key': 'boom-1', 'name': 'B', 'schedule_key': 'ebbinghaus',
+        'items': <Object>[],
+      }));
+      final acks = events.where((e) =>
+          e.$1 == 'cupitorNotifAck' && e.$2['request_id'] == 'r-boom');
+      expect(acks, hasLength(1));
+      expect(acks.single.$2['ok'], true);
+    });
+    test('fractional or string grade → bad_grade', () async {
+      await createFrenchList();
+      await bridge.handle(jsonEncode({
+        'op': 'grade', 'external_key': 'fr-1',
+        'item_external_id': 'c1', 'grade': 3.5,
+      }));
+      expect(lastAck()['error'], 'bad_grade');
+      await bridge.handle(jsonEncode({
+        'op': 'grade', 'external_key': 'fr-1',
+        'item_external_id': 'c1', 'grade': '3',
+      }));
+      expect(lastAck()['error'], 'bad_grade');
+    });
+  });
 }
