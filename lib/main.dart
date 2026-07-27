@@ -6764,6 +6764,25 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _showDialog1();
   }
 
+  /// Notification body tap: open dialog1 AT [url] (spec: open_url). This is
+  /// a NAVIGATION — it must not go through [_openDialogWithWebview], whose
+  /// argument is dictionary-lookup text (the page would "search" for the
+  /// URL string instead of loading it).
+  void _openDialogAtUrl(String url) {
+    final uri = Uri.tryParse(url);
+    if (dialogController == null) {
+      // Builds the controller + shows the dialog; empty text keeps the
+      // lookup filter and clipboard untouched.
+      _openDialogWithWebview('');
+    } else {
+      _currentDialogText = '';
+      _showDialog1();
+    }
+    if (uri != null && uri.hasScheme) {
+      dialogController?.loadRequest(uri);
+    }
+  }
+
   void _showDialog1() {
     if (dialogController == null) return;
     // Already on screen — nothing to push. The caller's content update via
@@ -7925,9 +7944,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
     final openUrl = p['open_url'] as String?;
     if (openUrl != null && openUrl.isNotEmpty) {
-      _openDialogWithWebview(openUrl);
-    } else {
+      _openDialogAtUrl(openUrl);
+    } else if (dialogController != null) {
       _showDialog1();
+    } else {
+      _openDialogWithWebview(''); // build + show at the default study page
     }
     _emitNotifEvent('cupitorNotificationOpened', {
       'external_key': p['list_ek'],
