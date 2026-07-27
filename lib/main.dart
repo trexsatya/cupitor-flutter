@@ -28,7 +28,7 @@ import 'memory_manager.dart';
 import 'notif/notif_bridge.dart';
 import 'notif/notif_channel.dart';
 import 'notif/notification_channel.dart';
-import 'notif/notification_service.dart';
+import 'notif/notif_runtime.dart';
 import 'notif/notif_settings.dart';
 import 'notif/notif_timer.dart';
 import 'playlist_service.dart';
@@ -39,47 +39,6 @@ import 'tag_capture.dart';
 import 'tag_filter.dart';
 import 'tag_settings.dart';
 import 'text_transform.dart';
-
-/// Feature-wide singletons. Channel choice: real plugin adapter where it
-/// delivers, noop shim on Windows/web (spec §Platform specifics).
-final NotifChannel notifChannel = FlutterNotifChannel.platformSupported
-    ? FlutterNotifChannel()
-    : NoopNotifChannel();
-
-final NotificationService notifService = NotificationService(
-  channel: notifChannel,
-  dao: () => CupitorDb.instance.notifDao(),
-  window: () => NotifSettings.window,
-  perFireCap: () => NotifSettings.perFireCap,
-  now: () => tz.TZDateTime.now(tz.local),
-  maxArmed: !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS ? 60 : 200,
-);
-
-/// Background isolate action handler (app may be dead). Boots just enough
-/// of the world — bindings, tz, db — grades, and rearms. No webview here;
-/// the webpage learns about the grade from the lists warm-push next launch.
-@pragma('vm:entry-point')
-Future<void> notifBackgroundActionHandler(
-    String actionId, String payloadJson) async {
-  try {
-    WidgetsFlutterBinding.ensureInitialized();
-    DartPluginRegistrant.ensureInitialized();
-    tzdata.initializeTimeZones();
-    try {
-      final zoneName = await FlutterTimezone.getLocalTimezone()
-          .timeout(const Duration(seconds: 2));
-      tz.setLocalLocation(tz.getLocation(zoneName));
-    } catch (_) {/* UTC */}
-    await NotifSettings.init();
-    await notifChannel.init(NotifCallbacks(
-      onOpened: (_) async {/* taps never route here */},
-      onAction: (_, __) async {},
-    ));
-    await notifService.handleAction(actionId, payloadJson);
-  } catch (e) {
-    debugPrint('notif background action failed: $e');
-  }
-}
 
 /// WorkManager entry point (Android periodic safety net, spec §Delivery:
 /// re-arms the window and sweeps missed fires ~every 30 min even if alarms
@@ -122,8 +81,6 @@ void main() async {
   } catch (e) {
     debugPrint('tz init failed, staying on UTC: $e');
   }
-  FlutterNotifChannel.backgroundHandler =
-      (actionId, payload) => notifBackgroundActionHandler(actionId, payload);
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     await Workmanager().initialize(notifWorkmanagerDispatcher);
     await Workmanager().registerPeriodicTask(
@@ -486,6 +443,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // waiting for onPageFinished). Critical for the Netflix manifest case —
     // autoplay fires before onPageFinished otherwise.
     _warmRemoteSnippetCache();
+    // Notification delivery must init on EVERY platform (Windows/web/Linux
+    // included), unlike the sentence-tagging DB probe below which is
+    // Android||iOS only — see _initNotifDelivery's doc comment.
+    _initNotifDelivery();
     // Probe sentence-tagging DB readiness in the background. The toolbar
     // tiles check this flag and hide themselves if the open failed (e.g.
     // on macOS host where sqflite isn't wired up).
@@ -496,28 +457,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         if (ok) {
           await ProfileService.init();
           await PlaylistService.init();
-          await NotifSettings.init();
-          await notifChannel.init(NotifCallbacks(
-            onOpened: _onNotificationOpened,
-            onAction: _onNotificationAction,
-          ));
-          // Terminated-tap: app was launched from a notification.
-          final nc = notifChannel;
-          if (nc is FlutterNotifChannel) {
-            final launch = await nc.launchPayload();
-            if (launch != null) {
-              // Defer until the first frame so dialog1 infrastructure exists.
-              WidgetsBinding.instance.addPostFrameCallback(
-                  (_) => _onNotificationOpened(launch));
-            }
-          }
-          await notifService.sweep(); // launch catch-up (spec: sweep callers)
-          if (kIsWeb ||
-              defaultTargetPlatform == TargetPlatform.windows ||
-              defaultTargetPlatform == TargetPlatform.linux ||
-              defaultTargetPlatform == TargetPlatform.macOS) {
-            _notifTimer.start();
-          }
           if (!mounted) return;
           await _loadProfileScopedPrefs();
           ProfileService.active.addListener(_onProfileChanged);
@@ -7935,6 +7874,33 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   Future<void> _pushNotifStateToDialog() async {
     await _notifBridge.handle('{"op":"getSchedules"}');
     await _notifBridge.handle('{"op":"getLists"}');
+  }
+
+  /// Notification delivery init — runs on EVERY platform (unlike the tagging
+  /// DB probe): on platforms without sqlite the dao resolves null and every
+  /// sweep no-ops (self-disable), but the channel and capabilities must still
+  /// initialize so getCapabilities answers honestly.
+  Future<void> _initNotifDelivery() async {
+    await NotifSettings.init();
+    await notifChannel.init(NotifCallbacks(
+      onOpened: _onNotificationOpened,
+      onAction: _onNotificationAction,
+    ));
+    final nc = notifChannel;
+    if (nc is FlutterNotifChannel) {
+      final launch = await nc.launchPayload();
+      if (launch != null) {
+        WidgetsBinding.instance.addPostFrameCallback(
+            (_) => _onNotificationOpened(launch));
+      }
+    }
+    await notifService.sweep(); // launch catch-up (spec: sweep callers)
+    if (kIsWeb ||
+        defaultTargetPlatform == TargetPlatform.windows ||
+        defaultTargetPlatform == TargetPlatform.linux ||
+        defaultTargetPlatform == TargetPlatform.macOS) {
+      _notifTimer.start();
+    }
   }
 
   /// Notification body tap → record response, open dialog1 at the item's

@@ -6,17 +6,22 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/timezone.dart' as tz;
 
 import 'notif_channel.dart';
+import 'notif_runtime.dart';
 import 'pending_fire.dart';
 
 /// Background action entry point — must be top-level with vm:entry-point so
-/// the engine can invoke it in a fresh isolate while the app is dead.
-/// Delegates to the handler main.dart registers (Task 8's
-/// notifBackgroundActionHandler); kept here so this file remains the only
-/// plugin importer.
+/// the engine can invoke it in a fresh isolate while the app is dead (or,
+/// on Android, even while the app is alive: `showsUserInterface: false`
+/// actions always route through the plugin's background dispatcher).
+/// Calls the isolate-safe top-level handler in notif_runtime.dart directly
+/// — NOT a mutable static set by main(), which would be null in this fresh
+/// isolate since main() never runs there. Kept here (rather than folded
+/// into notif_runtime.dart) so this file remains the only plugin importer;
+/// the resulting notification_channel <-> notif_runtime import cycle is
+/// legal Dart, and notif_runtime.dart itself never imports the plugin.
 @pragma('vm:entry-point')
 void notifBackgroundResponse(NotificationResponse response) {
-  FlutterNotifChannel.backgroundHandler?.call(response.actionId ?? '',
-      response.payload ?? '');
+  notifBackgroundActionHandler(response.actionId ?? '', response.payload ?? '');
 }
 
 /// flutter_local_notifications adapter. The ONLY file that imports the
@@ -27,9 +32,6 @@ class FlutterNotifChannel implements NotifChannel {
   static const String androidChannelId = 'cupitor_reviews';
   static const String androidChannelName = 'Review reminders';
   static const String darwinCategoryId = 'cupitorNotif';
-
-  /// Set by main.dart before init; used by the background entry point.
-  static void Function(String actionId, String payloadJson)? backgroundHandler;
 
   final _plugin = FlutterLocalNotificationsPlugin();
   NotifCallbacks? _callbacks;

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:cupitor/db.dart';
 import 'package:cupitor/notif/notif_dao.dart';
 import 'package:cupitor/notif/notification_service.dart';
+import 'package:cupitor/notif/pending_fire.dart';
 import 'package:cupitor/notif/waking_clock.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -369,5 +370,33 @@ void main() {
           'again', jsonEncode({'v': 1, 'item_id': item.id})), isNotNull);
       expect((await dao.itemById(item.id))!.step, 0);
     });
+
+    test('rearm survives a channel that throws on schedule', () async {
+      final throwing = _ThrowingChannel();
+      final svc = NotificationService(
+        channel: throwing,
+        dao: () async => dao,
+        window: () => WakingWindow.defaults,
+        perFireCap: () => 5,
+        now: () => now,
+        maxArmed: 60,
+      );
+      final l = await seriesList();
+      await dao.insertItem(
+          listId: l.id, title: 'a', position: 0, nextDueAt: nowMs() + 1000);
+      await dao.insertItem(
+          listId: l.id, title: 'b', position: 1, nextDueAt: nowMs() + 2000);
+      await svc.rearm(); // must not throw
+      expect(throwing.attempts, 2); // tried both, gave up per-fire
+    });
   });
+}
+
+class _ThrowingChannel extends FakeNotifChannel {
+  int attempts = 0;
+  @override
+  Future<void> schedule(PendingFire fire) async {
+    attempts++;
+    throw UnimplementedError();
+  }
 }

@@ -78,9 +78,16 @@ class NotificationService {
       final bucket = f.whenMs ~/ 60000;
       final inBucket = perMinute[bucket] ?? 0;
       if (inBucket >= cap) continue; // not armed; drains via the sweep once due (silent auto-advance)
+      try {
+        await channel.schedule(f);
+      } catch (e, _) {
+        // Platform can't schedule (e.g. Linux zonedSchedule): the sweep+showNow
+        // path still delivers while the app runs. Don't let one failure kill
+        // the rest of the window.
+        continue;
+      }
       perMinute[bucket] = inBucket + 1;
       armed++;
-      await channel.schedule(f);
     }
   }
 
