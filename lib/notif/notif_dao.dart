@@ -211,12 +211,14 @@ class NotifDao {
     return true;
   }
 
-  /// Delete a CUSTOM schedule. The caller must first verify no list uses it
-  /// (spec: deletion is blocked until those lists are reassigned). Builtin
-  /// or missing rows return false.
+  /// Delete a CUSTOM schedule. Refused (returns false) for builtin/missing
+  /// rows AND while any list still uses it (spec: deletion is blocked until
+  /// those lists are reassigned) — the UI's disabled button reads a stale
+  /// count, so the guard must live here.
   Future<bool> deleteCustomSchedule(int id) async {
     final s = await scheduleById(id);
     if (s == null || s.builtinKey != null) return false;
+    if ((await listsUsingSchedule(id)).isNotEmpty) return false;
     await db.delete('notif_schedules', where: 'id = ?', whereArgs: [id]);
     return true;
   }

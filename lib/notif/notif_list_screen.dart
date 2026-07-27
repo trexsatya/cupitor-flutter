@@ -29,6 +29,7 @@ class _NotifListScreenState extends State<NotifListScreen> {
   NotifScheduleRow? _schedule;
   List<NotifItemRow> _items = const [];
   bool _loading = true;
+  bool _unsupported = false;
 
   tz.TZDateTime get _now => tz.TZDateTime.now(tz.local);
 
@@ -40,7 +41,11 @@ class _NotifListScreenState extends State<NotifListScreen> {
 
   Future<void> _load() async {
     final d = await widget.dao();
-    if (d == null) return;
+    if (d == null) {
+      // Self-disable posture: show the notice, never a dead spinner.
+      if (mounted) setState(() { _unsupported = true; _loading = false; });
+      return;
+    }
     final list = await d.listById(widget.listId);
     if (list == null) {
       // Deleted underneath us (e.g. by the webpage) — nothing to show.
@@ -62,7 +67,17 @@ class _NotifListScreenState extends State<NotifListScreen> {
   Future<void> _mutate(Future<void> Function(NotifDao d) fn) async {
     final d = await widget.dao();
     if (d == null) return;
-    await fn(d);
+    try {
+      await fn(d);
+    } catch (_) {
+      // Never-crash posture: a storage failure surfaces, nothing throws
+      // into the framework.
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Could not save the change.')));
+      }
+      return;
+    }
     await widget.rearm();
     await _load();
   }
@@ -240,6 +255,22 @@ class _NotifListScreenState extends State<NotifListScreen> {
   }
 
   Future<void> _deleteItem(NotifItemRow item) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete item?'),
+        content: Text('"${item.title}" and its review history will be removed.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok != true) return;
     await _mutate((d) => d.deleteItem(item.id));
   }
 
@@ -248,6 +279,18 @@ class _NotifListScreenState extends State<NotifListScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    if (_unsupported) {
+      return Scaffold(
+        appBar: AppBar(),
+        body: const Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child:
+                Text('Notifications are not available on this platform.'),
+          ),
+        ),
+      );
+    }
     if (_loading || _list == null) {
       return Scaffold(
         appBar: AppBar(),

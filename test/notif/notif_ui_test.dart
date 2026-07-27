@@ -229,6 +229,36 @@ void main() {
       expect(rearms, 1);
     });
 
+    testWidgets('dao-null shows the unsupported notice, not a spinner',
+        (tester) async {
+      await pumpPushed(tester,
+          NotifListScreen(listId: 1, dao: () async => null, rearm: rearm));
+      expect(find.textContaining('not available'), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+    });
+
+    testWidgets('delete item asks for confirmation first', (tester) async {
+      final s = await dao.scheduleByKey('cepeda2x');
+      final l = await dao.createList(
+          profileId: 1, name: 'Deck', source: 'app', scheduleId: s!.id);
+      final it = await dao.insertItem(
+          listId: l.id, title: 'doomed', position: 0);
+
+      await pumpPushed(tester,
+          NotifListScreen(listId: l.id, dao: daoGetter, rearm: rearm));
+      await tester.tap(find.descendant(
+          of: find.byType(ListTile),
+          matching: find.byType(PopupMenuButton<String>)));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Delete'));
+      await tester.pumpAndSettle();
+      // Confirm dialog appeared; cancel keeps the item.
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(await dao.itemById(it.id), isNotNull);
+      expect(rearms, 0);
+    });
+
     testWidgets('pause via the list menu', (tester) async {
       final s = await dao.scheduleByKey('daily_0900');
       final l = await dao.createList(

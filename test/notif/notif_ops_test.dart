@@ -102,6 +102,22 @@ void main() {
       expect(await dao.deleteCustomSchedule(builtin!.id), isFalse);
       expect(await dao.scheduleById(builtin.id), isNotNull);
     });
+
+    test('deleteCustomSchedule refuses while any list uses it (review fix)',
+        () async {
+      final c = await dao.createCustomSchedule(
+          name: 'held',
+          kind: 'series',
+          config: {'offsets_waking_hours': [1]});
+      final l = await dao.createList(
+          profileId: 1, name: 'holder', source: 'app', scheduleId: c.id);
+      // The UI button may act on a stale use-count; the DAO is the guard.
+      expect(await dao.deleteCustomSchedule(c.id), isFalse);
+      expect(await dao.scheduleById(c.id), isNotNull);
+
+      await dao.deleteList(l.id);
+      expect(await dao.deleteCustomSchedule(c.id), isTrue);
+    });
   });
 
   group('notif_ops', () {

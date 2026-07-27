@@ -72,6 +72,12 @@ An entry in `items[]`:
 `title`, or one duplicate `external_id`, rejects the whole op with
 `bad_payload` and changes nothing.
 
+**Text length:** the app stores `title`/`body` unlimited (SQLite TEXT), but
+the OS truncates what a notification shows — Android caps each field at
+1024 chars and displays far less (title ~1 line, body 1–2 lines collapsed);
+iOS banners show ~1–2 lines. Recommended: title ≤ 50 chars, body ≤ 240.
+Full text is always visible in the app's manager UI regardless.
+
 ### Identity rules
 
 You address everything by your own `external_key` (list) and `external_id`

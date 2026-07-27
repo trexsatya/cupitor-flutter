@@ -255,7 +255,7 @@ class _ScheduleEditorScreenState extends State<ScheduleEditorScreen> {
       }
     }
     return {
-      'times': [for (final t in (_times..sort())) minutesToHhmm(t)],
+      'times': [for (final t in ([..._times]..sort())) minutesToHhmm(t)],
       'days': _days.toList()..sort(),
       'per_fire': _perFire,
     };
@@ -288,13 +288,19 @@ class _ScheduleEditorScreenState extends State<ScheduleEditorScreen> {
         // Re-anchor every list still on this schedule so next fire / due
         // times follow the new config immediately.
         final updated = await d.scheduleById(widget.existing!.id);
-        final now = tz.TZDateTime.now(tz.local);
-        for (final l in await d.listsUsingSchedule(widget.existing!.id)) {
-          await applyScheduleToList(d, l, updated!, now, NotifSettings.window);
+        if (updated != null) {
+          final now = tz.TZDateTime.now(tz.local);
+          for (final l in await d.listsUsingSchedule(updated.id)) {
+            await applyScheduleToList(d, l, updated, now, NotifSettings.window);
+          }
         }
       }
     } on ScheduleConfigError catch (e) {
       setState(() => _error = scheduleErrorMessage(e));
+      return;
+    } catch (_) {
+      // Storage failure: surface it, never throw into the framework.
+      setState(() => _error = 'Could not save the schedule.');
       return;
     }
     await widget.rearm();

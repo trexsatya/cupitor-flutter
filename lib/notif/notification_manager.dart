@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:timezone/timezone.dart' as tz;
+import 'package:url_launcher/url_launcher.dart';
 
 import '../db.dart';
 import '../profile_service.dart';
@@ -103,9 +104,19 @@ class _NotificationManagerScreenState extends State<NotificationManagerScreen> {
   }
 
   Future<void> _onRequestPermission() async {
-    await _requestPermission();
+    final result = await _requestPermission();
     await _rearm();
     await _load();
+    if (result == 'granted' || !mounted) return;
+    // Android 13+ never re-prompts after a permanent denial — point at the
+    // system settings instead (iOS/macOS get a real deep-link).
+    final opened = await launchUrl(Uri.parse('app-settings:'))
+        .catchError((_) => false);
+    if (!opened && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text(
+              'Enable notifications for Cupitor in system settings.')));
+    }
   }
 
   Future<void> _editWindow() async {
@@ -126,11 +137,13 @@ class _NotificationManagerScreenState extends State<NotificationManagerScreen> {
     if (end == null || !mounted) return;
     final startM = start.hour * 60 + start.minute;
     final endM = end.hour * 60 + end.minute;
-    if (startM == endM) {
-      // A zero-length window degenerates to "always awake" in the engine;
-      // the settings UI must not author one (spec §waking clock).
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Start and end must differ.')));
+    // The editor blocks the degenerate (always-awake) and inverted windows
+    // the engine merely tolerates (spec §In-app UI validation).
+    if (startM >= endM) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(startM == endM
+              ? 'Start and end must differ.'
+              : 'Wake-up must be earlier than bedtime.')));
       return;
     }
     await NotifSettings.setWindow(minutesToHhmm(startM), minutesToHhmm(endM));
@@ -150,6 +163,12 @@ class _NotificationManagerScreenState extends State<NotificationManagerScreen> {
     final nameCtrl = TextEditingController();
     final schedules = await d.listSchedules();
     if (!mounted) return;
+    if (schedules.isEmpty) {
+      // Only possible if the builtin seed failed — degrade, don't throw.
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No schedules available.')));
+      return;
+    }
     NotifScheduleRow selected = schedules.first;
     final ok = await showDialog<bool>(
       context: context,
