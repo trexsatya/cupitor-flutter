@@ -17,6 +17,8 @@ class WakingWindow {
   /// loop forever if the DB holds one; arithmetic becomes plain addition).
   bool get alwaysAwake => startMinutes == endMinutes;
 
+  /// Expects zero-padded 'HH:mm' already validated upstream (the
+  /// schedule-config validator); does not range-check.
   static WakingWindow fromStrings(String start, String end) => WakingWindow(
       startMinutes: _hhmm(start), endMinutes: _hhmm(end));
 
@@ -49,12 +51,17 @@ tz.TZDateTime _nextWall(tz.TZDateTime t, int minutes) {
   return d;
 }
 
+/// Assumes the window is wider than a DST gap; a window ≤1h landing exactly
+/// on a transition hour can return an instant isAwake rejects.
 tz.TZDateTime nextWakingInstant(tz.TZDateTime t, WakingWindow w) =>
     isAwake(t, w) ? t : _nextWall(t, w.startMinutes);
 
 /// Invariant: the result is never inside the sleep window. Landing exactly on
 /// the sleep boundary rolls to the next wake start (strict `<` below).
+/// Precondition: [hours] >= 0 — a negative value would walk back into the
+/// sleep window unchecked.
 tz.TZDateTime addWakingHours(tz.TZDateTime from, double hours, WakingWindow w) {
+  assert(hours >= 0);
   var remainingMs = (hours * 3600 * 1000).round();
   if (w.alwaysAwake) return from.add(Duration(milliseconds: remainingMs));
   var t = nextWakingInstant(from, w);
