@@ -71,11 +71,13 @@ class NotificationService {
     final cap = perFireCap();
     final perMinute = <int, int>{};
     var armed = 0;
+    final seenIds = <int>{};
     for (final f in fires) {
       if (armed >= maxArmed) break;
+      if (!seenIds.add(f.notifId)) continue; // same item via two paths
       final bucket = f.whenMs ~/ 60000;
       final inBucket = perMinute[bucket] ?? 0;
-      if (inBucket >= cap) continue; // deferred: next rearm picks it up
+      if (inBucket >= cap) continue; // not armed; drains via the sweep once due (silent auto-advance)
       perMinute[bucket] = inBucket + 1;
       armed++;
       await channel.schedule(f);
@@ -200,23 +202,28 @@ class NotificationService {
               t, w) <=
           graceWakingHours;
       var newCursor = list.cursor;
+      var firedAny = false;
       if (withinGrace) {
-        final items = await d.itemsForList(list.id);
-        final sel = takeForFire<NotifItemRow>(
-            items, list.cursor, cfg.perFire, (i) => i.status == 'active');
-        for (final item in sel.items) {
-          if (posted >= cap) break;
-          posted++;
-          await channel.showNow(
-              await _itemFire(d, item, nowMs, withActions: false));
-          await d.updateItem(item.id, {'last_fired_at': nowMs});
-          await d.insertEvent(itemId: item.id, firedAt: nowMs);
+        final capacity = cap - posted;
+        if (capacity > 0) {
+          final items = await d.itemsForList(list.id);
+          final take = cfg.perFire < capacity ? cfg.perFire : capacity;
+          final sel = takeForFire<NotifItemRow>(
+              items, list.cursor, take, (i) => i.status == 'active');
+          for (final item in sel.items) {
+            posted++;
+            await channel.showNow(
+                await _itemFire(d, item, nowMs, withActions: false));
+            await d.updateItem(item.id, {'last_fired_at': nowMs});
+            await d.insertEvent(itemId: item.id, firedAt: nowMs);
+          }
+          newCursor = sel.newCursor;
+          firedAny = sel.items.isNotEmpty;
         }
-        newCursor = sel.newCursor;
       }
       await d.updateList(list.id, {
         'cursor': newCursor,
-        'last_fired_at': withinGrace ? nowMs : list.lastFiredAt,
+        'last_fired_at': firedAny ? nowMs : list.lastFiredAt,
         'next_fire_at':
             nextRecurringFire(cfg, t, w).millisecondsSinceEpoch,
       });
@@ -261,6 +268,7 @@ class NotificationService {
     if (itemId is! int) return null;
     final item = await d.itemById(itemId);
     if (item == null) return null;
+    if (item.status == 'done' && grade != gradeAgain) return null;
     final offsets = await _offsetsForList(d, item.listId);
     if (offsets == null) return null; // not a series list (or list gone)
 

@@ -314,4 +314,60 @@ void main() {
       expect(ev.respondedAt, nowMs());
     });
   });
+
+  group('review fixes', () {
+    test('recurring rotation is not consumed when the global cap is exhausted',
+        () async {
+      final l = await seriesList();
+      for (var i = 0; i < 5; i++) {
+        await dao.insertItem(
+            listId: l.id, title: 's$i', position: i, nextDueAt: nowMs() - 1000 - i);
+      }
+      final daily = await dao.scheduleByKey('daily_0900');
+      final r = await dao.createList(
+          profileId: 1, name: 'R', source: 'app',
+          scheduleId: daily!.id, nextFireAt: nowMs() - 60000);
+      await dao.insertItem(listId: r.id, title: 'r0', position: 0);
+      await service.sweep();
+      expect(channel.shown, hasLength(5)); // series ate the cap
+      final after = (await dao.listById(r.id))!;
+      expect(after.cursor, 0); // rotation NOT consumed
+      expect(after.lastFiredAt, isNull); // no phantom fire stamp
+      expect(after.nextFireAt, greaterThan(nowMs())); // still rescheduled
+    });
+
+    test('an item reachable via both series and recurring paths arms once',
+        () async {
+      final daily = await dao.scheduleByKey('daily_0900');
+      final r = await dao.createList(
+          profileId: 1, name: 'R', source: 'app',
+          scheduleId: daily!.id, nextFireAt: nowMs() + 7200000);
+      // Leftover series state on a recurring-list item:
+      await dao.insertItem(
+          listId: r.id, title: 'r0', position: 0, nextDueAt: nowMs() + 3600000);
+      await service.rearm();
+      expect(channel.scheduled, hasLength(1));
+      expect(channel.scheduled.single.whenMs, nowMs() + 3600000); // earliest wins
+    });
+
+    test('good on a done item is a silent no-op', () async {
+      final l = await seriesList();
+      // Single-rung custom ladder graduates on first fire.
+      final s = await dao.createCustomSchedule(
+          name: 'One', kind: 'series', config: {'offsets_waking_hours': [1]});
+      await dao.updateList(l.id, {'schedule_id': s.id});
+      final item = await dao.insertItem(
+          listId: l.id, title: 'x', position: 0, nextDueAt: nowMs() - 1000);
+      await service.sweep(); // graduates: done
+      final evCountBefore = (await dao.lastEventForItem(item.id))!.id;
+      expect(await service.handleAction(
+          'good', jsonEncode({'v': 1, 'item_id': item.id})), isNull);
+      expect((await dao.itemById(item.id))!.lastGrade, isNull);
+      expect((await dao.lastEventForItem(item.id))!.id, evCountBefore);
+      // Again still resurrects:
+      expect(await service.handleAction(
+          'again', jsonEncode({'v': 1, 'item_id': item.id})), isNotNull);
+      expect((await dao.itemById(item.id))!.step, 0);
+    });
+  });
 }
