@@ -198,6 +198,7 @@ class NotifBridge {
         'source': l.source,
         'schedule_key': schedule?.key,
         'intro_schedule_key': introSchedule?.key,
+        'open_url': l.openUrl,
         'status': l.status,
         'next_fire_at': l.nextFireAt,
         'items': [
@@ -296,6 +297,11 @@ class NotifBridge {
     }
     final (handled, intro) = await _resolveIntro(d, reqId, op, m, schedule);
     if (handled) return;
+    final listOpenUrl = m['open_url'];
+    if (listOpenUrl != null && listOpenUrl is! String) {
+      _ack(reqId, op, false, error: 'bad_payload');
+      return;
+    }
     final w = window();
     final t = now();
     // With an intro cadence: items stay unseeded (they are the intro queue)
@@ -307,7 +313,8 @@ class NotifBridge {
     final list = await d.createList(
         profileId: profileId, name: name, source: 'webpage',
         externalKey: key, scheduleId: schedule.id,
-        introScheduleId: intro?.id, nextFireAt: nextFireAt);
+        introScheduleId: intro?.id, openUrl: listOpenUrl as String?,
+        nextFireAt: nextFireAt);
     var pos = 0;
     for (final it in items) {
       await _insertParsedItem(d, list.id, it, pos++, offsets, t, w);
@@ -328,6 +335,16 @@ class NotifBridge {
     }
     final list = await _listOrAck(d, reqId, op, m['external_key']);
     if (list == null) return;
+    // List-level deep link: present-and-string sets, present-and-null
+    // clears, absent leaves unchanged.
+    if (m.containsKey('open_url')) {
+      final v = m['open_url'];
+      if (v != null && v is! String) {
+        _ack(reqId, op, false, error: 'bad_payload');
+        return;
+      }
+      await d.updateList(list.id, {'open_url': v});
+    }
     // Intro lists: new items join the intro queue unseeded.
     final offsets = list.introScheduleId != null
         ? null

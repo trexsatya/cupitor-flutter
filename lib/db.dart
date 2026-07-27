@@ -45,8 +45,10 @@ class CupitorDb {
   // seven built-in schedules. Additive only — no existing table is touched.
   // v8: notif_lists.intro_schedule_id — optional recurring "introduction"
   // cadence for series lists (items drip-fired, then follow their ladder).
-  // Additive only: one nullable column, no existing data touched.
-  static const int _schemaVersion = 8;
+  // v9: notif_lists.open_url — list-level default notification deep link
+  // (items without their own open_url inherit it).
+  // Both additive only: nullable columns, no existing data touched.
+  static const int _schemaVersion = 9;
   static const String _fileName = 'cupitor.db';
   static const int defaultProfileId = 1;
 
@@ -312,6 +314,15 @@ class CupitorDb {
             'intro_schedule_id INTEGER REFERENCES notif_schedules(id)');
       }
     }
+    if (oldV < 9) {
+      // Same idempotence rationale as the v8 step.
+      final cols = await db.rawQuery('PRAGMA table_info(notif_lists)');
+      final has = cols.any((c) => c['name'] == 'open_url');
+      if (!has) {
+        await db.execute(
+            'ALTER TABLE notif_lists ADD COLUMN open_url TEXT');
+      }
+    }
   }
 
   /// v7 notification tables. Shared by createSchema (fresh install) and the
@@ -336,6 +347,7 @@ class CupitorDb {
         external_key  TEXT,
         schedule_id   INTEGER REFERENCES notif_schedules(id),
         intro_schedule_id INTEGER REFERENCES notif_schedules(id),
+        open_url      TEXT,
         status        TEXT NOT NULL,
         cursor        INTEGER NOT NULL DEFAULT 0,
         next_fire_at  INTEGER,

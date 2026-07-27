@@ -162,7 +162,8 @@ class NotificationService {
         'item_id': item.id,
         'list_ek': list?.externalKey,
         'item_eid': item.externalId,
-        'open_url': item.openUrl,
+        // Per-item deep link wins; the list-level default (v9) fills in.
+        'open_url': item.openUrl ?? list?.openUrl,
         'echo': item.payload == null ? null : jsonDecode(item.payload!),
       }),
       groupKey: 'cupitor-notif-list-${item.listId}',

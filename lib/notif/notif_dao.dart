@@ -45,6 +45,10 @@ class NotifListRow {
   /// the main schedule is a series. Items with no series state yet are
   /// drip-fired by this schedule and seeded onto the ladder at that moment.
   final int? introScheduleId;
+
+  /// List-level default notification deep link (v9): items without their
+  /// own open_url inherit this on tap.
+  final String? openUrl;
   final String status; // 'active' | 'paused'
   final int cursor;
   final int? nextFireAt;
@@ -54,7 +58,7 @@ class NotifListRow {
   const NotifListRow({
     required this.id, required this.profileId, required this.name,
     required this.source, required this.externalKey, required this.scheduleId,
-    required this.introScheduleId,
+    required this.introScheduleId, required this.openUrl,
     required this.status, required this.cursor, required this.nextFireAt,
     required this.lastFiredAt, required this.createdAt, required this.updatedAt,
   });
@@ -67,6 +71,7 @@ class NotifListRow {
         externalKey: m['external_key'] as String?,
         scheduleId: m['schedule_id'] as int?,
         introScheduleId: m['intro_schedule_id'] as int?,
+        openUrl: m['open_url'] as String?,
         status: m['status'] as String,
         cursor: (m['cursor'] as num?)?.toInt() ?? 0,
         nextFireAt: (m['next_fire_at'] as num?)?.toInt(),
@@ -241,20 +246,21 @@ class NotifDao {
     String? externalKey,
     int? scheduleId,
     int? introScheduleId,
+    String? openUrl,
     int? nextFireAt,
   }) async {
     final now = _now();
     final id = await db.insert('notif_lists', {
       'profile_id': profileId, 'name': name, 'source': source,
       'external_key': externalKey, 'schedule_id': scheduleId,
-      'intro_schedule_id': introScheduleId,
+      'intro_schedule_id': introScheduleId, 'open_url': openUrl,
       'status': 'active', 'cursor': 0, 'next_fire_at': nextFireAt,
       'created_at': now, 'updated_at': now,
     });
     return NotifListRow(
         id: id, profileId: profileId, name: name, source: source,
         externalKey: externalKey, scheduleId: scheduleId,
-        introScheduleId: introScheduleId, status: 'active',
+        introScheduleId: introScheduleId, openUrl: openUrl, status: 'active',
         cursor: 0, nextFireAt: nextFireAt, lastFiredAt: null,
         createdAt: now, updatedAt: now);
   }

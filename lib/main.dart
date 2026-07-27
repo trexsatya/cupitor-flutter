@@ -6753,6 +6753,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // so it can render manual cards without an explicit fetch.
               _pushPlaylistsToDialog();
               _pushNotifStateToDialog();
+              // Notification tap that triggered this load: deliver the
+              // opened-event to the page now that its JS context exists.
+              final pendingOpened = _pendingNotifOpenedEvent;
+              if (pendingOpened != null) {
+                _pendingNotifOpenedEvent = null;
+                _emitNotifEvent('cupitorNotificationOpened', pendingOpened);
+              }
             },
           ),
         )
@@ -7943,19 +7950,34 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       return;
     }
     final openUrl = p['open_url'] as String?;
+    // When a page load is in flight (cold start, or an open_url navigation)
+    // an immediate emit lands in the JS context that's about to be replaced
+    // and is lost. Stash the event; onPageFinished replays it.
+    var navigating = false;
     if (openUrl != null && openUrl.isNotEmpty) {
+      navigating = true;
       _openDialogAtUrl(openUrl);
     } else if (dialogController != null) {
       _showDialog1();
     } else {
+      navigating = true;
       _openDialogWithWebview(''); // build + show at the default study page
     }
-    _emitNotifEvent('cupitorNotificationOpened', {
+    final detail = <String, Object?>{
       'external_key': p['list_ek'],
       'item_external_id': p['item_eid'],
       'payload': p['echo'],
-    });
+    };
+    if (navigating) {
+      _pendingNotifOpenedEvent = detail;
+    } else {
+      _emitNotifEvent('cupitorNotificationOpened', detail);
+    }
   }
+
+  /// Set while a notification-tap navigation is loading; replayed by the
+  /// dialog's onPageFinished so the (re)loaded page still gets the event.
+  Map<String, Object?>? _pendingNotifOpenedEvent;
 
   /// Foreground action button → grade via the shared service path, then
   /// mirror to the webpage so its state doesn't drift (spec:

@@ -49,8 +49,8 @@ On dialog load the app warm-pushes `cupitorNotifSchedules` and
 | `requestPermission` | — | ack `data: {permission}` (triggers the OS prompt) |
 | `getSchedules` | — | `cupitorNotifSchedules` event, then ack |
 | `getLists` | — | `cupitorNotifLists` event, then ack |
-| `createList` | `external_key`, `name`, `schedule_key?` (default `'ebbinghaus'`), `intro_schedule_key?`, `items[]` | ack, then `cupitorNotifLists` push |
-| `syncItems` | `external_key`, `items[]`, `mode?` (`'merge'` default \| `'replace'`) | ack, then push |
+| `createList` | `external_key`, `name`, `schedule_key?` (default `'ebbinghaus'`), `intro_schedule_key?`, `open_url?`, `items[]` | ack, then `cupitorNotifLists` push |
+| `syncItems` | `external_key`, `items[]`, `mode?` (`'merge'` default \| `'replace'`), `open_url?` | ack, then push |
 | `setSchedule` | `external_key`, `schedule_key`, `intro_schedule_key?` | ack, then push |
 | `setStatus` | `external_key`, `status` (`'active'` \| `'paused'`) | ack, then push |
 | `deleteList` | `external_key` | ack, then push |
@@ -146,12 +146,17 @@ next fire to now.
 | `cupitorNotifGraded` | `{external_key, item_external_id, grade, source}` | any grade: `source` ∈ `'webpage'` \| `'action'` (notification button) \| `'auto'` |
 | `cupitorNotificationOpened` | `{external_key, item_external_id, payload}` | user tapped a notification body; dialog1 is opened at the item's `open_url` first |
 
-Deep-link choice per item: when `open_url` is set, the tap NAVIGATES dialog1
-there — the page reloads, so encode everything you need in the URL (the
-`cupitorNotificationOpened` event fires into the page being replaced and is
-effectively lost). When `open_url` is omitted, no navigation happens and the
-already-loaded page receives the event to handle in place — the better fit
-for SPA-style view switching.
+Deep-link resolution on tap: the item's own `open_url` wins, else the
+**list-level `open_url`** (set it once on `createList`, or via `syncItems` —
+present-string updates it, explicit `null` clears it, absent leaves it), else
+no navigation. Prefer the list-level field when the link is the same for
+every item — don't repeat it per item.
+
+When a tap navigates (any `open_url` resolved), the page reloads —
+`cupitorNotificationOpened` is delivered again AFTER the new page finishes
+loading, so you can rely on the event in both patterns; with `open_url` you
+can also read your own URL params. With no `open_url` at all, no reload
+happens and the live page just gets the event — best for SPA view switching.
 
 `cupitorNotifGraded` with `source:'action'` is how you learn about grades made
 from notification buttons while your page wasn't looking; a grade made while

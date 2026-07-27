@@ -175,6 +175,42 @@ class _NotifListScreenState extends State<NotifListScreen> {
         d, _list!, picked, _now, NotifSettings.window, intro: intro));
   }
 
+  /// List-level notification deep link (v9): items without their own
+  /// open_url inherit it on tap. Empty input clears it.
+  Future<void> _editOpenUrl() async {
+    final ctrl = TextEditingController(text: _list!.openUrl ?? '');
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Open link'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'URL opened on notification tap',
+            helperText: 'Applies to every item without its own link. '
+                'Leave empty to just show the study page.',
+            border: OutlineInputBorder(),
+            isDense: true,
+          ),
+          onSubmitted: (_) => Navigator.pop(ctx, ctrl.text),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, ctrl.text),
+              child: const Text('OK')),
+        ],
+      ),
+    );
+    if (result == null) return;
+    final v = result.trim();
+    await _mutate(
+        (d) => d.updateList(_list!.id, {'open_url': v.isEmpty ? null : v}));
+  }
+
   Future<void> _togglePaused() async {
     final next = _list!.status == 'paused' ? 'active' : 'paused';
     await _mutate(
@@ -365,6 +401,7 @@ class _NotifListScreenState extends State<NotifListScreen> {
             onSelected: (v) => switch (v) {
               'rename' => _rename(),
               'schedule' => _changeSchedule(),
+              'openUrl' => _editOpenUrl(),
               'pause' => _togglePaused(),
               'delete' => _deleteList(),
               _ => Future<void>.value(),
@@ -373,6 +410,8 @@ class _NotifListScreenState extends State<NotifListScreen> {
               const PopupMenuItem(value: 'rename', child: Text('Rename')),
               const PopupMenuItem(
                   value: 'schedule', child: Text('Change schedule')),
+              const PopupMenuItem(
+                  value: 'openUrl', child: Text('Set open link')),
               PopupMenuItem(
                   value: 'pause', child: Text(paused ? 'Resume' : 'Pause')),
               const PopupMenuItem(value: 'delete', child: Text('Delete list')),
