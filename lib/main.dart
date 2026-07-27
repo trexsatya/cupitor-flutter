@@ -3,7 +3,7 @@ import 'dart:async';
 import 'dart:io' show Platform, File, Directory;
 import 'dart:math' as math;
 import 'package:path_provider/path_provider.dart';
-import 'package:flutter/foundation.dart' show compute, debugPrint;
+import 'package:flutter/foundation.dart' show compute, debugPrint, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
@@ -22,6 +22,8 @@ import 'yt_dlp_service.dart';
 import 'epub_reader.dart';
 import 'db.dart';
 import 'memory_manager.dart';
+import 'notif/notif_bridge.dart';
+import 'notif/notif_settings.dart';
 import 'playlist_service.dart';
 import 'profile_service.dart';
 import 'tag_browser.dart';
@@ -193,6 +195,25 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // Fullscreen toggle for dialog1. Notifier (not bare field) so the showDialog
   // route — which lives outside the outer State's setState scope — rebuilds.
   final ValueNotifier<bool> _dialog1FullscreenNotifier = ValueNotifier(false);
+  // Language-app ↔ Cupitor bridge for the notification feature (spec:
+  // docs/superpowers/specs/2026-07-27-notifications-design.md §Bridge).
+  // Permission/exact-alarm/action capabilities are stubbed until the
+  // delivery layer (Plan 2) supplies real ones through these callbacks.
+  late final NotifBridge _notifBridge = NotifBridge(
+    dao: () => CupitorDb.instance.notifDao(),
+    activeProfileId: () => ProfileService.currentId,
+    emit: _emitNotifEvent,
+    capabilities: () async => NotifCapabilities(
+      supported: await CupitorDb.instance.isReady(),
+      permission: 'unknown',
+      exactAlarms: false,
+      actions: false,
+      platform: defaultTargetPlatform.name,
+    ),
+    requestPermission: () async => 'unknown',
+    window: () => NotifSettings.window,
+    now: () => tz.TZDateTime.now(tz.local),
+  );
   // Web Speech Synthesis bridge for dialog1. The Android WebView does not
   // implement window.speechSynthesis, so the dictionary page's TTS calls go
   // through a JS-side polyfill that posts here. We speak one utterance at a
@@ -376,6 +397,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         if (ok) {
           await ProfileService.init();
           await PlaylistService.init();
+          await NotifSettings.init();
           if (!mounted) return;
           await _loadProfileScopedPrefs();
           ProfileService.active.addListener(_onProfileChanged);
@@ -6604,6 +6626,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         //     dialog1 and opens the EPUB reader at the given chapter.
         ..addJavaScriptChannel('PlaylistBridge',
             onMessageReceived: (msg) => _handlePlaylistBridge(msg.message))
+        // Language-app ↔ Cupitor bridge for the notification feature.
+        // Ops + events: spec §Bridge. Acks via cupitorNotifAck.
+        ..addJavaScriptChannel('NotifBridge',
+            onMessageReceived: (msg) => _notifBridge.handle(msg.message))
         ..setNavigationDelegate(
           NavigationDelegate(
             onPageStarted: (url) {
@@ -6658,6 +6684,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // Warm the language app with the current playlist state
               // so it can render manual cards without an explicit fetch.
               _pushPlaylistsToDialog();
+              _pushNotifStateToDialog();
             },
           ),
         )
@@ -7768,6 +7795,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           "window.dispatchEvent(new CustomEvent('cupitorPlaylists', { detail: window.__cupitorPlaylistsPayload }));";
       await ctrl.runJavaScript(js);
     } catch (_) { /* dialog1 not loaded yet — safe to ignore */ }
+  }
+
+  /// Dispatch a notification-bridge CustomEvent into dialog1. Same
+  /// global-then-dispatch pattern as _pushPlaylistsToDialog so a listener
+  /// that attaches late can still read the current state.
+  void _emitNotifEvent(String event, Map<String, Object?> detail) {
+    final ctrl = dialogController;
+    if (ctrl == null) return;
+    final payload = jsonEncode(detail);
+    final js = "window.__$event = $payload;"
+        "window.dispatchEvent(new CustomEvent('$event', { detail: window.__$event }));";
+    ctrl.runJavaScript(js).catchError((_) {/* dialog1 not loaded yet */});
+  }
+
+  /// Warm the language app with schedules + lists on page load, mirroring
+  /// the playlist warm-push. Routed through the bridge's own ops so the
+  /// payloads stay single-sourced; the stray acks are harmless.
+  Future<void> _pushNotifStateToDialog() async {
+    await _notifBridge.handle('{"op":"getSchedules"}');
+    await _notifBridge.handle('{"op":"getLists"}');
   }
 
   /// Handle a JSON message from the language app via the
