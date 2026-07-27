@@ -3,7 +3,7 @@ import 'dart:async';
 import 'dart:io' show Platform, File, Directory;
 import 'dart:math' as math;
 import 'package:path_provider/path_provider.dart';
-import 'package:flutter/foundation.dart' show compute;
+import 'package:flutter/foundation.dart' show compute, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
@@ -38,9 +38,11 @@ void main() async {
   // rather than crashing.
   tzdata.initializeTimeZones();
   try {
-    final zoneName = await FlutterTimezone.getLocalTimezone();
+    final zoneName = await FlutterTimezone.getLocalTimezone().timeout(const Duration(seconds: 2));
     tz.setLocalLocation(tz.getLocation(zoneName));
-  } catch (_) {/* tz.local stays UTC */}
+  } catch (e) {
+    debugPrint('tz init failed, staying on UTC: $e');
+  }
   // Hide both system bars for maximum reading area, but rely on
   // `immersiveSticky` so the user can swipe from any edge to transiently
   // reveal them (status bar top, back / home / recents bottom). They
