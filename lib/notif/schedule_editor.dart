@@ -82,7 +82,14 @@ class _ScheduleListScreenState extends State<ScheduleListScreen> {
     if (ok != true) return;
     final d = await widget.dao();
     if (d == null) return;
-    await d.deleteCustomSchedule(s.id);
+    final deleted = await d.deleteCustomSchedule(s.id);
+    if (!deleted && mounted) {
+      // The DAO guard caught a stale use-count (a list adopted the schedule
+      // after this screen loaded).
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content:
+              Text('Schedule is now in use — reassign those lists first.')));
+    }
     await widget.rearm();
     await _load();
   }
@@ -264,7 +271,7 @@ class _ScheduleEditorScreenState extends State<ScheduleEditorScreen> {
   Future<void> _save() async {
     setState(() => _error = null);
     final d = await widget.dao();
-    if (d == null) return;
+    if (d == null || !mounted) return;
     final name = _nameCtrl.text.trim();
     if (name.isEmpty) {
       setState(() => _error = 'Name is required.');
@@ -282,7 +289,9 @@ class _ScheduleEditorScreenState extends State<ScheduleEditorScreen> {
         final ok = await d.updateCustomSchedule(widget.existing!.id,
             name: name, kind: _kind, config: config);
         if (!ok) {
-          setState(() => _error = 'Built-in schedules cannot be edited.');
+          if (mounted) {
+            setState(() => _error = 'Built-in schedules cannot be edited.');
+          }
           return;
         }
         // Re-anchor every list still on this schedule so next fire / due
@@ -296,11 +305,11 @@ class _ScheduleEditorScreenState extends State<ScheduleEditorScreen> {
         }
       }
     } on ScheduleConfigError catch (e) {
-      setState(() => _error = scheduleErrorMessage(e));
+      if (mounted) setState(() => _error = scheduleErrorMessage(e));
       return;
     } catch (_) {
       // Storage failure: surface it, never throw into the framework.
-      setState(() => _error = 'Could not save the schedule.');
+      if (mounted) setState(() => _error = 'Could not save the schedule.');
       return;
     }
     await widget.rearm();
