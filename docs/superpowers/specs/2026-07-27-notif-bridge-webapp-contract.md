@@ -49,9 +49,9 @@ On dialog load the app warm-pushes `cupitorNotifSchedules` and
 | `requestPermission` | — | ack `data: {permission}` (triggers the OS prompt) |
 | `getSchedules` | — | `cupitorNotifSchedules` event, then ack |
 | `getLists` | — | `cupitorNotifLists` event, then ack |
-| `createList` | `external_key`, `name`, `schedule_key?` (default `'ebbinghaus'`), `items[]` | ack, then `cupitorNotifLists` push |
+| `createList` | `external_key`, `name`, `schedule_key?` (default `'ebbinghaus'`), `intro_schedule_key?`, `items[]` | ack, then `cupitorNotifLists` push |
 | `syncItems` | `external_key`, `items[]`, `mode?` (`'merge'` default \| `'replace'`) | ack, then push |
-| `setSchedule` | `external_key`, `schedule_key` | ack, then push |
+| `setSchedule` | `external_key`, `schedule_key`, `intro_schedule_key?` | ack, then push |
 | `setStatus` | `external_key`, `status` (`'active'` \| `'paused'`) | ack, then push |
 | `deleteList` | `external_key` | ack, then push |
 | `grade` | `external_key`, `item_external_id`, `grade` (literal int 1\|3\|5) | ack, then `cupitorNotifGraded` + push |
@@ -103,6 +103,30 @@ to `done`. `grade` must be a literal JSON integer — `3.5` or `"3"` is
 
 Item order in `items[]` becomes `position`.
 
+### Intro cadence (`intro_schedule_key`, optional)
+
+A series list may additionally carry a recurring **introduction schedule**:
+items then fire for the FIRST time on that cadence (in `position` order,
+`per_fire` at a time) instead of all together, and each item's
+spaced-repetition ladder starts at its own introduction. Example:
+`schedule_key: 'ebbinghaus'` + `intro_schedule_key: 'daily_0900'` introduces
+one new item every morning; each introduced item then repeats at
++0.25, +1, +4… waking hours from its introduction.
+
+Rules:
+- `intro_schedule_key` must reference a **recurring** schedule and the main
+  `schedule_key` must be a **series** — anything else acks `bad_intro`.
+- With an intro set, new items (from `createList` or `syncItems`) arrive
+  with `next_due_at: null` — that state means "queued for introduction".
+- The cadence goes dormant when every item has been introduced and wakes
+  automatically when `syncItems` adds new ones.
+- `setSchedule` sets the list's FULL scheduling: omitting
+  `intro_schedule_key` **clears** any existing intro (remaining queued items
+  are then seeded immediately, i.e. the no-intro behavior).
+- `grade` on a not-yet-introduced item is allowed and introduces it early.
+- `getLists` exposes the current value as `intro_schedule_key` (null when
+  none).
+
 ### `setSchedule` semantics (lossless round trip)
 
 - → recurring: per-item SRS state stays in place, unread.
@@ -153,7 +177,8 @@ authored in the app's UI, not over the bridge.
 ```jsonc
 { "version": 1, "lists": [
   { "external_key": "deck-fr-1", "name": "French B2", "source": "webpage",
-    "schedule_key": "ebbinghaus", "status": "active", "next_fire_at": null,
+    "schedule_key": "ebbinghaus", "intro_schedule_key": null,
+    "status": "active", "next_fire_at": null,
     "items": [
       { "external_id": "card-4711", "title": "le dénouement", "body": "…",
         "open_url": "…", "payload": { }, "position": 0,
@@ -173,9 +198,10 @@ authored in the app's UI, not over the bridge.
 
 `bad_json`, `unknown_op`, `bad_payload`, `unknown_list`, `unknown_item`,
 `unknown_schedule`, `duplicate_key`, `bad_grade`, `not_series`,
-`unsupported` (SQLite unavailable on this platform — also visible as
-`getCapabilities → supported:false`), `internal` (nothing committed).
-Failed ops change nothing.
+`bad_intro` (intro on a recurring main schedule, or a series schedule used
+as intro), `unsupported` (SQLite unavailable on this platform — also
+visible as `getCapabilities → supported:false`), `internal` (nothing
+committed). Failed ops change nothing.
 
 ## Capabilities
 

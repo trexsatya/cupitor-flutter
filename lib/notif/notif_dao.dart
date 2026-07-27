@@ -40,6 +40,11 @@ class NotifListRow {
   final String source; // 'webpage' | 'app'
   final String? externalKey;
   final int? scheduleId;
+
+  /// Optional recurring "introduction" cadence (v8) — meaningful only when
+  /// the main schedule is a series. Items with no series state yet are
+  /// drip-fired by this schedule and seeded onto the ladder at that moment.
+  final int? introScheduleId;
   final String status; // 'active' | 'paused'
   final int cursor;
   final int? nextFireAt;
@@ -49,6 +54,7 @@ class NotifListRow {
   const NotifListRow({
     required this.id, required this.profileId, required this.name,
     required this.source, required this.externalKey, required this.scheduleId,
+    required this.introScheduleId,
     required this.status, required this.cursor, required this.nextFireAt,
     required this.lastFiredAt, required this.createdAt, required this.updatedAt,
   });
@@ -60,6 +66,7 @@ class NotifListRow {
         source: m['source'] as String,
         externalKey: m['external_key'] as String?,
         scheduleId: m['schedule_id'] as int?,
+        introScheduleId: m['intro_schedule_id'] as int?,
         status: m['status'] as String,
         cursor: (m['cursor'] as num?)?.toInt() ?? 0,
         nextFireAt: (m['next_fire_at'] as num?)?.toInt(),
@@ -186,11 +193,13 @@ class NotifDao {
         config: normalized, createdAt: now);
   }
 
-  /// Every list (any profile) still pointing at [scheduleId] — the editor's
-  /// delete guard and its re-anchor-after-edit pass both need the full set.
+  /// Every list (any profile) still pointing at [scheduleId] — as its main
+  /// OR intro schedule. The editor's delete guard and its re-anchor pass
+  /// both need the full set.
   Future<List<NotifListRow>> listsUsingSchedule(int scheduleId) async =>
       (await db.query('notif_lists',
-              where: 'schedule_id = ?', whereArgs: [scheduleId],
+              where: 'schedule_id = ? OR intro_schedule_id = ?',
+              whereArgs: [scheduleId, scheduleId],
               orderBy: 'id ASC'))
           .map(NotifListRow.fromMap)
           .toList(growable: false);
@@ -231,18 +240,21 @@ class NotifDao {
     required String source,
     String? externalKey,
     int? scheduleId,
+    int? introScheduleId,
     int? nextFireAt,
   }) async {
     final now = _now();
     final id = await db.insert('notif_lists', {
       'profile_id': profileId, 'name': name, 'source': source,
       'external_key': externalKey, 'schedule_id': scheduleId,
+      'intro_schedule_id': introScheduleId,
       'status': 'active', 'cursor': 0, 'next_fire_at': nextFireAt,
       'created_at': now, 'updated_at': now,
     });
     return NotifListRow(
         id: id, profileId: profileId, name: name, source: source,
-        externalKey: externalKey, scheduleId: scheduleId, status: 'active',
+        externalKey: externalKey, scheduleId: scheduleId,
+        introScheduleId: introScheduleId, status: 'active',
         cursor: 0, nextFireAt: nextFireAt, lastFiredAt: null,
         createdAt: now, updatedAt: now);
   }
@@ -301,6 +313,19 @@ class NotifDao {
   Future<List<NotifItemRow>> itemsForList(int listId) async =>
       (await db.query('notif_items',
               where: 'list_id = ?', whereArgs: [listId],
+              orderBy: 'position ASC, id ASC'))
+          .map(NotifItemRow.fromMap)
+          .toList(growable: false);
+
+  /// Items the intro cadence has not fired yet: active, with no series
+  /// state, in position order. In an intro list "no next_due_at" IS the
+  /// un-introduced marker (graded/introduced items always carry one until
+  /// they graduate to done).
+  Future<List<NotifItemRow>> unintroducedItems(int listId) async =>
+      (await db.query('notif_items',
+              where: "list_id = ? AND status = 'active' "
+                  'AND next_due_at IS NULL',
+              whereArgs: [listId],
               orderBy: 'position ASC, id ASC'))
           .map(NotifItemRow.fromMap)
           .toList(growable: false);

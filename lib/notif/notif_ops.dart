@@ -37,23 +37,47 @@ int? initialNextFireMs(
       .millisecondsSinceEpoch;
 }
 
-/// Assign [schedule] to [list] (spec: setSchedule semantics). Recurring
-/// re-anchors the list fire time and leaves per-item state untouched;
-/// series clears the list fire time and initialises only items that carry
-/// no series state yet — items with history keep it (lossless round trip).
+/// Assign [schedule] (and optionally a recurring [intro] cadence) to [list]
+/// (spec: setSchedule semantics).
+///
+/// - recurring main: re-anchors the list fire time, leaves per-item state
+///   untouched, clears any intro ([intro] must be null — callers validate).
+/// - series without intro: clears the list fire time and initialises only
+///   items that carry no series state yet — items with history keep it
+///   (lossless round trip).
+/// - series with intro: stateless items stay UN-seeded (they are the intro
+///   queue); the list fire time runs the intro cadence while that queue is
+///   non-empty, else goes dormant.
 Future<void> applyScheduleToList(NotifDao d, NotifListRow list,
-    NotifScheduleRow schedule, tz.TZDateTime now, WakingWindow w) async {
+    NotifScheduleRow schedule, tz.TZDateTime now, WakingWindow w,
+    {NotifScheduleRow? intro}) async {
+  assert(intro == null ||
+      (schedule.kind == 'series' && intro.kind == 'recurring'));
   if (schedule.kind == 'recurring') {
     await d.updateList(list.id, {
       'schedule_id': schedule.id,
+      'intro_schedule_id': null,
       'next_fire_at': initialNextFireMs(schedule, now, w),
+    });
+    return;
+  }
+  if (intro != null) {
+    final queued = await d.unintroducedItems(list.id);
+    await d.updateList(list.id, {
+      'schedule_id': schedule.id,
+      'intro_schedule_id': intro.id,
+      'next_fire_at':
+          queued.isEmpty ? null : initialNextFireMs(intro, now, w),
     });
     return;
   }
   final offsets =
       seriesOffsets(jsonDecode(schedule.config) as Map<String, dynamic>);
-  await d.updateList(
-      list.id, {'schedule_id': schedule.id, 'next_fire_at': null});
+  await d.updateList(list.id, {
+    'schedule_id': schedule.id,
+    'intro_schedule_id': null,
+    'next_fire_at': null,
+  });
   for (final i in await d.itemsForList(list.id)) {
     if (i.status == 'active' && i.nextDueAt == null) {
       await d.updateItem(i.id, {
@@ -64,18 +88,54 @@ Future<void> applyScheduleToList(NotifDao d, NotifListRow list,
   }
 }
 
-/// Pause/resume (spec: setStatus semantics). Resuming a recurring list
-/// re-anchors next_fire_at — the stale pre-pause slot may be long past.
+/// Re-arm a dormant intro cadence: when [list] has an intro schedule, no
+/// pending fire, and a non-empty intro queue, anchor next_fire_at to the
+/// next slot. Called after items are added (bridge syncItems, UI add-item).
+Future<void> ensureIntroArmed(
+    NotifDao d, NotifListRow list, tz.TZDateTime now, WakingWindow w) async {
+  if (list.introScheduleId == null || list.nextFireAt != null) return;
+  final intro = await d.scheduleById(list.introScheduleId!);
+  if (intro == null || intro.kind != 'recurring') return;
+  if ((await d.unintroducedItems(list.id)).isEmpty) return;
+  await d.updateList(list.id, {'next_fire_at': initialNextFireMs(intro, now, w)});
+}
+
+/// Pause/resume (spec: setStatus semantics). Resuming re-anchors the list
+/// fire time — the stale pre-pause slot may be long past. For a recurring
+/// main schedule that's the rotation slot; for an intro list it's the next
+/// intro slot (only while the intro queue is non-empty).
 Future<void> setListStatus(NotifDao d, NotifListRow list, String status,
     tz.TZDateTime now, WakingWindow w) async {
   final fields = <String, Object?>{'status': status};
-  if (status == 'active' && list.scheduleId != null) {
-    final schedule = await d.scheduleById(list.scheduleId!);
-    if (schedule != null && schedule.kind == 'recurring') {
-      fields['next_fire_at'] = initialNextFireMs(schedule, now, w);
+  if (status == 'active') {
+    if (list.scheduleId != null) {
+      final schedule = await d.scheduleById(list.scheduleId!);
+      if (schedule != null && schedule.kind == 'recurring') {
+        fields['next_fire_at'] = initialNextFireMs(schedule, now, w);
+      }
+    }
+    if (list.introScheduleId != null) {
+      final intro = await d.scheduleById(list.introScheduleId!);
+      if (intro != null && intro.kind == 'recurring') {
+        fields['next_fire_at'] =
+            (await d.unintroducedItems(list.id)).isEmpty
+                ? null
+                : initialNextFireMs(intro, now, w);
+      }
     }
   }
   await d.updateList(list.id, fields);
+}
+
+/// Seed [item] onto the first rung of its ladder at [anchor] — the moment
+/// the intro cadence fires it. Next repetition = anchor + offsets[0].
+Future<void> seedItemLadder(NotifDao d, NotifItemRow item,
+    List<double> offsets, tz.TZDateTime anchor, WakingWindow w) async {
+  await d.updateItem(item.id, {
+    'step': 0,
+    'next_due_at':
+        addWakingHours(anchor, offsets[0], w).millisecondsSinceEpoch,
+  });
 }
 
 /// Reset an item to the start of its ladder (manager UI: reset-to-step-1).

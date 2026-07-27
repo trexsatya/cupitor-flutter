@@ -186,6 +186,9 @@ class NotifBridge {
     for (final l in lists) {
       final schedule =
           l.scheduleId == null ? null : await d.scheduleById(l.scheduleId!);
+      final introSchedule = l.introScheduleId == null
+          ? null
+          : await d.scheduleById(l.introScheduleId!);
       final items = await d.itemsForList(l.id);
       out.add({
         // Identity rule (spec): external ids only, internal row ids never
@@ -194,6 +197,7 @@ class NotifBridge {
         'name': l.name,
         'source': l.source,
         'schedule_key': schedule?.key,
+        'intro_schedule_key': introSchedule?.key,
         'status': l.status,
         'next_fire_at': l.nextFireAt,
         'items': [
@@ -243,6 +247,30 @@ class NotifBridge {
 
   // ── ops ────────────────────────────────────────────────────────────
 
+  /// Resolves an optional `intro_schedule_key` against the main [schedule].
+  /// Returns (handled, intro): when handled is true an error ack has already
+  /// been sent and the op must stop. An intro requires a series main
+  /// schedule and a recurring intro schedule — anything else is `bad_intro`.
+  Future<(bool, NotifScheduleRow?)> _resolveIntro(NotifDao d, String? reqId,
+      String op, Map<String, dynamic> m, NotifScheduleRow schedule) async {
+    final raw = m['intro_schedule_key'];
+    if (raw == null) return (false, null);
+    if (raw is! String || raw.isEmpty) {
+      _ack(reqId, op, false, error: 'bad_payload');
+      return (true, null);
+    }
+    final intro = await d.scheduleByKey(raw);
+    if (intro == null) {
+      _ack(reqId, op, false, error: 'unknown_schedule');
+      return (true, null);
+    }
+    if (schedule.kind != 'series' || intro.kind != 'recurring') {
+      _ack(reqId, op, false, error: 'bad_intro');
+      return (true, null);
+    }
+    return (false, intro);
+  }
+
   Future<void> _createList(String? reqId, Map<String, dynamic> m) async {
     const op = 'createList';
     final d = await _daoOrAck(reqId, op);
@@ -266,13 +294,20 @@ class NotifBridge {
       _ack(reqId, op, false, error: 'unknown_schedule');
       return;
     }
+    final (handled, intro) = await _resolveIntro(d, reqId, op, m, schedule);
+    if (handled) return;
     final w = window();
     final t = now();
-    final nextFireAt = initialNextFireMs(schedule, t, w);
-    final offsets = offsetsIfSeries(schedule);
+    // With an intro cadence: items stay unseeded (they are the intro queue)
+    // and the list fire runs the cadence. Without: today's behavior.
+    final nextFireAt = intro != null
+        ? (items.isEmpty ? null : initialNextFireMs(intro, t, w))
+        : initialNextFireMs(schedule, t, w);
+    final offsets = intro != null ? null : offsetsIfSeries(schedule);
     final list = await d.createList(
         profileId: profileId, name: name, source: 'webpage',
-        externalKey: key, scheduleId: schedule.id, nextFireAt: nextFireAt);
+        externalKey: key, scheduleId: schedule.id,
+        introScheduleId: intro?.id, nextFireAt: nextFireAt);
     var pos = 0;
     for (final it in items) {
       await _insertParsedItem(d, list.id, it, pos++, offsets, t, w);
@@ -293,7 +328,10 @@ class NotifBridge {
     }
     final list = await _listOrAck(d, reqId, op, m['external_key']);
     if (list == null) return;
-    final offsets = await _offsetsFor(d, list.scheduleId);
+    // Intro lists: new items join the intro queue unseeded.
+    final offsets = list.introScheduleId != null
+        ? null
+        : await _offsetsFor(d, list.scheduleId);
     final existing = await d.itemsForList(list.id);
     final byExt = {
       for (final i in existing)
@@ -325,6 +363,8 @@ class NotifBridge {
         }
       }
     }
+    // A dormant intro cadence wakes up when new items join its queue.
+    await ensureIntroArmed(d, list, t, w);
     _ack(reqId, op, true);
     await _afterMutation(d);
   }
@@ -417,7 +457,12 @@ class NotifBridge {
       _ack(reqId, op, false, error: 'unknown_schedule');
       return;
     }
-    await applyScheduleToList(d, list, schedule, now(), window());
+    // setSchedule sets the list's FULL scheduling: an absent
+    // intro_schedule_key clears any existing intro (contract doc).
+    final (handled, intro) = await _resolveIntro(d, reqId, op, m, schedule);
+    if (handled) return;
+    await applyScheduleToList(d, list, schedule, now(), window(),
+        intro: intro);
     _ack(reqId, op, true);
     await _afterMutation(d);
   }

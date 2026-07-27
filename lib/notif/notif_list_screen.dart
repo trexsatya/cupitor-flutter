@@ -27,6 +27,7 @@ class NotifListScreen extends StatefulWidget {
 class _NotifListScreenState extends State<NotifListScreen> {
   NotifListRow? _list;
   NotifScheduleRow? _schedule;
+  NotifScheduleRow? _introSchedule;
   List<NotifItemRow> _items = const [];
   bool _loading = true;
   bool _unsupported = false;
@@ -54,11 +55,15 @@ class _NotifListScreenState extends State<NotifListScreen> {
     }
     final schedule =
         list.scheduleId == null ? null : await d.scheduleById(list.scheduleId!);
+    final introSchedule = list.introScheduleId == null
+        ? null
+        : await d.scheduleById(list.introScheduleId!);
     final items = await d.itemsForList(list.id);
     if (!mounted) return;
     setState(() {
       _list = list;
       _schedule = schedule;
+      _introSchedule = introSchedule;
       _items = items;
       _loading = false;
     });
@@ -133,9 +138,41 @@ class _NotifListScreenState extends State<NotifListScreen> {
         ],
       ),
     );
-    if (picked == null || picked.id == _list!.scheduleId) return;
+    if (picked == null) return;
+    NotifScheduleRow? intro;
+    if (picked.kind == 'series') {
+      final recurring = schedules
+          .where((s) => s.kind == 'recurring')
+          .toList(growable: false);
+      if (!mounted) return;
+      // Sentinel-wrapped picker: null result = dialog dismissed (abort),
+      // (null,) = "All at once", (row,) = that intro cadence.
+      final introChoice = await showDialog<(NotifScheduleRow?,)>(
+        context: context,
+        builder: (ctx) => SimpleDialog(
+          title: const Text('Introduce items'),
+          children: [
+            RadioListTile<int?>(
+              value: null,
+              groupValue: _list!.introScheduleId,
+              title: const Text('All at once'),
+              onChanged: (_) => Navigator.pop(ctx, (null,)),
+            ),
+            for (final s in recurring)
+              RadioListTile<int?>(
+                value: s.id,
+                groupValue: _list!.introScheduleId,
+                title: Text(s.name),
+                onChanged: (_) => Navigator.pop(ctx, (s,)),
+              ),
+          ],
+        ),
+      );
+      if (introChoice == null) return;
+      intro = introChoice.$1;
+    }
     await _mutate((d) => applyScheduleToList(
-        d, _list!, picked, _now, NotifSettings.window));
+        d, _list!, picked, _now, NotifSettings.window, intro: intro));
   }
 
   Future<void> _togglePaused() async {
@@ -231,14 +268,23 @@ class _NotifListScreenState extends State<NotifListScreen> {
     final r = await _itemDialog();
     if (r == null) return;
     final (title, body, openUrl) = r;
-    await _mutate((d) => d.insertItem(
-          listId: _list!.id,
-          title: title,
-          body: body,
-          openUrl: openUrl,
-          position: _items.length,
-          nextDueAt: initialNextDueMs(_schedule, _now, NotifSettings.window),
-        ));
+    final hasIntro = _list!.introScheduleId != null;
+    await _mutate((d) async {
+      await d.insertItem(
+        listId: _list!.id,
+        title: title,
+        body: body,
+        openUrl: openUrl,
+        position: _items.length,
+        // Intro lists queue new items unseeded; the cadence fires them.
+        nextDueAt: hasIntro
+            ? null
+            : initialNextDueMs(_schedule, _now, NotifSettings.window),
+      );
+      if (hasIntro) {
+        await ensureIntroArmed(d, _list!, _now, NotifSettings.window);
+      }
+    });
   }
 
   Future<void> _editItem(NotifItemRow item) async {
@@ -250,8 +296,21 @@ class _NotifListScreenState extends State<NotifListScreen> {
   }
 
   Future<void> _resetItem(NotifItemRow item) async {
-    await _mutate((d) =>
-        resetItemToStart(d, item, _schedule, _now, NotifSettings.window));
+    final hasIntro = _list!.introScheduleId != null;
+    await _mutate((d) async {
+      if (hasIntro) {
+        // In an intro list "the start" is the back of the intro queue.
+        await d.updateItem(item.id, {
+          'step': 0,
+          'status': 'active',
+          'next_due_at': null,
+          'last_grade': null,
+        });
+        await ensureIntroArmed(d, _list!, _now, NotifSettings.window);
+      } else {
+        await resetItemToStart(d, item, _schedule, _now, NotifSettings.window);
+      }
+    });
   }
 
   Future<void> _deleteItem(NotifItemRow item) async {
@@ -341,6 +400,13 @@ class _NotifListScreenState extends State<NotifListScreen> {
                   label: Text(_schedule?.name ?? 'No schedule'),
                 ),
                 const SizedBox(width: 8),
+                if (_introSchedule != null) ...[
+                  Chip(
+                    avatar: const Icon(Icons.start, size: 18),
+                    label: Text('intro: ${_introSchedule!.name}'),
+                  ),
+                  const SizedBox(width: 8),
+                ],
                 if (paused)
                   Chip(
                     label: const Text('paused'),
@@ -378,6 +444,10 @@ class _NotifListScreenState extends State<NotifListScreen> {
     final state = switch (item.status) {
       'done' => 'done',
       'suspended' => 'suspended',
+      _ when isSeries &&
+              item.nextDueAt == null &&
+              _list!.introScheduleId != null =>
+        'queued for introduction',
       _ => isSeries
           ? 'step ${item.step + 1} · ${formatDue(item.nextDueAt, nowMs)}'
           : 'in rotation',

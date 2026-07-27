@@ -4,6 +4,7 @@ import 'package:timezone/timezone.dart' as tz;
 
 import 'notif_channel.dart';
 import 'notif_dao.dart';
+import 'notif_ops.dart';
 import 'pending_fire.dart';
 import 'recurring_scheduler.dart';
 import 'schedules.dart';
@@ -169,24 +170,41 @@ class NotificationService {
     );
   }
 
-  /// The items a recurring list would show at [whenMs], selected with the
-  /// CURRENT cursor. The cursor only advances when the fire is processed
-  /// (sweep) — consecutive unattended fires may repeat items; documented
-  /// spec §Delivery trade-off for content frozen at arm time.
+  /// The items a list-level fire at [whenMs] would show. Two flavours:
+  /// rotation for a recurring main schedule (selected with the CURRENT
+  /// cursor — it only advances when the sweep processes the fire, so
+  /// consecutive unattended fires may repeat items; documented spec
+  /// §Delivery trade-off), or the head of the intro queue for a series
+  /// list with an intro cadence (v8).
   Future<List<PendingFire>> _recurringFires(
       NotifDao d, NotifListRow list, int whenMs) async {
     final schedule =
         list.scheduleId == null ? null : await d.scheduleById(list.scheduleId!);
-    if (schedule == null || schedule.kind != 'recurring') return const [];
-    final cfg = parseRecurring(
-        jsonDecode(schedule.config) as Map<String, dynamic>);
-    final items = await d.itemsForList(list.id);
-    final sel = takeForFire<NotifItemRow>(
-        items, list.cursor, cfg.perFire, (i) => i.status == 'active');
-    return [
-      for (final item in sel.items)
-        await _itemFire(d, item, whenMs, withActions: false)
-    ];
+    if (schedule == null) return const [];
+    if (schedule.kind == 'recurring') {
+      final cfg = parseRecurring(
+          jsonDecode(schedule.config) as Map<String, dynamic>);
+      final items = await d.itemsForList(list.id);
+      final sel = takeForFire<NotifItemRow>(
+          items, list.cursor, cfg.perFire, (i) => i.status == 'active');
+      return [
+        for (final item in sel.items)
+          await _itemFire(d, item, whenMs, withActions: false)
+      ];
+    }
+    if (schedule.kind == 'series' && list.introScheduleId != null) {
+      final intro = await d.scheduleById(list.introScheduleId!);
+      if (intro == null || intro.kind != 'recurring') return const [];
+      final cfg =
+          parseRecurring(jsonDecode(intro.config) as Map<String, dynamic>);
+      final queue = await d.unintroducedItems(list.id);
+      return [
+        // Series items: grade actions apply from the very first showing.
+        for (final item in queue.take(cfg.perFire))
+          await _itemFire(d, item, whenMs, withActions: true)
+      ];
+    }
+    return const [];
   }
 
   // ── sweep ────────────────────────────────────────────────────────────
@@ -249,11 +267,19 @@ class NotificationService {
           itemId: item.id, firedAt: nowMs, source: fireNow ? null : 'auto');
     }
 
-    // Due recurring lists.
+    // Due list-level fires: rotation (recurring main schedule) or the
+    // intro cadence of a series list (v8).
     for (final list in await d.recurringDueLists(nowMs)) {
       final schedule = list.scheduleId == null
           ? null
           : await d.scheduleById(list.scheduleId!);
+      if (schedule != null &&
+          schedule.kind == 'series' &&
+          list.introScheduleId != null) {
+        posted = await _sweepIntroFire(
+            d, list, schedule, t, nowMs, w, cap, posted, summarized);
+        continue;
+      }
       if (schedule == null || schedule.kind != 'recurring') {
         await d.updateList(list.id, {'next_fire_at': null});
         continue;
@@ -297,6 +323,65 @@ class NotificationService {
     }
 
     await rearm();
+  }
+
+  /// Process one due intro fire (v8): within the grace window, post up to
+  /// per_fire queued items (capacity-bounded) and seed each onto the first
+  /// rung of the list's ladder anchored at now; a stale fire is skipped
+  /// silently and the cadence just continues (same trade-off as rotation).
+  /// The cadence goes dormant (null next_fire_at) once the queue drains.
+  /// Returns the updated global posted count.
+  Future<int> _sweepIntroFire(
+      NotifDao d,
+      NotifListRow list,
+      NotifScheduleRow schedule,
+      tz.TZDateTime t,
+      int nowMs,
+      WakingWindow w,
+      int cap,
+      int posted,
+      Set<int> summarized) async {
+    final intro = await d.scheduleById(list.introScheduleId!);
+    if (intro == null || intro.kind != 'recurring') {
+      await d.updateList(list.id, {'next_fire_at': null});
+      return posted;
+    }
+    final cfg =
+        parseRecurring(jsonDecode(intro.config) as Map<String, dynamic>);
+    final offsets =
+        seriesOffsets(jsonDecode(schedule.config) as Map<String, dynamic>);
+    final withinGrace = wakingHoursBetween(
+            tz.TZDateTime.fromMillisecondsSinceEpoch(
+                t.location, list.nextFireAt!),
+            t, w) <=
+        graceWakingHours;
+    var firedAny = false;
+    if (withinGrace) {
+      final capacity = cap - posted;
+      if (capacity > 0) {
+        final take = cfg.perFire < capacity ? cfg.perFire : capacity;
+        for (final item in (await d.unintroducedItems(list.id)).take(take)) {
+          posted++;
+          await channel.showNow(
+              await _itemFire(d, item, nowMs, withActions: true));
+          await seedItemLadder(d, item, offsets, t, w);
+          await d.updateItem(item.id, {'last_fired_at': nowMs});
+          await d.insertEvent(itemId: item.id, firedAt: nowMs);
+          if (summarized.add(list.id)) {
+            await channel.showNow(_summaryFire(list, nowMs));
+          }
+          firedAny = true;
+        }
+      }
+    }
+    final remaining = await d.unintroducedItems(list.id);
+    await d.updateList(list.id, {
+      'last_fired_at': firedAny ? nowMs : list.lastFiredAt,
+      'next_fire_at': remaining.isEmpty
+          ? null
+          : nextRecurringFire(cfg, t, w).millisecondsSinceEpoch,
+    });
+    return posted;
   }
 
   Future<List<double>?> _offsetsForList(NotifDao d, int listId) async {

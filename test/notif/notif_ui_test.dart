@@ -229,6 +229,30 @@ void main() {
       expect(rearms, 1);
     });
 
+    testWidgets('intro list: added item is queued unseeded and arms cadence',
+        (tester) async {
+      final series = await dao.scheduleByKey('cepeda2x');
+      final intro = await dao.scheduleByKey('daily_0900');
+      final l = await dao.createList(
+          profileId: 1, name: 'Drip', source: 'app',
+          scheduleId: series!.id, introScheduleId: intro!.id);
+
+      await pumpPushed(tester,
+          NotifListScreen(listId: l.id, dao: daoGetter, rearm: rearm));
+      expect(find.textContaining('intro:'), findsOneWidget);
+
+      await tester.tap(find.byType(FloatingActionButton));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).first, 'queued one');
+      await tester.tap(find.text('OK'));
+      await tester.pumpAndSettle();
+
+      final item = (await dao.itemsForList(l.id)).single;
+      expect(item.nextDueAt, isNull); // waiting for the intro cadence
+      expect((await dao.listById(l.id))!.nextFireAt, isNotNull); // armed
+      expect(find.text('queued for introduction'), findsOneWidget);
+    });
+
     testWidgets('dao-null shows the unsupported notice, not a spinner',
         (tester) async {
       await pumpPushed(tester,

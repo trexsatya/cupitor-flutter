@@ -170,6 +170,9 @@ class _NotificationManagerScreenState extends State<NotificationManagerScreen> {
       return;
     }
     NotifScheduleRow selected = schedules.first;
+    NotifScheduleRow? intro; // null = introduce everything immediately
+    final recurring =
+        schedules.where((s) => s.kind == 'recurring').toList(growable: false);
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -197,9 +200,31 @@ class _NotificationManagerScreenState extends State<NotificationManagerScreen> {
                   for (final s in schedules)
                     DropdownMenuItem(value: s, child: Text(s.name)),
                 ],
-                onChanged: (s) =>
-                    setDialogState(() => selected = s ?? selected),
+                onChanged: (s) => setDialogState(() {
+                  selected = s ?? selected;
+                  if (selected.kind != 'series') intro = null;
+                }),
               ),
+              if (selected.kind == 'series') ...[
+                const SizedBox(height: 12),
+                DropdownButtonFormField<NotifScheduleRow?>(
+                  value: intro,
+                  decoration: const InputDecoration(
+                      labelText: 'Introduce items',
+                      helperText: 'Drip new items on a cadence; each then '
+                          'follows the ladder from its own start.',
+                      border: OutlineInputBorder(),
+                      isDense: true),
+                  items: [
+                    const DropdownMenuItem<NotifScheduleRow?>(
+                        value: null, child: Text('All at once')),
+                    for (final s in recurring)
+                      DropdownMenuItem<NotifScheduleRow?>(
+                          value: s, child: Text(s.name)),
+                  ],
+                  onChanged: (s) => setDialogState(() => intro = s),
+                ),
+              ],
             ],
           ),
           actions: [
@@ -221,7 +246,11 @@ class _NotificationManagerScreenState extends State<NotificationManagerScreen> {
       name: name,
       source: 'app',
       scheduleId: selected.id,
-      nextFireAt: initialNextFireMs(selected, now, NotifSettings.window),
+      introScheduleId: intro?.id,
+      // Empty at birth: an intro cadence arms when the first item arrives
+      // (ensureIntroArmed in the add-item path).
+      nextFireAt:
+          intro != null ? null : initialNextFireMs(selected, now, NotifSettings.window),
     );
     await _rearm();
     await _load();

@@ -43,7 +43,10 @@ class CupitorDb {
   // with per-item Leitner state), notif_events (fire/response history for
   // dedupe, the catch-up sweep, and the manager's history view). Seeds the
   // seven built-in schedules. Additive only — no existing table is touched.
-  static const int _schemaVersion = 7;
+  // v8: notif_lists.intro_schedule_id — optional recurring "introduction"
+  // cadence for series lists (items drip-fired, then follow their ladder).
+  // Additive only: one nullable column, no existing data touched.
+  static const int _schemaVersion = 8;
   static const String _fileName = 'cupitor.db';
   static const int defaultProfileId = 1;
 
@@ -298,6 +301,17 @@ class CupitorDb {
     if (oldV < 7) {
       await createNotifTables(db);
     }
+    if (oldV < 8) {
+      // A v6 device just got the table WITH the column from the step above;
+      // only a true v7 table needs the ALTER. Column-existence check keeps
+      // this idempotent either way.
+      final cols = await db.rawQuery('PRAGMA table_info(notif_lists)');
+      final has = cols.any((c) => c['name'] == 'intro_schedule_id');
+      if (!has) {
+        await db.execute('ALTER TABLE notif_lists ADD COLUMN '
+            'intro_schedule_id INTEGER REFERENCES notif_schedules(id)');
+      }
+    }
   }
 
   /// v7 notification tables. Shared by createSchema (fresh install) and the
@@ -321,6 +335,7 @@ class CupitorDb {
         source        TEXT NOT NULL,
         external_key  TEXT,
         schedule_id   INTEGER REFERENCES notif_schedules(id),
+        intro_schedule_id INTEGER REFERENCES notif_schedules(id),
         status        TEXT NOT NULL,
         cursor        INTEGER NOT NULL DEFAULT 0,
         next_fire_at  INTEGER,
