@@ -229,11 +229,20 @@ be, so they are isolated and directly unit-testable.
 ### `waking_clock.dart`
 
 ```dart
-DateTime addWakingHours(DateTime from, double hours, WakingWindow w);
-double   wakingHoursBetween(DateTime a, DateTime b, WakingWindow w);
-bool     isAwake(DateTime t, WakingWindow w);
-DateTime nextWakingInstant(DateTime t, WakingWindow w);
+tz.TZDateTime addWakingHours(tz.TZDateTime from, double hours, WakingWindow w);
+double        wakingHoursBetween(tz.TZDateTime a, tz.TZDateTime b, WakingWindow w);
+bool          isAwake(tz.TZDateTime t, WakingWindow w);
+tz.TZDateTime nextWakingInstant(tz.TZDateTime t, WakingWindow w);
 ```
+
+The functions take `TZDateTime` from the `timezone` package, not bare `DateTime`.
+Bare `DateTime` resolves local time against the host machine's zone, which would
+make every DST test pass or fail depending on where it runs. `TZDateTime` carries
+its `Location`, so a test can pin `America/New_York` and assert real DST behaviour
+deterministically. The package is a dependency of `zonedSchedule` anyway.
+
+Persisted times are absolute epoch milliseconds; conversion happens at the DB
+boundary via `TZDateTime.fromMillisecondsSinceEpoch(location, ms)`.
 
 The window is stored in prefs as `notifWakeStart` (default `05:00`) and
 `notifWakeEnd` (default `22:00`), interpreted in the device's local timezone.
@@ -244,10 +253,13 @@ than needing its own rule.
 
 Required behaviour at the edges:
 
-- **DST forward** — the skipped wall-clock hour is not a waking hour; a 4-waking-hour
-  interval starting at 01:00 on a spring-forward night lands at 06:00 wall-clock,
-  not 05:00.
-- **DST backward** — the repeated wall-clock hour counts once.
+- **DST forward** — with the default window the transition (typically 02:00–03:00)
+  falls inside the sleep window, so it consumes no waking hours at all: 20:00 the
+  evening before plus 4 waking hours is 2h to the 22:00 boundary, then 2h from the
+  05:00 resumption, landing at 07:00 wall-clock. With a window that *does* contain
+  the transition, the skipped wall-clock hour is simply not available to spend.
+- **DST backward** — the repeated wall-clock hour is available twice, so a fixed
+  number of waking hours lands one wall-clock hour earlier than on a normal day.
 - **Window crossing midnight** — e.g. wake 22:00, sleep 06:00. Supported.
 - **Zero-length or inverted window** — treated as "always awake"; `addWakingHours`
   degenerates to plain addition. The settings UI prevents authoring one, but the
@@ -299,10 +311,12 @@ list, in `next_fire_at`. Clock-anchored configs can recompute it from wall-clock
 alone, but interval configs need an anchor, which is what `last_fired_at` provides —
 without it, `every_4_waking_hours` would restart its count on every `rearm()`.
 
-Switching a list from `recurring` to `series` initialises every active item to
-step 0 with `next_due_at = addWakingHours(now, offsets[0])`. Switching from `series`
-to `recurring` leaves the per-item state in place, unread, so switching back is
-lossless.
+Switching a list from `recurring` to `series` initialises each active item that has
+**no series state yet** (`next_due_at IS NULL`) to step 0 with
+`next_due_at = addWakingHours(now, offsets[0])`; items that already carry series
+state keep it. Switching from `series` to `recurring` leaves the per-item state in
+place, unread. Together these make a round trip lossless — a blanket
+reset-on-switch would contradict that.
 
 ## Bridge
 
@@ -351,7 +365,10 @@ to know the difference.
 | `cupitorNotifLists` | lists + items + due state; also pushed unprompted on any mutation |
 | `cupitorNotificationOpened` | `{external_key, item_external_id, payload}` |
 | `cupitorNotifGraded` | `{external_key, item_external_id, grade, source}` |
-| `cupitorNotifAck` | `{request_id, op, ok, error?}` |
+| `cupitorNotifAck` | `{request_id, op, ok, error?, data?}` |
+
+`data` carries the reply for ops that return a value rather than push a payload
+event: `getCapabilities` and `requestPermission` answer through it.
 
 `cupitorNotifGraded` exists so an action-button grade does not silently desync the
 webpage's own view of the item.
@@ -381,7 +398,11 @@ follows.
 
 Malformed JSON, an unknown `op`, an unknown `external_key`, an unknown
 `schedule_key`, or a grade outside {1,3,5} produces an ack with `ok:false` and a
-machine-readable `error` code, and changes nothing. The handler never throws into
+machine-readable `error` code, and changes nothing. The full code set:
+`bad_json`, `unknown_op`, `bad_payload`, `unknown_list`, `unknown_item`,
+`unknown_schedule`, `duplicate_key` (`createList` on an `external_key` that
+already exists — use `syncItems` to update), `bad_grade`, `not_series` (`grade`
+against a list whose schedule is `recurring`), `unsupported`, `internal`. The handler never throws into
 the channel. If SQLite is unavailable the whole feature answers
 `getCapabilities` with `supported:false` — the self-disable contract `CupitorDb`
 already uses.
@@ -392,7 +413,9 @@ already uses.
 
 - `flutter_local_notifications` — Android, iOS, macOS, Linux, including action
   buttons that work while the app is killed.
-- `timezone` — required by `zonedSchedule`.
+- `timezone` — required by `zonedSchedule`, and by the waking-hour engine above.
+  Added in the first slice, not the delivery slice.
+- `sqflite_common_ffi` (dev) — in-memory SQLite for DAO and migration tests.
 - `workmanager` — the Android safety net.
 - Windows and web get a shim over an in-process timer; lowest-priority slice.
 
@@ -528,7 +551,7 @@ lib/notif/
   schedules.dart             built-in defs, config parse + validate
   series_scheduler.dart      pure
   recurring_scheduler.dart   pure
-  notif_dao.dart             extension on CupitorDb
+  notif_dao.dart             class NotifDao(Database) — no path_provider
   notification_service.dart  rearm / fire / sweep
   notification_channel.dart  the only file importing a notification package
   notif_bridge.dart          JS channel handler
@@ -539,7 +562,22 @@ lib/notif/
 
 The v6→v7 migration statement goes in `lib/db.dart`, where the schema version and
 its history already live. The roughly 400 lines of new queries do not: `db.dart` is
-already 1684 lines, so the DAO is an extension in its own file.
+already 1684 lines, so the DAO lives in its own file.
+
+`NotifDao` takes a `Database` in its constructor rather than being an extension on
+`CupitorDb`. `CupitorDb._open()` calls `getApplicationDocumentsDirectory()`, which
+does not exist in a unit test; a DAO that reaches through it could only be tested
+under a widget-test harness with a mocked path_provider channel. Taking the handle
+directly lets every DAO test run against `sqflite_common_ffi` in memory.
+`CupitorDb` exposes one accessor, `Future<NotifDao?> notifDao()`, honouring the same
+null-if-unavailable contract as `rawDb()`.
+
+For the same reason, `db.dart`'s inline `onCreate` and `onUpgrade` closures are
+extracted to `static Future<void> createSchema(Database)` and
+`static Future<void> runMigrations(Database, int oldV, int newV)`. Without that, the
+v6→v7 migration cannot be tested at all — the logic is unreachable except through a
+real device path. This is a targeted refactor of code the feature is modifying
+anyway, not a general restructuring of `db.dart`.
 
 A subdirectory is used rather than the flat `lib/` root because this is eleven new
 files.
