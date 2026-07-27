@@ -120,7 +120,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   late final WebViewController _controller;
   WebViewController? dialogController;
   final TextEditingController _urlController = TextEditingController(text: 'https://google.com');
-  String _dialogUrl = 'https://satyendra.website/language.html';
+  String _dialogUrl = 'https://trexsatya.github.io/language.html';
   final List<String> _languages = ['sv', 'es'];
   final Map<String, String> _languageParams = {'sv': 'swedish', 'es': 'spanish'};
   String _selectedLanguage = 'sv';
@@ -6680,7 +6680,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('TtsBridge', onMessageReceived: _handleTtsBridge)
         ..addJavaScriptChannel('MediaState', onMessageReceived: _handleMediaStateBridge)
         ..addJavaScriptChannel('AudioBridge', onMessageReceived: _handleAudioBridge)
-        // The study page (satyendra.website/language.html) loads in THIS
+        // The study page (trexsatya.github.io/language.html) loads in THIS
         // (dialog) controller, so its 🌐 translate button needs the channel
         // here too. The main _controller registers TranslateRequest as well,
         // but that controller isn't the one hosting the study app. The handler
