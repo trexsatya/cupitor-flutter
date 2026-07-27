@@ -67,19 +67,33 @@ class CupitorDb {
         onOpen: (db) async {
           await db.execute('PRAGMA foreign_keys = ON;');
         },
-        onCreate: (db, v) async {
-          await db.execute('''
+        onCreate: (db, v) => createSchema(db),
+        onUpgrade: (db, oldV, newV) => runMigrations(db, oldV, newV),
+      );
+      return _db;
+    } catch (e, st) {
+      _failed = true;
+      // ignore: avoid_print
+      print('CupitorDb open failed: $e\n$st');
+      return null;
+    }
+  }
+
+  /// Full current-version schema. Public + static so tests can build a real
+  /// database on sqflite_common_ffi without touching path_provider.
+  static Future<void> createSchema(Database db) async {
+    await db.execute('''
             CREATE TABLE profiles (
               id         INTEGER PRIMARY KEY AUTOINCREMENT,
               name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
               created_at INTEGER NOT NULL
             )''');
-          await db.insert('profiles', {
-            'id': defaultProfileId,
-            'name': 'Default',
-            'created_at': DateTime.now().millisecondsSinceEpoch,
-          });
-          await db.execute('''
+    await db.insert('profiles', {
+      'id': defaultProfileId,
+      'name': 'Default',
+      'created_at': DateTime.now().millisecondsSinceEpoch,
+    });
+    await db.execute('''
             CREATE TABLE tags (
               id         INTEGER PRIMARY KEY AUTOINCREMENT,
               profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -88,8 +102,8 @@ class CupitorDb {
               created_at INTEGER NOT NULL,
               UNIQUE(profile_id, name)
             )''');
-          await db.execute('CREATE INDEX idx_tags_profile ON tags(profile_id)');
-          await db.execute('''
+    await db.execute('CREATE INDEX idx_tags_profile ON tags(profile_id)');
+    await db.execute('''
             CREATE TABLE pages (
               id           INTEGER PRIMARY KEY AUTOINCREMENT,
               surface      TEXT NOT NULL,
@@ -98,7 +112,7 @@ class CupitorDb {
               last_seen_at INTEGER NOT NULL,
               UNIQUE(surface, locator)
             )''');
-          await db.execute('''
+    await db.execute('''
             CREATE TABLE sentences (
               id         INTEGER PRIMARY KEY AUTOINCREMENT,
               profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -110,16 +124,16 @@ class CupitorDb {
               created_at INTEGER NOT NULL,
               UNIQUE(profile_id, page_id, text, prev_fp, next_fp)
             )''');
-          await db.execute('CREATE INDEX idx_sentences_page ON sentences(page_id)');
-          await db.execute('CREATE INDEX idx_sentences_profile ON sentences(profile_id)');
-          await db.execute('''
+    await db.execute('CREATE INDEX idx_sentences_page ON sentences(page_id)');
+    await db.execute('CREATE INDEX idx_sentences_profile ON sentences(profile_id)');
+    await db.execute('''
             CREATE TABLE sentence_tags (
               sentence_id INTEGER NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
               tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
               PRIMARY KEY (sentence_id, tag_id)
             )''');
-          await db.execute('CREATE INDEX idx_st_tag ON sentence_tags(tag_id)');
-          await db.execute('''
+    await db.execute('CREATE INDEX idx_st_tag ON sentence_tags(tag_id)');
+    await db.execute('''
             CREATE TABLE sentence_media (
               id          INTEGER PRIMARY KEY AUTOINCREMENT,
               sentence_id INTEGER NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
@@ -131,15 +145,15 @@ class CupitorDb {
               size_bytes  INTEGER,
               created_at  INTEGER NOT NULL
             )''');
-          await db.execute('CREATE INDEX idx_sentence_media_sentence ON sentence_media(sentence_id)');
-          await db.execute('CREATE INDEX idx_sentence_media_sha1 ON sentence_media(sha1)');
-          await db.execute('''
+    await db.execute('CREATE INDEX idx_sentence_media_sentence ON sentence_media(sentence_id)');
+    await db.execute('CREATE INDEX idx_sentence_media_sha1 ON sentence_media(sha1)');
+    await db.execute('''
             CREATE TABLE playlists (
               id         INTEGER PRIMARY KEY AUTOINCREMENT,
               name       TEXT NOT NULL,
               created_at INTEGER NOT NULL
             )''');
-          await db.execute('''
+    await db.execute('''
             CREATE TABLE playlist_items (
               id            INTEGER PRIMARY KEY AUTOINCREMENT,
               playlist_id   INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
@@ -151,31 +165,34 @@ class CupitorDb {
               position      INTEGER NOT NULL,
               created_at    INTEGER NOT NULL
             )''');
-          await db.execute('CREATE INDEX idx_playlist_items_playlist ON playlist_items(playlist_id)');
-        },
-        onUpgrade: (db, oldV, newV) async {
-          if (oldV < 2) {
-            await db.execute('ALTER TABLE sentences ADD COLUMN mask TEXT;');
-          }
-          if (oldV < 3) {
-            // v2 → v3: introduce profiles. Existing rows fold into a
-            // pre-created "Default" profile (id=1). Tables with new
-            // composite UNIQUE constraints have to be rebuilt because
-            // SQLite can't ALTER an existing UNIQUE. FKs are already OFF
-            // here (set in onConfigure outside the transaction) so the
-            // DROP TABLE statements below won't cascade-wipe sentence_tags.
-            await db.execute('''
+    await db.execute('CREATE INDEX idx_playlist_items_playlist ON playlist_items(playlist_id)');
+  }
+
+  /// All version-stepped migrations. Public + static for the same reason —
+  /// the v6→v7 test drives this directly against an in-memory v6 fixture.
+  static Future<void> runMigrations(Database db, int oldV, int newV) async {
+    if (oldV < 2) {
+      await db.execute('ALTER TABLE sentences ADD COLUMN mask TEXT;');
+    }
+    if (oldV < 3) {
+      // v2 → v3: introduce profiles. Existing rows fold into a
+      // pre-created "Default" profile (id=1). Tables with new
+      // composite UNIQUE constraints have to be rebuilt because
+      // SQLite can't ALTER an existing UNIQUE. FKs are already OFF
+      // here (set in onConfigure outside the transaction) so the
+      // DROP TABLE statements below won't cascade-wipe sentence_tags.
+      await db.execute('''
               CREATE TABLE profiles (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 created_at INTEGER NOT NULL
               )''');
-            await db.insert('profiles', {
-              'id': defaultProfileId,
-              'name': 'Default',
-              'created_at': DateTime.now().millisecondsSinceEpoch,
-            });
-            await db.execute('''
+      await db.insert('profiles', {
+        'id': defaultProfileId,
+        'name': 'Default',
+        'created_at': DateTime.now().millisecondsSinceEpoch,
+      });
+      await db.execute('''
               CREATE TABLE tags_new (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -184,14 +201,14 @@ class CupitorDb {
                 created_at INTEGER NOT NULL,
                 UNIQUE(profile_id, name)
               )''');
-            await db.execute('''
+      await db.execute('''
               INSERT INTO tags_new (id, profile_id, name, color, created_at)
               SELECT id, $defaultProfileId, name, color, created_at FROM tags
             ''');
-            await db.execute('DROP TABLE tags');
-            await db.execute('ALTER TABLE tags_new RENAME TO tags');
-            await db.execute('CREATE INDEX idx_tags_profile ON tags(profile_id)');
-            await db.execute('''
+      await db.execute('DROP TABLE tags');
+      await db.execute('ALTER TABLE tags_new RENAME TO tags');
+      await db.execute('CREATE INDEX idx_tags_profile ON tags(profile_id)');
+      await db.execute('''
               CREATE TABLE sentences_new (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -203,23 +220,23 @@ class CupitorDb {
                 created_at INTEGER NOT NULL,
                 UNIQUE(profile_id, page_id, text, prev_fp, next_fp)
               )''');
-            await db.execute('''
+      await db.execute('''
               INSERT INTO sentences_new (id, profile_id, page_id, text, prev_fp, next_fp, mask, created_at)
               SELECT id, $defaultProfileId, page_id, text, prev_fp, next_fp, mask, created_at FROM sentences
             ''');
-            await db.execute('DROP TABLE sentences');
-            await db.execute('ALTER TABLE sentences_new RENAME TO sentences');
-            await db.execute('CREATE INDEX idx_sentences_page ON sentences(page_id)');
-            await db.execute('CREATE INDEX idx_sentences_profile ON sentences(profile_id)');
-            // sentence_tags keeps its rows; FK targets still resolve
-            // because tag/sentence ids were preserved.
-            await db.execute('PRAGMA foreign_key_check;');
-          }
-          if (oldV < 4) {
-            // v3 → v4: add sentence_media table for image/audio/video
-            // attachments. Files live under app_docs/sentence_media,
-            // content-addressed by SHA-1.
-            await db.execute('''
+      await db.execute('DROP TABLE sentences');
+      await db.execute('ALTER TABLE sentences_new RENAME TO sentences');
+      await db.execute('CREATE INDEX idx_sentences_page ON sentences(page_id)');
+      await db.execute('CREATE INDEX idx_sentences_profile ON sentences(profile_id)');
+      // sentence_tags keeps its rows; FK targets still resolve
+      // because tag/sentence ids were preserved.
+      await db.execute('PRAGMA foreign_key_check;');
+    }
+    if (oldV < 4) {
+      // v3 → v4: add sentence_media table for image/audio/video
+      // attachments. Files live under app_docs/sentence_media,
+      // content-addressed by SHA-1.
+      await db.execute('''
               CREATE TABLE sentence_media (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 sentence_id INTEGER NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
@@ -230,23 +247,23 @@ class CupitorDb {
                 size_bytes  INTEGER,
                 created_at  INTEGER NOT NULL
               )''');
-            await db.execute('CREATE INDEX idx_sentence_media_sentence ON sentence_media(sentence_id)');
-            await db.execute('CREATE INDEX idx_sentence_media_sha1 ON sentence_media(sha1)');
-          }
-          if (oldV < 5) {
-            // v4 → v5: allow URL attachments alongside on-disk files.
-            // Existing rows have url = NULL and stay content-addressed.
-            await db.execute('ALTER TABLE sentence_media ADD COLUMN url TEXT');
-          }
-          if (oldV < 6) {
-            // v5 → v6: user-created playlists sourced from EPUB captures.
-            await db.execute('''
+      await db.execute('CREATE INDEX idx_sentence_media_sentence ON sentence_media(sentence_id)');
+      await db.execute('CREATE INDEX idx_sentence_media_sha1 ON sentence_media(sha1)');
+    }
+    if (oldV < 5) {
+      // v4 → v5: allow URL attachments alongside on-disk files.
+      // Existing rows have url = NULL and stay content-addressed.
+      await db.execute('ALTER TABLE sentence_media ADD COLUMN url TEXT');
+    }
+    if (oldV < 6) {
+      // v5 → v6: user-created playlists sourced from EPUB captures.
+      await db.execute('''
               CREATE TABLE playlists (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 name       TEXT NOT NULL,
                 created_at INTEGER NOT NULL
               )''');
-            await db.execute('''
+      await db.execute('''
               CREATE TABLE playlist_items (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 playlist_id   INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
@@ -258,16 +275,7 @@ class CupitorDb {
                 position      INTEGER NOT NULL,
                 created_at    INTEGER NOT NULL
               )''');
-            await db.execute('CREATE INDEX idx_playlist_items_playlist ON playlist_items(playlist_id)');
-          }
-        },
-      );
-      return _db;
-    } catch (e, st) {
-      _failed = true;
-      // ignore: avoid_print
-      print('CupitorDb open failed: $e\n$st');
-      return null;
+      await db.execute('CREATE INDEX idx_playlist_items_playlist ON playlist_items(playlist_id)');
     }
   }
 
