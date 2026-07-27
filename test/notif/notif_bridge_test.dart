@@ -250,4 +250,140 @@ void main() {
       expect(lastEvent('cupitorNotifLists'), isNotNull);
     });
   });
+
+  group('grade', () {
+    test('Good advances step, records event, emits cupitorNotifGraded',
+        () async {
+      await createFrenchList();
+      await bridge.handle(jsonEncode({
+        'op': 'grade', 'request_id': 'r-g', 'external_key': 'fr-1',
+        'item_external_id': 'c1', 'grade': 3,
+      }));
+      expect(lastAck()['ok'], true);
+      final list = (await dao.listByExternalKey(1, 'fr-1'))!;
+      final c1 = (await dao.itemByExternalId(list.id, 'c1'))!;
+      expect(c1.step, 1);
+      expect(c1.lastGrade, 3);
+      // offsets[1] = 1 wh from Mon 10:00 → 11:00.
+      expect(c1.nextDueAt,
+          tz.TZDateTime(ny, 2026, 7, 27, 11).millisecondsSinceEpoch);
+      final ev = (await dao.lastEventForItem(c1.id))!;
+      expect(ev.grade, 3);
+      expect(ev.source, 'webpage');
+      final graded = lastEvent('cupitorNotifGraded')!;
+      expect(graded['item_external_id'], 'c1');
+      expect(graded['grade'], 3);
+      expect(graded['source'], 'webpage');
+    });
+    test('grade on recurring list → not_series', () async {
+      await createFrenchList(scheduleKey: 'daily_0900');
+      await bridge.handle(jsonEncode({
+        'op': 'grade', 'external_key': 'fr-1',
+        'item_external_id': 'c1', 'grade': 3,
+      }));
+      expect(lastAck()['error'], 'not_series');
+    });
+    test('grade outside {1,3,5} → bad_grade', () async {
+      await createFrenchList();
+      await bridge.handle(jsonEncode({
+        'op': 'grade', 'external_key': 'fr-1',
+        'item_external_id': 'c1', 'grade': 2,
+      }));
+      expect(lastAck()['error'], 'bad_grade');
+    });
+    test('unknown item → unknown_item', () async {
+      await createFrenchList();
+      await bridge.handle(jsonEncode({
+        'op': 'grade', 'external_key': 'fr-1',
+        'item_external_id': 'zzz', 'grade': 3,
+      }));
+      expect(lastAck()['error'], 'unknown_item');
+    });
+  });
+
+  group('setSchedule', () {
+    test('recurring → series inits only items without series state',
+        () async {
+      await createFrenchList(scheduleKey: 'daily_0900');
+      final list = (await dao.listByExternalKey(1, 'fr-1'))!;
+      // Simulate c1 having prior series state from an earlier stint.
+      final c1 = (await dao.itemByExternalId(list.id, 'c1'))!;
+      await dao.updateItem(c1.id, {'step': 5, 'next_due_at': 777});
+
+      await bridge.handle(jsonEncode({
+        'op': 'setSchedule', 'external_key': 'fr-1',
+        'schedule_key': 'ebbinghaus',
+      }));
+      expect(lastAck()['ok'], true);
+
+      final after = (await dao.listByExternalKey(1, 'fr-1'))!;
+      expect(after.nextFireAt, isNull);
+      final c1After = (await dao.itemByExternalId(list.id, 'c1'))!;
+      expect(c1After.step, 5); // lossless: prior state kept
+      expect(c1After.nextDueAt, 777);
+      final c2After = (await dao.itemByExternalId(list.id, 'c2'))!;
+      expect(c2After.step, 0); // no prior state: initialised
+      expect(c2After.nextDueAt,
+          tz.TZDateTime(ny, 2026, 7, 27, 10, 15).millisecondsSinceEpoch);
+    });
+    test('series → recurring sets next_fire_at, leaves item state', () async {
+      await createFrenchList();
+      await bridge.handle(jsonEncode({
+        'op': 'setSchedule', 'external_key': 'fr-1',
+        'schedule_key': 'daily_0900',
+      }));
+      final after = (await dao.listByExternalKey(1, 'fr-1'))!;
+      expect(after.nextFireAt,
+          tz.TZDateTime(ny, 2026, 7, 28, 9).millisecondsSinceEpoch);
+      final c1 = (await dao.itemByExternalId(after.id, 'c1'))!;
+      expect(c1.nextDueAt, isNotNull); // unread but preserved
+    });
+    test('unknown schedule → unknown_schedule', () async {
+      await createFrenchList();
+      await bridge.handle(jsonEncode({
+        'op': 'setSchedule', 'external_key': 'fr-1', 'schedule_key': 'nope',
+      }));
+      expect(lastAck()['error'], 'unknown_schedule');
+    });
+  });
+
+  group('setStatus', () {
+    test('pause and resume; resume recomputes recurring next_fire_at',
+        () async {
+      await createFrenchList(scheduleKey: 'daily_0900');
+      await bridge.handle(jsonEncode(
+          {'op': 'setStatus', 'external_key': 'fr-1', 'status': 'paused'}));
+      expect((await dao.listByExternalKey(1, 'fr-1'))!.status, 'paused');
+
+      now = tz.TZDateTime(ny, 2026, 7, 30, 12); // resume days later
+      await bridge.handle(jsonEncode(
+          {'op': 'setStatus', 'external_key': 'fr-1', 'status': 'active'}));
+      final l = (await dao.listByExternalKey(1, 'fr-1'))!;
+      expect(l.status, 'active');
+      expect(l.nextFireAt,
+          tz.TZDateTime(ny, 2026, 7, 31, 9).millisecondsSinceEpoch);
+    });
+    test('bad status → bad_payload', () async {
+      await createFrenchList();
+      await bridge.handle(jsonEncode(
+          {'op': 'setStatus', 'external_key': 'fr-1', 'status': 'zzz'}));
+      expect(lastAck()['error'], 'bad_payload');
+    });
+  });
+
+  group('deleteList', () {
+    test('deletes and pushes updated lists', () async {
+      await createFrenchList();
+      await bridge.handle(jsonEncode(
+          {'op': 'deleteList', 'external_key': 'fr-1'}));
+      expect(lastAck()['ok'], true);
+      expect(await dao.listByExternalKey(1, 'fr-1'), isNull);
+      expect(lastEvent('cupitorNotifLists')!['lists'], isEmpty);
+    });
+    test('unknown key → unknown_list', () async {
+      await bridge.handle(jsonEncode(
+          {'op': 'deleteList', 'external_key': 'zzz'}));
+      expect(lastAck()['error'], 'unknown_list');
+    });
+  });
 }

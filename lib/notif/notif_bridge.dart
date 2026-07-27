@@ -103,7 +103,14 @@ class NotifBridge {
           await _syncItems(reqId, m);
         case 'getLists':
           await _getLists(reqId);
-        // Task 11 adds: grade, setSchedule, setStatus, deleteList.
+        case 'grade':
+          await _grade(reqId, m);
+        case 'setSchedule':
+          await _setSchedule(reqId, m);
+        case 'setStatus':
+          await _setStatus(reqId, m);
+        case 'deleteList':
+          await _deleteList(reqId, m);
         default:
           _ack(reqId, op, false, error: 'unknown_op');
       }
@@ -338,6 +345,154 @@ class NotifBridge {
     if (d == null) return;
     await _pushLists(d);
     _ack(reqId, op, true);
+  }
+
+  /// Shared list lookup with unknown_list ack.
+  Future<NotifListRow?> _listOrAck(
+      NotifDao d, String? reqId, String op, Object? key) async {
+    final k = key as String?;
+    if (k == null || k.isEmpty) {
+      _ack(reqId, op, false, error: 'bad_payload');
+      return null;
+    }
+    final list = await d.listByExternalKey(activeProfileId(), k);
+    if (list == null) _ack(reqId, op, false, error: 'unknown_list');
+    return list;
+  }
+
+  Future<void> _grade(String? reqId, Map<String, dynamic> m) async {
+    const op = 'grade';
+    final d = await _daoOrAck(reqId, op);
+    if (d == null) return;
+    final itemExt = m['item_external_id'] as String?;
+    final grade = (m['grade'] as num?)?.toInt();
+    if (itemExt == null || itemExt.isEmpty) {
+      _ack(reqId, op, false, error: 'bad_payload');
+      return;
+    }
+    if (grade != gradeAgain && grade != gradeGood && grade != gradeEasy) {
+      _ack(reqId, op, false, error: 'bad_grade');
+      return;
+    }
+    final list = await _listOrAck(d, reqId, op, m['external_key']);
+    if (list == null) return;
+    final schedule =
+        list.scheduleId == null ? null : await d.scheduleById(list.scheduleId!);
+    if (schedule == null || schedule.kind != 'series') {
+      _ack(reqId, op, false, error: 'not_series');
+      return;
+    }
+    final item = await d.itemByExternalId(list.id, itemExt);
+    if (item == null) {
+      _ack(reqId, op, false, error: 'unknown_item');
+      return;
+    }
+    final offsets =
+        seriesOffsets(jsonDecode(schedule.config) as Map<String, dynamic>);
+    final t = now();
+    final o = advanceSeries(
+        step: item.step, done: item.status == 'done',
+        offsetsWakingHours: offsets, now: t, grade: grade, window: window());
+    await d.updateItem(item.id, {
+      'step': o.step,
+      'status': o.done ? 'done' : 'active',
+      'next_due_at': o.nextDue?.millisecondsSinceEpoch,
+      'last_grade': grade,
+    });
+    final nowMs = t.millisecondsSinceEpoch;
+    // A webpage grade is review-without-fire; fired_at = responded_at keeps
+    // the event usable for dedupe and the sweep (spec: notif_events).
+    await d.insertEvent(
+        itemId: item.id, firedAt: nowMs, respondedAt: nowMs,
+        grade: grade, source: 'webpage');
+    emit('cupitorNotifGraded', {
+      'external_key': list.externalKey,
+      'item_external_id': itemExt,
+      'grade': grade,
+      'source': 'webpage',
+    });
+    _ack(reqId, op, true);
+    await _afterMutation(d);
+  }
+
+  Future<void> _setSchedule(String? reqId, Map<String, dynamic> m) async {
+    const op = 'setSchedule';
+    final d = await _daoOrAck(reqId, op);
+    if (d == null) return;
+    final list = await _listOrAck(d, reqId, op, m['external_key']);
+    if (list == null) return;
+    final schedule = await d.scheduleByKey((m['schedule_key'] as String?) ?? '');
+    if (schedule == null) {
+      _ack(reqId, op, false, error: 'unknown_schedule');
+      return;
+    }
+    final w = window();
+    final t = now();
+    final config = jsonDecode(schedule.config) as Map<String, dynamic>;
+    if (schedule.kind == 'recurring') {
+      // Series → recurring: per-item state stays in place, unread (spec:
+      // lossless round trip).
+      await d.updateList(list.id, {
+        'schedule_id': schedule.id,
+        'next_fire_at': nextRecurringFire(parseRecurring(config), t, w)
+            .millisecondsSinceEpoch,
+      });
+    } else {
+      final offsets = seriesOffsets(config);
+      await d.updateList(list.id, {'schedule_id': schedule.id, 'next_fire_at': null});
+      for (final i in await d.itemsForList(list.id)) {
+        // Only items with no series state get initialised — items that
+        // carry state from an earlier stint keep it (spec: lossless).
+        if (i.status == 'active' && i.nextDueAt == null) {
+          await d.updateItem(i.id, {
+            'step': 0,
+            'next_due_at':
+                addWakingHours(t, offsets[0], w).millisecondsSinceEpoch,
+          });
+        }
+      }
+    }
+    _ack(reqId, op, true);
+    await _afterMutation(d);
+  }
+
+  Future<void> _setStatus(String? reqId, Map<String, dynamic> m) async {
+    const op = 'setStatus';
+    final d = await _daoOrAck(reqId, op);
+    if (d == null) return;
+    final status = m['status'] as String?;
+    if (status != 'active' && status != 'paused') {
+      _ack(reqId, op, false, error: 'bad_payload');
+      return;
+    }
+    final list = await _listOrAck(d, reqId, op, m['external_key']);
+    if (list == null) return;
+    final fields = <String, Object?>{'status': status};
+    if (status == 'active' && list.scheduleId != null) {
+      final schedule = await d.scheduleById(list.scheduleId!);
+      if (schedule != null && schedule.kind == 'recurring') {
+        // Resuming a recurring list re-anchors its fire time to now — the
+        // stale pre-pause slot may be long past.
+        fields['next_fire_at'] = nextRecurringFire(
+                parseRecurring(jsonDecode(schedule.config) as Map<String, dynamic>),
+                now(), window())
+            .millisecondsSinceEpoch;
+      }
+    }
+    await d.updateList(list.id, fields);
+    _ack(reqId, op, true);
+    await _afterMutation(d);
+  }
+
+  Future<void> _deleteList(String? reqId, Map<String, dynamic> m) async {
+    const op = 'deleteList';
+    final d = await _daoOrAck(reqId, op);
+    if (d == null) return;
+    final list = await _listOrAck(d, reqId, op, m['external_key']);
+    if (list == null) return;
+    await d.deleteList(list.id);
+    _ack(reqId, op, true);
+    await _afterMutation(d);
   }
 }
 
