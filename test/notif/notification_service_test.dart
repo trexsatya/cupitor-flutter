@@ -255,4 +255,63 @@ void main() {
       expect(channel.scheduled, hasLength(1));
     });
   });
+
+  group('handleAction / recordOpened', () {
+    Future<(NotifListRow, NotifItemRow)> firedItem() async {
+      final l = await seriesList(ek: 'fr-1');
+      final item = await dao.insertItem(
+          listId: l.id, externalId: 'c1', title: 'x', position: 0,
+          nextDueAt: nowMs() - 1000);
+      await service.sweep(); // fires it, step → 1
+      channel.shown.clear();
+      channel.scheduled.clear();
+      return (l, (await dao.itemById(item.id))!);
+    }
+
+    test('again resets to step 0 and records responded event', () async {
+      final (_, item) = await firedItem();
+      final payload = jsonEncode({'v': 1, 'item_id': item.id});
+      final graded = await service.handleAction('again', payload);
+      expect(graded, isNotNull);
+      final after = (await dao.itemById(item.id))!;
+      expect(after.step, 0);
+      expect(after.lastGrade, 1);
+      final ev = (await dao.lastEventForItem(item.id))!;
+      expect(ev.grade, 1);
+      expect(ev.source, 'action');
+      expect(ev.respondedAt, nowMs());
+      expect(graded!.$2, 1); // (externals, grade) for the cupitorNotifGraded push
+    });
+
+    test('good and easy advance from the post-fire step', () async {
+      final (_, item) = await firedItem(); // step 1 after auto-advance
+      await service.handleAction(
+          'easy', jsonEncode({'v': 1, 'item_id': item.id}));
+      expect((await dao.itemById(item.id))!.step, 3); // 1 + 2
+    });
+
+    test('unknown action / bad payload / missing item are silent no-ops',
+        () async {
+      expect(await service.handleAction('again', 'not-json'), isNull);
+      expect(await service.handleAction('again',
+          jsonEncode({'v': 1, 'item_id': 999999})), isNull);
+      final (_, item) = await firedItem();
+      expect(await service.handleAction('snooze',
+          jsonEncode({'v': 1, 'item_id': item.id})), isNull);
+    });
+
+    test('handleAction ends by rearming', () async {
+      final (_, item) = await firedItem();
+      await service.handleAction(
+          'good', jsonEncode({'v': 1, 'item_id': item.id}));
+      expect(channel.scheduled, isNotEmpty);
+    });
+
+    test('recordOpened stamps responded_at on the latest fire event', () async {
+      final (_, item) = await firedItem();
+      await service.recordOpened(jsonEncode({'v': 1, 'item_id': item.id}));
+      final ev = (await dao.lastEventForItem(item.id))!;
+      expect(ev.respondedAt, nowMs());
+    });
+  });
 }

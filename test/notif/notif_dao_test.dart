@@ -152,4 +152,16 @@ void main() {
     expect(await dao.itemById(999999), isNull);
     expect(await dao.listById(999999), isNull);
   });
+
+  test('markEventResponded stamps only the target event', () async {
+    final l = await dao.createList(profileId: 1, name: 'L', source: 'app');
+    final i = await dao.insertItem(listId: l.id, title: 'x', position: 0);
+    final e1 = await dao.insertEvent(itemId: i.id, firedAt: 100);
+    final e2 = await dao.insertEvent(itemId: i.id, firedAt: 200);
+    await dao.markEventResponded(e2, 250);
+    final last = (await dao.lastEventForItem(i.id))!;
+    expect(last.id, e2);
+    expect(last.respondedAt, 250);
+    expect(e1, isNot(e2));
+  });
 }

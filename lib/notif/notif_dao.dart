@@ -363,4 +363,9 @@ class NotifDao {
         orderBy: 'fired_at DESC, id DESC', limit: 1);
     return r.isEmpty ? null : NotifEventRow.fromMap(r.first);
   }
+
+  Future<void> markEventResponded(int eventId, int respondedAtMs) async {
+    await db.update('notif_events', {'responded_at': respondedAtMs},
+        where: 'id = ?', whereArgs: [eventId]);
+  }
 }

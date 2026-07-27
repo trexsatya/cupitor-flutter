@@ -232,4 +232,70 @@ class NotificationService {
     if (s == null || s.kind != 'series') return null;
     return seriesOffsets(jsonDecode(s.config) as Map<String, dynamic>);
   }
+
+  // ── notification responses ───────────────────────────────────────────
+
+  static const Map<String, int> actionGrades = {
+    'again': gradeAgain,
+    'good': gradeGood,
+    'easy': gradeEasy,
+  };
+
+  /// Grade an item from a notification action button. Returns
+  /// ((list_ek, item_eid), grade) for the caller to emit cupitorNotifGraded
+  /// (foreground only — the background isolate has no webview), or null on
+  /// any invalid input — a notification action must never crash the app.
+  Future<((String?, String?), int)?> handleAction(
+      String actionId, String payloadJson) async {
+    final grade = actionGrades[actionId];
+    if (grade == null) return null;
+    final d = await dao();
+    if (d == null) return null;
+    Map<String, dynamic> p;
+    try {
+      p = jsonDecode(payloadJson) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+    final itemId = p['item_id'];
+    if (itemId is! int) return null;
+    final item = await d.itemById(itemId);
+    if (item == null) return null;
+    final offsets = await _offsetsForList(d, item.listId);
+    if (offsets == null) return null; // not a series list (or list gone)
+
+    final t = now();
+    final o = advanceSeries(
+        step: item.step, done: item.status == 'done',
+        offsetsWakingHours: offsets, now: t, grade: grade, window: window());
+    await d.updateItem(item.id, {
+      'step': o.step,
+      'status': o.done ? 'done' : 'active',
+      'next_due_at': o.nextDue?.millisecondsSinceEpoch,
+      'last_grade': grade,
+    });
+    final nowMs = t.millisecondsSinceEpoch;
+    await d.insertEvent(
+        itemId: item.id, firedAt: item.lastFiredAt ?? nowMs,
+        respondedAt: nowMs, grade: grade, source: 'action');
+    final list = await d.listById(item.listId);
+    await rearm();
+    return ((list?.externalKey, item.externalId), grade);
+  }
+
+  /// Body tap: stamp responded_at on the item's latest event so the sweep's
+  /// already-handled check sees it. Navigation is the caller's job.
+  Future<void> recordOpened(String payloadJson) async {
+    final d = await dao();
+    if (d == null) return;
+    try {
+      final p = jsonDecode(payloadJson) as Map<String, dynamic>;
+      final itemId = p['item_id'];
+      if (itemId is! int) return;
+      final last = await d.lastEventForItem(itemId);
+      if (last != null && last.respondedAt == null) {
+        await d.markEventResponded(last.id, now().millisecondsSinceEpoch);
+      }
+    } catch (_) {/* never crash on a tap */}
+  }
 }
