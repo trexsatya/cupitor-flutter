@@ -74,6 +74,12 @@ dependencies:
   # manager. Dialog1 already plays these via HTML5 Audio, but the
   # memory-manager screen is pure Flutter and needs its own player.
   audioplayers: ^6.1.0
+  # Notifications feature (spec: docs/superpowers/specs/2026-07-27-notifications-design.md).
+  # timezone: waking-hour arithmetic must be DST-correct and testable against a
+  # pinned zone — bare DateTime resolves against the host machine.
+  # flutter_timezone: device IANA zone name to seed tz.local.
+  timezone: ^0.9.4
+  flutter_timezone: ^2.1.0
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
@@ -81,6 +87,10 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+
+  # In-memory SQLite so NotifDao and the v6→v7 migration are unit-testable
+  # without a device (CupitorDb itself needs path_provider).
+  sqflite_common_ffi: ^2.3.3
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is

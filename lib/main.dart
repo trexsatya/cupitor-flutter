@@ -15,6 +15,9 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:google_mlkit_translation/google_mlkit_translation.dart' as mlkit;
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:flutter_timezone/flutter_timezone.dart';
+import 'package:timezone/data/latest.dart' as tzdata;
+import 'package:timezone/timezone.dart' as tz;
 import 'yt_dlp_service.dart';
 import 'epub_reader.dart';
 import 'db.dart';
@@ -30,6 +33,14 @@ import 'text_transform.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Notifications: waking-hour math and (Plan 2) zonedSchedule both need the
+  // device zone. Fallback to UTC keeps the feature alive with shifted windows
+  // rather than crashing.
+  tzdata.initializeTimeZones();
+  try {
+    final zoneName = await FlutterTimezone.getLocalTimezone();
+    tz.setLocalLocation(tz.getLocation(zoneName));
+  } catch (_) {/* tz.local stays UTC */}
   // Hide both system bars for maximum reading area, but rely on
   // `immersiveSticky` so the user can swipe from any edge to transiently
   // reveal them (status bar top, back / home / recents bottom). They
