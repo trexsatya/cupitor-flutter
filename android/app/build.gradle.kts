@@ -13,6 +13,9 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+        // flutter_local_notifications 18 needs Java 8+ API desugaring to
+        // support scheduled notifications back to older Android versions.
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
@@ -93,4 +96,7 @@ dependencies {
     // owns audio (often the YT iframe's own internal session), and we have no
     // hook to add custom behavior like "repeat previous video".
     implementation("androidx.media:media:1.7.0")
+    // Required by flutter_local_notifications 18 (core library desugaring,
+    // see compileOptions above).
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }

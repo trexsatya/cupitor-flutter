@@ -78,13 +78,26 @@ dependencies:
   # timezone: waking-hour arithmetic must be DST-correct and testable against a
   # pinned zone — bare DateTime resolves against the host machine.
   # flutter_timezone: device IANA zone name to seed tz.local.
+  # Pinned >=3.0.1 (not the originally-planned ^2.1.0): 2.1.0's Android side
+  # still references the v1-embedding PluginRegistry.Registrar shim, which
+  # Flutter's engine jar has fully removed as of this SDK (build fails with
+  # "Unresolved reference 'Registrar'"). 3.0.1 dropped v1-embedding support
+  # and is otherwise the same Dart API (Future<String> getLocalTimezone()),
+  # so this is a build-fix bump, not a behavior change.
   timezone: ^0.9.4
-  flutter_timezone: ^2.1.0
+  flutter_timezone: ^3.0.1
   # Delivery layer (Plan 2). flutter_local_notifications: pre-armed OS alarms
   # + offline action buttons on Android/iOS/macOS/Linux. workmanager: Android
   # periodic safety net (rearm + sweep) — spec §Delivery.
   flutter_local_notifications: ^18.0.1
-  workmanager: ^0.5.2
+  # Pinned >=0.6.0 (not the originally-planned ^0.5.2): 0.5.2's Android side
+  # still references v1-embedding shims (ShimPluginRegistry,
+  # PluginRegistrantCallback, PluginRegistry.Registrar) that this Flutter
+  # SDK's engine jar no longer ships (build fails with "Unresolved
+  # reference"). 0.6.0's changelog: "Removed V1 plugin APIs - this is now a
+  # Android V2 plugin only"; the Dart API (Workmanager(), initialize(),
+  # registerPeriodicTask(), ExistingWorkPolicy) is unchanged.
+  workmanager: ^0.6.0
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8

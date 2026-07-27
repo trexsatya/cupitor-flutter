@@ -20,6 +20,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:timezone/data/latest.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
+import 'package:workmanager/workmanager.dart';
 import 'yt_dlp_service.dart';
 import 'epub_reader.dart';
 import 'db.dart';
@@ -79,6 +80,35 @@ Future<void> notifBackgroundActionHandler(
   }
 }
 
+/// WorkManager entry point (Android periodic safety net, spec §Delivery:
+/// re-arms the window and sweeps missed fires ~every 30 min even if alarms
+/// were dropped by an OEM battery killer).
+@pragma('vm:entry-point')
+void notifWorkmanagerDispatcher() {
+  Workmanager().executeTask((task, inputData) async {
+    try {
+      WidgetsFlutterBinding.ensureInitialized();
+      DartPluginRegistrant.ensureInitialized();
+      tzdata.initializeTimeZones();
+      try {
+        final zoneName = await FlutterTimezone.getLocalTimezone()
+            .timeout(const Duration(seconds: 2));
+        tz.setLocalLocation(tz.getLocation(zoneName));
+      } catch (_) {}
+      await NotifSettings.init();
+      await notifChannel.init(NotifCallbacks(
+        onOpened: (_) async {},
+        onAction: (_, __) async {},
+      ));
+      await notifService.sweep();
+      return true;
+    } catch (e) {
+      debugPrint('notif worker failed: $e');
+      return false; // let WorkManager retry
+    }
+  });
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // Notifications: waking-hour math and (Plan 2) zonedSchedule both need the
@@ -93,6 +123,14 @@ void main() async {
   }
   FlutterNotifChannel.backgroundHandler =
       (actionId, payload) => notifBackgroundActionHandler(actionId, payload);
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+    await Workmanager().initialize(notifWorkmanagerDispatcher);
+    await Workmanager().registerPeriodicTask(
+      'cupitor-notif-sweep', 'notifSweep',
+      frequency: const Duration(minutes: 30),
+      existingWorkPolicy: ExistingWorkPolicy.keep,
+    );
+  }
   // Hide both system bars for maximum reading area, but rely on
   // `immersiveSticky` so the user can swipe from any edge to transiently
   // reveal them (status bar top, back / home / recents bottom). They
