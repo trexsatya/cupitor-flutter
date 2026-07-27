@@ -71,8 +71,8 @@ void main() {
 
       await service.rearm();
       expect(channel.cancelAllCalls, 1);
-      expect(channel.scheduled, hasLength(1));
-      final f = channel.scheduled.single;
+      expect(channel.scheduled.where((f) => !f.isSummary), hasLength(1));
+      final f = channel.scheduled.firstWhere((f) => !f.isSummary);
       expect(f.notifId, NotificationService.itemNotifId(soon.id));
       expect(f.title, 'soon');
       expect(f.whenMs, nowMs() + 3600000);
@@ -88,7 +88,8 @@ void main() {
           listId: l.id, title: 'x', position: 0, nextDueAt: nowMs() + 1000);
       await service.rearm();
       await service.rearm();
-      expect(channel.scheduled, hasLength(1)); // fake clears on cancelAll
+      expect(channel.scheduled.where((f) => !f.isSummary),
+          hasLength(1)); // fake clears on cancelAll
       expect(channel.cancelAllCalls, 2);
     });
 
@@ -100,7 +101,8 @@ void main() {
             listId: l.id, title: 'i$i', position: i, nextDueAt: due + i * 100);
       }
       await service.rearm();
-      expect(channel.scheduled, hasLength(5)); // cap 5, 3 deferred
+      expect(channel.scheduled.where((f) => !f.isSummary),
+          hasLength(5)); // cap 5, 3 deferred
     });
 
     test('maxArmed cap holds', () async {
@@ -112,7 +114,9 @@ void main() {
             nextDueAt: nowMs() + (i + 1) * 120000);
       }
       await service.rearm();
-      expect(channel.scheduled, hasLength(60));
+      expect(channel.scheduled.where((f) => !f.isSummary), hasLength(60));
+      // One list → exactly one summary, exempt from the maxArmed cap.
+      expect(channel.scheduled.where((f) => f.isSummary), hasLength(1));
     });
 
     test('recurring list arms next fire with rotation items, no actions',
@@ -125,8 +129,9 @@ void main() {
       await dao.insertItem(listId: l.id, title: 'r1', position: 1);
 
       await service.rearm();
-      expect(channel.scheduled, hasLength(1)); // per_fire = 1
-      final f = channel.scheduled.single;
+      expect(channel.scheduled.where((f) => !f.isSummary),
+          hasLength(1)); // per_fire = 1
+      final f = channel.scheduled.firstWhere((f) => !f.isSummary);
       expect(f.title, 'r0'); // cursor 0
       expect(f.withActions, isFalse);
       expect(f.whenMs, nowMs() + 3600000);
@@ -163,8 +168,8 @@ void main() {
           nextDueAt: nowMs() - 3600000); // 1 waking hour ago (10:00 Mon)
       await service.sweep();
 
-      expect(channel.shown, hasLength(1));
-      expect(channel.shown.single.notifId,
+      expect(channel.shown.where((f) => !f.isSummary), hasLength(1));
+      expect(channel.shown.firstWhere((f) => !f.isSummary).notifId,
           NotificationService.itemNotifId(item.id));
       final after = (await dao.itemById(item.id))!;
       expect(after.step, 1); // auto-advance = the automatic fading
@@ -210,8 +215,8 @@ void main() {
       await dao.insertItem(listId: l.id, title: 'r1', position: 1);
       await service.sweep();
 
-      expect(channel.shown, hasLength(1));
-      expect(channel.shown.single.title, 'r0');
+      expect(channel.shown.where((f) => !f.isSummary), hasLength(1));
+      expect(channel.shown.firstWhere((f) => !f.isSummary).title, 'r0');
       final after = (await dao.listById(l.id))!;
       expect(after.cursor, 1);
       expect(after.lastFiredAt, nowMs());
@@ -241,7 +246,7 @@ void main() {
             nextDueAt: nowMs() - 1000 - i);
       }
       await service.sweep();
-      expect(channel.shown, hasLength(5));
+      expect(channel.shown.where((f) => !f.isSummary), hasLength(5));
       // The other 3 still advanced silently (auto) so the backlog drains.
       final items = await dao.itemsForList(l.id);
       expect(items.where((i) => i.step == 1), hasLength(8));
@@ -253,7 +258,7 @@ void main() {
           listId: l.id, title: 'due', position: 0, nextDueAt: nowMs() - 1000);
       await service.sweep();
       // The auto-advanced item got a future next_due_at → must now be armed.
-      expect(channel.scheduled, hasLength(1));
+      expect(channel.scheduled.where((f) => !f.isSummary), hasLength(1));
     });
   });
 
@@ -330,7 +335,8 @@ void main() {
           scheduleId: daily!.id, nextFireAt: nowMs() - 60000);
       await dao.insertItem(listId: r.id, title: 'r0', position: 0);
       await service.sweep();
-      expect(channel.shown, hasLength(5)); // series ate the cap
+      expect(channel.shown.where((f) => !f.isSummary),
+          hasLength(5)); // series ate the cap
       final after = (await dao.listById(r.id))!;
       expect(after.cursor, 0); // rotation NOT consumed
       expect(after.lastFiredAt, isNull); // no phantom fire stamp
@@ -347,8 +353,9 @@ void main() {
       await dao.insertItem(
           listId: r.id, title: 'r0', position: 0, nextDueAt: nowMs() + 3600000);
       await service.rearm();
-      expect(channel.scheduled, hasLength(1));
-      expect(channel.scheduled.single.whenMs, nowMs() + 3600000); // earliest wins
+      expect(channel.scheduled.where((f) => !f.isSummary), hasLength(1));
+      expect(channel.scheduled.firstWhere((f) => !f.isSummary).whenMs,
+          nowMs() + 3600000); // earliest wins
     });
 
     test('good on a done item is a silent no-op', () async {
@@ -388,6 +395,59 @@ void main() {
           listId: l.id, title: 'b', position: 1, nextDueAt: nowMs() + 2000);
       await svc.rearm(); // must not throw
       expect(throwing.attempts, 2); // tried both, gave up per-fire
+    });
+  });
+
+  group('group summaries', () {
+    test('rearm schedules one summary per armed group at earliest fire time',
+        () async {
+      final l = await seriesList(name: 'French');
+      await dao.insertItem(
+          listId: l.id, title: 'a', position: 0, nextDueAt: nowMs() + 2000);
+      await dao.insertItem(
+          listId: l.id, title: 'b', position: 1, nextDueAt: nowMs() + 1000);
+      await service.rearm();
+      final summaries =
+          channel.scheduled.where((f) => f.isSummary).toList();
+      expect(summaries, hasLength(1));
+      expect(summaries.single.notifId,
+          NotificationService.summaryNotifId(l.id));
+      expect(summaries.single.whenMs, nowMs() + 1000); // earliest
+      expect(summaries.single.title, 'French');
+      // Items themselves are unaffected and summaries don't eat the caps.
+      expect(channel.scheduled.where((f) => !f.isSummary), hasLength(2));
+    });
+
+    test('summaries are exempt from per-minute cap and maxArmed', () async {
+      final l = await seriesList();
+      final due = nowMs() + 600000;
+      for (var i = 0; i < 5; i++) {
+        await dao.insertItem(
+            listId: l.id, title: 'i$i', position: i, nextDueAt: due + i * 100);
+      }
+      await service.rearm();
+      expect(channel.scheduled.where((f) => !f.isSummary), hasLength(5));
+      expect(channel.scheduled.where((f) => f.isSummary), hasLength(1));
+    });
+
+    test('sweep posts a summary once per list that posted fires', () async {
+      final l = await seriesList();
+      await dao.insertItem(
+          listId: l.id, title: 'x', position: 0, nextDueAt: nowMs() - 1000);
+      await dao.insertItem(
+          listId: l.id, title: 'y', position: 1, nextDueAt: nowMs() - 2000);
+      await service.sweep();
+      expect(channel.shown.where((f) => !f.isSummary), hasLength(2));
+      expect(channel.shown.where((f) => f.isSummary), hasLength(1));
+    });
+
+    test('no summary when nothing was posted for a list', () async {
+      final l = await seriesList();
+      await dao.insertItem(
+          listId: l.id, title: 'stale', position: 0,
+          nextDueAt: nowMs() - 4 * 3600000); // beyond grace: silent
+      await service.sweep();
+      expect(channel.shown, isEmpty);
     });
   });
 }

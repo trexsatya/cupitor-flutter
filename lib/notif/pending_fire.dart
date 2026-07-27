@@ -22,6 +22,9 @@ class PendingFire {
   /// Again/Good/Easy buttons. Only true for series-list items.
   final bool withActions;
 
+  /// Group summary scaffolding (Android): setAsGroupSummary, exempt from caps.
+  final bool isSummary;
+
   const PendingFire({
     required this.notifId,
     required this.whenMs,
@@ -30,5 +33,6 @@ class PendingFire {
     required this.payloadJson,
     required this.groupKey,
     required this.withActions,
+    this.isSummary = false,
   });
 }

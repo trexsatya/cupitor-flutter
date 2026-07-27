@@ -181,6 +181,10 @@ class FlutterNotifChannel implements NotifChannel {
         androidChannelName,
         channelDescription: 'Spaced-repetition review reminders',
         groupKey: fire.groupKey,
+        // Without a summary row Android's auto-grouping ignores our custom
+        // groupKey (it only kicks in below 4 ungrouped notifications), so
+        // grouped fires never collapse into a stack.
+        setAsGroupSummary: fire.isSummary,
         actions: fire.withActions
             ? const [
                 AndroidNotificationAction('again', 'Again',

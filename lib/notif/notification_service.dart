@@ -38,6 +38,10 @@ class NotificationService {
   /// keeps this range disjoint from any future id families (int32-safe).
   static int itemNotifId(int itemId) => 0x1000000 + itemId;
 
+  /// Android group-summary row id, one per list. Disjoint id family from
+  /// itemNotifId's 0x1000000 so a summary can never collide with an item.
+  static int summaryNotifId(int listId) => 0x2000000 + listId;
+
   /// Rearm window: 48 absolute hours (spec §Arming).
   static const int windowMs = 48 * 3600 * 1000;
 
@@ -72,6 +76,11 @@ class NotificationService {
     final perMinute = <int, int>{};
     var armed = 0;
     final seenIds = <int>{};
+    // Earliest successfully-armed whenMs per list, keyed by listId (parsed
+    // back out of the fire's groupKey — the "cupitor-notif-list-<id>" format
+    // is owned by this file, see _itemFire/_recurringFires). Used to arm one
+    // group-summary row per list below, exempt from both caps above.
+    final earliestArmedByList = <int, int>{};
     for (final f in fires) {
       if (armed >= maxArmed) break;
       if (!seenIds.add(f.notifId)) continue; // same item via two paths
@@ -88,8 +97,47 @@ class NotificationService {
       }
       perMinute[bucket] = inBucket + 1;
       armed++;
+      final listId =
+          int.parse(f.groupKey.substring('cupitor-notif-list-'.length));
+      final earliest = earliestArmedByList[listId];
+      if (earliest == null || f.whenMs < earliest) {
+        earliestArmedByList[listId] = f.whenMs;
+      }
+    }
+
+    // One group-summary row per list that actually got something armed —
+    // without it, Android won't collapse custom-grouped notifications into
+    // a stack (system auto-grouping only kicks in below 4 without a summary,
+    // and doesn't understand our custom groupKey at all). Scheduled after
+    // the capped loop so summaries never count against perMinute/maxArmed.
+    for (final entry in earliestArmedByList.entries) {
+      final list = await d.listById(entry.key);
+      if (list == null) continue;
+      try {
+        await channel.schedule(_summaryFire(list, entry.value));
+      } catch (_) {
+        // Same rationale as the per-fire guard above: a summary that can't
+        // be scheduled must not take down the rest of arming.
+      }
     }
   }
+
+  /// Android group-summary scaffolding for [list] at [whenMs] (the earliest
+  /// armed/posted fire time for that list's group). Darwin/Linux channels
+  /// ignore isSummary; Android sets setAsGroupSummary so grouped fires
+  /// collapse into a stack instead of the system's default heuristic
+  /// (auto-grouping only applies with 4+ ungrouped notifications and ignores
+  /// custom groupKeys).
+  PendingFire _summaryFire(NotifListRow list, int whenMs) => PendingFire(
+        notifId: summaryNotifId(list.id),
+        whenMs: whenMs,
+        title: list.name,
+        body: 'Reviews due',
+        payloadJson: jsonEncode({'v': 1, 'summary': true}),
+        groupKey: 'cupitor-notif-list-${list.id}',
+        withActions: false,
+        isSummary: true,
+      );
 
   // ── shared fire construction ─────────────────────────────────────────
 
@@ -154,6 +202,9 @@ class NotificationService {
     final w = window();
     final cap = perFireCap();
     var posted = 0;
+    // One summary showNow per list that actually posted a fire this sweep
+    // (spec: group summary rows so collapsed Android notifications behave).
+    final summarized = <int>{};
 
     // Overdue series items.
     for (final item in await d.dueItems(nowMs)) {
@@ -169,6 +220,12 @@ class NotificationService {
         posted++;
         await channel.showNow(await _itemFire(d, item, nowMs,
             withActions: await _isSeriesList(d, item.listId)));
+        if (summarized.add(item.listId)) {
+          final list = await d.listById(item.listId);
+          if (list != null) {
+            await channel.showNow(_summaryFire(list, nowMs));
+          }
+        }
       }
       // Automatic fading: every processed fire advances one step. Items in
       // recurring lists carry due times only if they have prior series
@@ -223,6 +280,9 @@ class NotificationService {
                 await _itemFire(d, item, nowMs, withActions: false));
             await d.updateItem(item.id, {'last_fired_at': nowMs});
             await d.insertEvent(itemId: item.id, firedAt: nowMs);
+            if (summarized.add(list.id)) {
+              await channel.showNow(_summaryFire(list, nowMs));
+            }
           }
           newCursor = sel.newCursor;
           firedAny = sel.items.isNotEmpty;
