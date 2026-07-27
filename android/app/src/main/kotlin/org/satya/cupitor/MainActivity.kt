@@ -281,25 +281,52 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
                 "requestMicrophone" -> requestMicPermission(result)
                 "startNativeRecording" -> {
-                    val path = call.argument<String>("path")
-                    if (path.isNullOrBlank()) { result.error("BAD_ARG", "path required", null); return@setMethodCallHandler }
-                    startNativeRecording(path, result)
+                    // New API: caller passes `pathStem` (no extension) and the
+                    // recorder picks .ogg / .m4a based on the OS's Opus support.
+                    // We still accept the legacy `path` key (extension included)
+                    // for callers that haven't been updated yet — the recorder
+                    // strips the extension before deciding the container.
+                    val pathStem = call.argument<String>("pathStem")
+                        ?: call.argument<String>("path")?.let {
+                            val dot = it.lastIndexOf('.')
+                            if (dot > 0) it.substring(0, dot) else it
+                        }
+                    if (pathStem.isNullOrBlank()) {
+                        result.error("BAD_ARG", "pathStem required", null)
+                        return@setMethodCallHandler
+                    }
+                    startNativeRecording(pathStem, result)
                 }
                 "stopNativeRecording" -> stopNativeRecording(result)
                 "cancelNativeRecording" -> cancelNativeRecording(result)
                 "isNativeRecording" -> result.success(nativeRecorder != null)
+                "shareText" -> {
+                    val text = call.argument<String>("text") ?: ""
+                    val chooserTitle = call.argument<String>("chooserTitle") ?: "Share"
+                    val subject = call.argument<String>("subject")
+                    if (text.isEmpty()) {
+                        result.error("BAD_ARG", "text required", null)
+                        return@setMethodCallHandler
+                    }
+                    shareText(text, chooserTitle, subject)
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         }
     }
 
     // ---- Native MediaRecorder ----
-    // start: open AudioRecord through MediaRecorder, write AAC/MP4 to `path`.
-    //        Returns true on a successful start, errors otherwise.
+    // start: open AudioRecord through MediaRecorder, write to a
+    //        <stem>.<ext> file where the container is chosen from the
+    //        platform's Opus support:
+    //          API ≥ 29 (Android 10+): OPUS in an OGG container (.ogg)
+    //          API < 29:               AAC-LC in MPEG-4 (.m4a)
+    //        Returns the actual file path on success, errors otherwise.
     // stop:  finish writing the file and return the path. Returns null if
     //        nothing was recording.
     // cancel: stop without keeping the file; deletes any partial output.
-    private fun startNativeRecording(path: String, result: MethodChannel.Result) {
+    private fun startNativeRecording(pathStem: String, result: MethodChannel.Result) {
         if (androidx.core.content.ContextCompat.checkSelfPermission(
                 this, android.Manifest.permission.RECORD_AUDIO
             ) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -316,15 +343,28 @@ class MainActivity : FlutterActivity() {
             @Suppress("DEPRECATION")
             android.media.MediaRecorder()
         }
+        val useOpus = android.os.Build.VERSION.SDK_INT >= 29
+        val path = if (useOpus) "$pathStem.ogg" else "$pathStem.m4a"
         try {
             rec.setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
-            rec.setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
-            rec.setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
-            // 64 kbps mono is plenty for spoken-word pronunciation cards and
-            // keeps the on-disk file ≲ 1 KB per second.
-            rec.setAudioChannels(1)
-            rec.setAudioSamplingRate(44100)
-            rec.setAudioEncodingBitRate(64_000)
+            if (useOpus) {
+                // OPUS/OGG path — the modern, most storage-efficient choice
+                // for speech. 24 kbps mono @ 16 kHz is transparent for
+                // spoken word and lands at ~3 KB/sec on disk (~180 KB/min).
+                rec.setOutputFormat(android.media.MediaRecorder.OutputFormat.OGG)
+                rec.setAudioEncoder(android.media.MediaRecorder.AudioEncoder.OPUS)
+                rec.setAudioChannels(1)
+                rec.setAudioSamplingRate(16_000)
+                rec.setAudioEncodingBitRate(24_000)
+            } else {
+                // API 24–28 fallback: AAC-LC in MPEG-4 (.m4a). Tuned for
+                // speech (16 kHz / 32 kbps mono) — ~4 KB/sec on disk.
+                rec.setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
+                rec.setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
+                rec.setAudioChannels(1)
+                rec.setAudioSamplingRate(16_000)
+                rec.setAudioEncodingBitRate(32_000)
+            }
             rec.setOutputFile(path)
             rec.prepare()
             rec.start()
@@ -337,7 +377,7 @@ class MainActivity : FlutterActivity() {
         }
         nativeRecorder = rec
         nativeRecorderPath = path
-        result.success(true)
+        result.success(path)
     }
 
     private fun stopNativeRecording(result: MethodChannel.Result) {
@@ -373,6 +413,23 @@ class MainActivity : FlutterActivity() {
         }
         if (!path.isNullOrEmpty()) { try { java.io.File(path).delete() } catch (_: Exception) {} }
         result.success(null)
+    }
+
+    // Fires an Intent.ACTION_SEND chooser so the user can hand the text off
+    // to any installed app that accepts plain text — ChatGPT, Claude, Gemini,
+    // Bard, Bing, Perplexity, system clipboard managers, notes apps, etc.
+    // The chooser title (`chooserTitle`) labels the picker; `subject` is
+    // optional and used by apps that expect one (email clients, mostly).
+    private fun shareText(text: String, chooserTitle: String, subject: String?) {
+        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_TEXT, text)
+            if (!subject.isNullOrEmpty()) putExtra(android.content.Intent.EXTRA_SUBJECT, subject)
+        }
+        val chooser = android.content.Intent.createChooser(send, chooserTitle).apply {
+            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try { startActivity(chooser) } catch (_: Exception) { /* no chooser available — silent no-op */ }
     }
 
     // Returns true via `result` if RECORD_AUDIO is granted (now or after the

@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Cupitor sentence-tag harness — real page</title>
+<style>
+  :root { color-scheme: light; }
+  body { font: 14px/1.5 -apple-system, system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
+  #left  { flex: 1 1 auto; display: flex; flex-direction: column; border-right: 1px solid #ddd; }
+  #right { flex: 0 0 380px; padding: 12px; overflow: auto; background: #fafafa; }
+  #pasteBar {
+    padding: 8px; border-bottom: 1px solid #ddd; background: #fafafa;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  #pasteBar textarea {
+    width: 100%; box-sizing: border-box; font: 11px/1.4 ui-monospace, Menlo, monospace;
+    border: 1px solid #ccc; border-radius: 4px; padding: 4px 6px; min-height: 48px; max-height: 200px;
+  }
+  #pasteBar.collapsed textarea { display: none; }
+  #pasteBar.collapsed #pasteHint { display: none; }
+  #pageFrame { flex: 1 1 auto; border: 0; width: 100%; }
+  h1 { font-size: 16px; margin: 0; }
+  h2 { font-size: 14px; margin: 14px 0 6px; color: #444; text-transform: uppercase; letter-spacing: 0.06em; }
+  fieldset { border: 1px solid #ddd; border-radius: 6px; padding: 8px 10px; margin: 0 0 10px; }
+  legend { font-size: 12px; color: #666; padding: 0 4px; }
+  button { font: inherit; padding: 4px 8px; margin: 2px 0; cursor: pointer; }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  input[type=text], textarea {
+    box-sizing: border-box; font: 12px/1.4 ui-monospace, Menlo, monospace;
+    border: 1px solid #ccc; border-radius: 4px; padding: 4px 6px;
+  }
+  label.row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  label.row input { flex: 1; }
+  #log {
+    background: #1e1e1e; color: #e0e0e0; padding: 8px; border-radius: 4px;
+    font: 11px/1.4 ui-monospace, Menlo, monospace; min-height: 180px; max-height: 360px;
+    overflow: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  .log-line { padding: 2px 0; border-bottom: 1px solid #2a2a2a; }
+  .log-line.in  { color: #8fd0ff; }
+  .log-line.out { color: #f0c674; }
+  .log-line.sys { color: #888; }
+  .pill {
+    display: inline-block; padding: 1px 6px; border-radius: 9px; font-size: 11px;
+    background: #eee; color: #444; margin-left: 4px;
+  }
+  .pill.on { background: #d4ffd4; color: #176f17; }
+  #setup {
+    background: #fffacc; border-bottom: 1px solid #e7c12d;
+    padding: 8px 12px; font-size: 12px; color: #5b4a00;
+  }
+  #setup code { background: #fff; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<section id="left">
+
+  <div id="setup">
+    <strong>Run as a local server</strong> — this harness fetches
+    <code>assets/js/utils.js</code> and <code>assets/js/sentence_tag.js</code>
+    and won't work from <code>file://</code> in most browsers. From the
+    <code>Cupitor</code> directory, run:
+    <code>python3 -m http.server 8765</code> then open
+    <code>http://localhost:8765/tools/real_page_harness.html</code>.
+  </div>
+
+  <div id="pasteBar">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <h1>Real-page harness</h1>
+      <span id="loadedFor" style="color:#888;font-size:12px;"></span>
+      <button style="margin-left:auto;" onclick="togglePaste()">Collapse paste box</button>
+    </div>
+    <p id="pasteHint" style="margin:0;color:#666;font-size:12px;">
+      <strong>1.</strong> Visit the page you want to test in another tab.
+      <strong>2.</strong> Open DevTools → Elements → right-click on the root
+      <code>&lt;html&gt;</code> → <em>Copy → Copy outerHTML</em>.
+      <strong>3.</strong> Paste below and click Load.
+    </p>
+    <textarea id="pasteBox" placeholder="Paste the page's outerHTML here…"></textarea>
+    <div class="btn-row">
+      <button onclick="loadPasted()">Load</button>
+      <button onclick="document.getElementById('pasteBox').value=''">Clear paste</button>
+      <span style="color:#888;font-size:11px;margin-left:auto;">
+        Or paste a URL on a line by itself and we'll try to <code>fetch()</code> it
+        (works only when CORS allows, which most prose sites don't).
+      </span>
+    </div>
+  </div>
+
+  <iframe id="pageFrame" sandbox="allow-scripts allow-same-origin allow-forms" title="loaded page"></iframe>
+</section>
+
+<aside id="right">
+  <fieldset>
+    <legend>Capture mode</legend>
+    <div class="btn-row">
+      <button onclick="setCap(true)">Arm capture</button>
+      <button onclick="setCap(false)">Disarm</button>
+      <span id="capPill" class="pill">OFF</span>
+      <button style="margin-left:auto;" onclick="resetHarness()">Reset</button>
+    </div>
+    <p style="color:#666;font-size:11px;margin:6px 0 0;">
+      Arm + tap a word in the loaded page. The captured sid auto-fills
+      into the Extend / Commit panels below.
+    </p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Extend the active capture</legend>
+    <div class="btn-row">
+      <input id="extSid" type="text" placeholder="sentenceId from log (e.g. s_1)" style="flex:1;" />
+    </div>
+    <div class="btn-row" style="margin-top:4px;">
+      <button onclick="ext('prev')">‹ Prev</button>
+      <button onclick="ext('next')">Next ›</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Simulate Save (commit)</legend>
+    <label class="row">sid: <input id="cmSid" type="text" placeholder="s_1" /></label>
+    <label class="row">dbid: <input id="cmDbid" type="text" value="101" /></label>
+    <label class="row">colors: <input id="cmColors" type="text" value='["#FFC107"]' /></label>
+    <label class="row">tagIds: <input id="cmTagIds" type="text" value="5" /></label>
+    <label class="row">mask:   <input id="cmMask" type="text" placeholder="(optional)" /></label>
+    <div class="btn-row">
+      <button onclick="commit()">Commit</button>
+      <button onclick="clearTemp()">Clear temp</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Page-load rehydrate (__cupitorApplyTags)</legend>
+    <textarea id="applyJson" style="width:100%;min-height:56px;">[]</textarea>
+    <div class="btn-row">
+      <button onclick="applyTags()">Apply tags</button>
+      <button onclick="document.getElementById('applyJson').value=lastCommittedRehydrate()">↑ Replay last commit</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Filter (__cupitorApplyFilter)</legend>
+    <label class="row">tagIds: <input id="flTagIds" type="text" value="5" /></label>
+    <div class="btn-row">
+      <button onclick="applyFilter()">Apply</button>
+      <button onclick="clearFilter()">Clear</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Masks</legend>
+    <div class="btn-row">
+      <button onclick="setMasks(true)">Show masks</button>
+      <button onclick="setMasks(false)">Hide masks</button>
+      <span id="maskPill" class="pill">OFF</span>
+    </div>
+  </fieldset>
+
+  <h2>Event log <button style="float:right;font-size:11px;" onclick="document.getElementById('log').innerHTML=''">clear</button></h2>
+  <div id="log"></div>
+</aside>
+
+<script>
+  // ─── Log + parent-bridge for the iframe ─────────────────────────
+  function logLine(kind, txt) {
+    var el = document.createElement('div');
+    el.className = 'log-line ' + kind;
+    var when = new Date().toISOString().substring(11, 19);
+    el.textContent = '[' + when + '] ' + txt;
+    var log = document.getElementById('log');
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  }
+  // The iframe-side stubs call back into the parent through this.
+  window.harnessLog = function (kind, s) {
+    logLine(kind, s);
+    if (kind === 'in') {
+      try {
+        var m = JSON.parse(s.replace(/^[^{[]*/, ''));
+        if (m && m.op === 'capture' && m.sentenceId) {
+          document.getElementById('extSid').value = m.sentenceId;
+          document.getElementById('cmSid').value  = m.sentenceId;
+        }
+      } catch (_) {}
+    }
+  };
+
+  var _lastCommitted = null;
+  window.harnessRememberCommit = function (sid, dbid, tagColors, tagIds, mask, text) {
+    _lastCommitted = { sid: sid, dbid: dbid, tagColors: tagColors,
+                       tagIds: tagIds, mask: mask, text: text };
+  };
+  function lastCommittedRehydrate() {
+    if (!_lastCommitted) return '[]';
+    var c = _lastCommitted;
+    return JSON.stringify([{
+      id: c.dbid, text: c.text || '', prevFp: '', nextFp: '',
+      mask: c.mask || null,
+      tagIds: c.tagIds || [], tagColors: c.tagColors || [], tagNames: [],
+    }]);
+  }
+
+  // ─── iframe accessor ────────────────────────────────────────────
+  function fw() {
+    var fr = document.getElementById('pageFrame');
+    return fr && fr.contentWindow;
+  }
+  function missing(fn) {
+    logLine('sys', '⚠ ' + fn + ' is not defined in the iframe. Load a page first.');
+  }
+
+  function setCap(on) {
+    var w = fw();
+    if (!w || typeof w.__cupitorSetCaptureMode !== 'function') { missing('__cupitorSetCaptureMode'); return; }
+    w.__cupitorSetCaptureMode(on);
+    var pill = document.getElementById('capPill');
+    pill.textContent = on ? 'ON' : 'OFF';
+    pill.classList.toggle('on', on);
+    logLine('out', '__cupitorSetCaptureMode(' + on + ')');
+  }
+  function ext(dir) {
+    var sid = document.getElementById('extSid').value.trim();
+    if (!sid) { logLine('sys', 'set a sentenceId first'); return; }
+    var w = fw();
+    if (!w || typeof w.__cupitorRequestExtend !== 'function') { missing('__cupitorRequestExtend'); return; }
+    logLine('out', '__cupitorRequestExtend("' + sid + '","' + dir + '")');
+    w.__cupitorRequestExtend(sid, dir);
+  }
+  function commit() {
+    var sid    = document.getElementById('cmSid').value.trim();
+    var dbid   = document.getElementById('cmDbid').value.trim();
+    var colors = document.getElementById('cmColors').value;
+    var tagIds = document.getElementById('cmTagIds').value;
+    var mask   = document.getElementById('cmMask').value;
+    if (!sid) { logLine('sys', 'set sid first'); return; }
+    var w = fw();
+    if (!w || typeof w.__cupitorCommitTags !== 'function') { missing('__cupitorCommitTags'); return; }
+    logLine('out', '__cupitorCommitTags("' + sid + '",' + dbid + ',' + colors + ',"' + tagIds + '","' + mask + '")');
+    // Capture the active-capture text first so "Replay last commit"
+    // can rebuild a rehydrate record without round-tripping.
+    var capText = '';
+    try {
+      var captured = w.document.querySelectorAll('[data-cupitor-sent="' + sid + '"]');
+      var bits = [];
+      for (var i = 0; i < captured.length; i++) bits.push((captured[i].textContent || '').trim());
+      capText = bits.join(' ').replace(/\s+/g, ' ').trim();
+    } catch (_) {}
+    try {
+      var colorsArr = JSON.parse(colors);
+      var idsArr = tagIds.split(',').map(function (s) { return parseInt(s.trim(), 10); }).filter(function (n) { return !isNaN(n); });
+      window.harnessRememberCommit(sid, parseInt(dbid, 10), colorsArr, idsArr, mask, capText);
+    } catch (_) {}
+    w.__cupitorCommitTags(sid, parseInt(dbid, 10), colors, tagIds, mask || '');
+    // Bump dbid for the next commit so two captures don't share an id
+    // (in the real app SQLite auto-increments — the harness simulates).
+    var next = parseInt(dbid, 10) + 1;
+    if (!isNaN(next)) document.getElementById('cmDbid').value = String(next);
+  }
+  function clearTemp() {
+    var sid = document.getElementById('cmSid').value.trim();
+    var w = fw();
+    if (!w || typeof w.__cupitorClearTempHighlight !== 'function') { missing('__cupitorClearTempHighlight'); return; }
+    logLine('out', '__cupitorClearTempHighlight(' + (sid ? '"' + sid + '"' : '') + ')');
+    w.__cupitorClearTempHighlight(sid || undefined);
+  }
+  function applyTags() {
+    var json = document.getElementById('applyJson').value;
+    var w = fw();
+    if (!w || typeof w.__cupitorApplyTags !== 'function') { missing('__cupitorApplyTags'); return; }
+    logLine('out', '__cupitorApplyTags(' + json.substring(0, 60) + (json.length > 60 ? '…' : '') + ')');
+    try { w.__cupitorApplyTags(json); }
+    catch (e) { logLine('sys', '⚠ __cupitorApplyTags threw: ' + (e && e.message ? e.message : e)); }
+  }
+  function applyFilter() {
+    var ids = document.getElementById('flTagIds').value.trim();
+    var arr = '[' + ids + ']';
+    var w = fw();
+    if (!w || typeof w.__cupitorApplyFilter !== 'function') { missing('__cupitorApplyFilter'); return; }
+    logLine('out', '__cupitorApplyFilter(' + arr + ')');
+    w.__cupitorApplyFilter(arr);
+    // Helpful hint: filter only keeps spans whose data-cupitor-tagids
+    // attribute (set at commit / rehydrate) overlaps the chosen ids.
+    // If nothing has been committed yet, EVERY clickable-word will fade
+    // — which is the exact "page goes mostly dim" symptom on-device.
+    try {
+      var stamped = w.document.querySelectorAll('[data-cupitor-tagids]').length;
+      if (stamped === 0) {
+        logLine('sys', '⚠ filter applied but no spans carry data-cupitor-tagids — Commit a capture first, or use "Page-load rehydrate" to inject some tagged sentences. With zero stamped spans every word fades.');
+      } else {
+        logLine('sys', stamped + ' span(s) carry data-cupitor-tagids');
+      }
+    } catch (_) {}
+  }
+  function clearFilter() {
+    var w = fw();
+    if (!w || typeof w.__cupitorApplyFilter !== 'function') { missing('__cupitorApplyFilter'); return; }
+    logLine('out', '__cupitorApplyFilter([])');
+    w.__cupitorApplyFilter('[]');
+  }
+  function setMasks(on) {
+    var w = fw();
+    if (!w || typeof w.__cupitorSetMasksVisible !== 'function') { missing('__cupitorSetMasksVisible'); return; }
+    w.__cupitorSetMasksVisible(on);
+    var pill = document.getElementById('maskPill');
+    pill.textContent = on ? 'ON' : 'OFF';
+    pill.classList.toggle('on', on);
+    logLine('out', '__cupitorSetMasksVisible(' + on + ')');
+  }
+
+  // ─── Load pasted HTML into the iframe ───────────────────────────
+  var utilsCode = null;
+  var sentTagCode = null;
+
+  async function fetchAssets() {
+    if (utilsCode && sentTagCode) return;
+    logLine('sys', 'fetching utils.js + sentence_tag.js …');
+    utilsCode   = await fetch('../assets/js/utils.js?t='        + Date.now()).then(function (r) { return r.text(); });
+    sentTagCode = await fetch('../assets/js/sentence_tag.js?t=' + Date.now()).then(function (r) { return r.text(); });
+    logLine('sys', 'assets loaded (' + utilsCode.length + ' + ' + sentTagCode.length + ' bytes).');
+  }
+
+  // Strip CSP meta tags from the pasted HTML so our inline scripts run.
+  // Also strip <base> so we don't inherit a remote base URL and try to
+  // load stylesheets / images from the original host (mostly cosmetic).
+  function sanitizeHtml(html) {
+    return html
+      .replace(/<meta[^>]+http-equiv\s*=\s*["']?(?:content-security-policy|x-content-security-policy|x-webkit-csp)[^>]*>/gi, '')
+      .replace(/<base[^>]*>/gi, '');
+  }
+
+  // The injected iframe-side bootstrap. Runs AFTER the user HTML so the
+  // DOM is in place. Word-wraps via utils.js, installs sentence_tag.js,
+  // and attaches the same click router the real app uses.
+  function bootstrapScript() {
+    return [
+      // Channel stubs forward into the parent's log.
+      "(function(){",
+      "  function p(k){return function(s){",
+      "    try{parent.harnessLog(k,(arguments.callee.chName||'channel')+' ← '+s);}catch(_){}",
+      "  };}",
+      "  function ch(n){var fn=p('in');fn.chName=n;return {postMessage:fn};}",
+      "  window.SentenceTagHandler    = ch('SentenceTagHandler');",
+      "  window.SentenceFilterHandler = ch('SentenceFilterHandler');",
+      "  window.SnippetLogChannel     = {postMessage: function(s){try{parent.harnessLog('sys','SnippetLogChannel ← '+s);}catch(_){}}};",
+      "})();",
+    ].join('\n');
+  }
+
+  // No click router here on purpose — utils.js already attaches a
+  // capture-phase click listener that branches on
+  // `window.__cupitorCaptureMode` and calls `__cupitorOnWordTap`. Adding
+  // a second listener doubled every tap (utils.js's stopPropagation
+  // doesn't stop sibling listeners on the same node — only further
+  // propagation), producing two `capture` events per click.
+  function readyScript() {
+    return "try { parent.harnessLog('sys','iframe ready — utils + sentence_tag installed'); } catch(_){}";
+  }
+
+  async function loadPasted() {
+    try { await fetchAssets(); } catch (e) {
+      logLine('sys', '⚠ failed to fetch assets: ' + (e && e.message ? e.message : e) +
+        ' (start a local server: python3 -m http.server 8765 from Cupitor/)');
+      return;
+    }
+    var raw = document.getElementById('pasteBox').value;
+    if (!raw.trim()) { logLine('sys', 'paste the page HTML first'); return; }
+    // If the paste is a single URL, try to fetch it (rare success — most
+    // prose sites lack CORS, but litteraturbanken sometimes works).
+    var oneLine = raw.trim();
+    if (/^https?:\/\/\S+$/.test(oneLine)) {
+      logLine('sys', 'fetching ' + oneLine + ' …');
+      try { raw = await fetch(oneLine).then(function (r) { return r.text(); }); }
+      catch (e) { logLine('sys', '⚠ fetch failed (CORS?). Paste the outerHTML instead.'); return; }
+    }
+    var clean = sanitizeHtml(raw);
+    var doc =
+      clean +
+      '\n<script>\n' + bootstrapScript() + '\n<\/script>' +
+      '\n<script>\n' + utilsCode + '\n<\/script>' +
+      '\n<script>\n' + sentTagCode + '\n<\/script>' +
+      '\n<script>\n' + readyScript() + '\n<\/script>';
+    var iframe = document.getElementById('pageFrame');
+    iframe.removeAttribute('src');
+    iframe.srcdoc = doc;
+    document.getElementById('loadedFor').textContent =
+      'loaded ' + (clean.length / 1024).toFixed(1) + ' KB';
+    togglePaste(true);  // auto-collapse paste box
+  }
+
+  function togglePaste(forceCollapse) {
+    var bar = document.getElementById('pasteBar');
+    if (forceCollapse === true) { bar.classList.add('collapsed'); return; }
+    bar.classList.toggle('collapsed');
+  }
+
+  function resetHarness() {
+    var fr = document.getElementById('pageFrame');
+    fr.srcdoc = '';
+    fr.removeAttribute('src');
+    document.getElementById('log').innerHTML = '';
+    document.getElementById('capPill').textContent = 'OFF';
+    document.getElementById('capPill').classList.remove('on');
+    document.getElementById('maskPill').textContent = 'OFF';
+    document.getElementById('maskPill').classList.remove('on');
+    document.getElementById('extSid').value = '';
+    document.getElementById('cmSid').value = '';
+    document.getElementById('cmDbid').value = '101';
+    document.getElementById('cmMask').value = '';
+    document.getElementById('applyJson').value = '[]';
+    document.getElementById('loadedFor').textContent = '';
+    _lastCommitted = null;
+    logLine('sys', 'reset done. paste HTML and click Load.');
+  }
+
+  logLine('sys', 'ready. paste the page outerHTML and click Load.');
+</script>
+
+</body>
+</html>

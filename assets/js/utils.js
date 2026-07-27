@@ -52,15 +52,21 @@
     const text = node.textContent;
     if (!text || text.length > MAX_TEXT_LEN || !text.trim()) return;
     const words = getWords(text);
-    // Short-circuit: nothing to wrap in this segment.
+    // Wrap every non-empty word (was: length > 2). The old threshold
+    // skipped 1- and 2-char particles ("är", "av", "nu", "i", "I", "a"),
+    // which left them as raw text nodes — the sentence-tagging filter
+    // can't stamp those with data-cupitor-tagids, so a kept sentence
+    // had visible "holes" where short words inherited the body-level
+    // dim. Wrapping them costs one click-target per particle (clicking
+    // "i" now opens a lookup); we accept that for filter completeness.
     let hasWord = false;
     for (let i = 0; i < words.length; i++) {
-      if (words[i].isWord && words[i].text.trim().length > 2) { hasWord = true; break; }
+      if (words[i].isWord && words[i].text.trim().length > 0) { hasWord = true; break; }
     }
     if (!hasWord) return;
     const frag = document.createDocumentFragment();
     for (const {text: word, isWord} of words) {
-      if (!isWord || word.trim().length <= 2) {
+      if (!isWord || !word.trim().length) {
         frag.appendChild(document.createTextNode(word));
       } else {
         const span = document.createElement('span');
@@ -251,6 +257,16 @@
         let t = e.target && e.target.closest && e.target.closest('.clickable-word');
         if (t) {
           try {
+             // Sentence-tag capture mode: route to the tagging handler
+             // and swallow the rest. Lookup is suppressed until the
+             // user disarms capture (per the spec's "Conflict with
+             // word-tap lookup" open edge).
+             if (window.__cupitorCaptureMode && typeof window.__cupitorOnWordTap === 'function') {
+               e.preventDefault();
+               e.stopPropagation();
+               window.__cupitorOnWordTap(t);
+               return;
+             }
              const base = (t.dataset && t.dataset.word) || t.textContent || '';
              const looked = joinHyphenatedWord(t);
              // Diagnostic — viewable via Tools → "View snippet logs".

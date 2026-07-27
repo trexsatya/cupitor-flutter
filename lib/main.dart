@@ -17,6 +17,16 @@ import 'package:google_mlkit_translation/google_mlkit_translation.dart' as mlkit
 import 'package:flutter_tts/flutter_tts.dart';
 import 'yt_dlp_service.dart';
 import 'epub_reader.dart';
+import 'db.dart';
+import 'memory_manager.dart';
+import 'playlist_service.dart';
+import 'profile_service.dart';
+import 'tag_browser.dart';
+import 'media_store.dart';
+import 'tag_capture.dart';
+import 'tag_filter.dart';
+import 'tag_settings.dart';
+import 'text_transform.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -83,6 +93,23 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   final ValueNotifier<bool> _wiktCollectMode = ValueNotifier(false);
   final ValueNotifier<List<String>> _wiktCollectedWords = ValueNotifier(<String>[]);
   String _currentDialogText = '';
+  // ---- Sentence-tagging feature ----
+  // _tagCaptureToggleVisible: floating capture chip is on-screen.
+  // _tagCaptureArmed: next word tap will capture (chip is in "active" state).
+  // Both default off; toggled from Tools drawer and the chip itself.
+  // _tagFilterTagIds: in-memory filter set (per spec, not persisted).
+  // _pendingTagExtend: single-slot Completer for the JS extend round-trip;
+  //   the capture sheet awaits this between Prev/Next button presses.
+  bool _tagCaptureToggleVisible = false;
+  bool _tagCaptureArmed = false;
+  Offset _tagCaptureChipPos = const Offset(-1, -1);
+  Set<int> _tagFilterTagIds = <int>{};
+  bool _tagMasksVisible = false;
+  bool _tagTransformsEnabled = true;
+  // 'block' (default) or 'document'. See sentence_tag.js for semantics.
+  String _tagSegmentationScope = 'block';
+  Completer<ExtendResult>? _pendingTagExtend;
+  bool _tagDbReady = false;
   String? _cachedRemoteSnippet;
   final Set<String> _handledPdfUrls = {};
   bool _isTextView = false;
@@ -238,6 +265,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   @override
   void dispose() {
     _appBarTimer?.cancel();
+    ProfileService.active.removeListener(_onProfileChanged);
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     _adBlockChannel.setMethodCallHandler(null); // stop receiving callbacks
@@ -325,6 +353,36 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // waiting for onPageFinished). Critical for the Netflix manifest case —
     // autoplay fires before onPageFinished otherwise.
     _warmRemoteSnippetCache();
+    // Probe sentence-tagging DB readiness in the background. The toolbar
+    // tiles check this flag and hide themselves if the open failed (e.g.
+    // on macOS host where sqflite isn't wired up).
+    if (isSqlitePlatform) {
+      CupitorDb.instance.isReady().then((ok) async {
+        if (!mounted) return;
+        setState(() => _tagDbReady = ok);
+        if (ok) {
+          await ProfileService.init();
+          await PlaylistService.init();
+          if (!mounted) return;
+          await _loadProfileScopedPrefs();
+          ProfileService.active.addListener(_onProfileChanged);
+          // Push playlist changes into dialog1's WebView whenever they
+          // happen. If dialog1 isn't up, the runJavaScript call
+          // silently no-ops (no controller yet) — the language app
+          // will fetch on load via the PlaylistBridge 'get' op.
+          PlaylistService.changes.addListener(_pushPlaylistsToDialog);
+        }
+      });
+    }
+    // Restore persisted segmentation-scope (NOT profile-scoped: it's a
+    // UI preference, not a tagging-data preference).
+    SharedPreferences.getInstance().then((p) {
+      final scope = p.getString('tagScope:web') ?? 'block';
+      if (!mounted) return;
+      setState(() {
+        _tagSegmentationScope = (scope == 'document') ? 'document' : 'block';
+      });
+    });
     SharedPreferences.getInstance().then((prefs) {
       final savedUrl = prefs.getString('lastUrl') ?? _urlController.text;
       _urlController.text = savedUrl;
@@ -397,6 +455,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           }
         })
         ..addJavaScriptChannel('TranslateRequest', onMessageReceived: _handleTranslateRequest)
+        // Sentence-tagging bridges. SentenceTagHandler carries 'capture'
+        // (initial word-tap) and 'extend' (Prev/Next response) payloads.
+        // SentenceFilterHandler is currently used only for an initial
+        // 'ready' ping; reserved for future filter-side messages.
+        ..addJavaScriptChannel('SentenceTagHandler',
+            onMessageReceived: (msg) => _onSentenceTagMessage(msg.message))
+        ..addJavaScriptChannel('SentenceFilterHandler',
+            onMessageReceived: (msg) => _onSentenceFilterMessage(msg.message))
+        ..addJavaScriptChannel('LinkLongPress',
+            onMessageReceived: (msg) => _handleLinkLongPress(msg.message))
         ..setNavigationDelegate(
           NavigationDelegate(
             onNavigationRequest: (request) async {
@@ -518,6 +586,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             onPageFinished: (url) {
               if (_isShowingOurHtml) {
                 _injectJs(); // only need word-click JS on our own text page
+                _controller.runJavaScript(_linkLongPressJs);
                 // Scroll to preserved page position if switching from PDF view
                 if (_pendingScrollToPage != null && _pendingScrollToPage! > 1) {
                   final pg = _pendingScrollToPage!;
@@ -532,6 +601,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               if (Platform.isAndroid) _attachAndroidAdBlocker();
               _injectJs();
               _injectAdBlocker();
+              _controller.runJavaScript(_linkLongPressJs);
               _injectSpaHook();
               _injectPageZoom();
               _injectSelectionWatcher();
@@ -1315,7 +1385,645 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   Future<void> _injectJs() async {
     final jsCode = await rootBundle.loadString('assets/js/utils.js');
-    _controller.runJavaScript(jsCode);
+    await _controller.runJavaScript(jsCode);
+    // Sentence-tagging companion script — depends on utils.js wrapping
+    // words into .clickable-word spans, so injected immediately after.
+    try {
+      final stagJs = await rootBundle.loadString('assets/js/sentence_tag.js');
+      await _controller.runJavaScript(stagJs);
+      // Push the segmentation scope BEFORE rehydrate — the rehydrate
+      // path mirrors the capture path's scope choice, so swapping the
+      // scope on every page load is one of the first JS-side actions.
+      await _controller.runJavaScript(
+        "window.__cupitorSetSegmentationScope && window.__cupitorSetSegmentationScope('$_tagSegmentationScope');",
+      );
+      // Push current capture-mode flag in case the JS just reloaded.
+      await _controller.runJavaScript(
+        'window.__cupitorSetCaptureMode && window.__cupitorSetCaptureMode(${_tagCaptureArmed ? 'true' : 'false'});',
+      );
+      // Push per-language text-transform rules and apply BEFORE rehydrate
+      // so span text and tag identity settle in the same pass. Rules key
+      // on document.documentElement.lang — engine picks the right set.
+      try {
+        final allRules = await TransformRuleStore.loadAll();
+        final payload = <String, dynamic>{};
+        allRules.forEach((lang, rules) {
+          payload[lang] = rules.map((r) => r.toJson()).toList();
+        });
+        final applyCall = _tagTransformsEnabled
+            ? 'window.__cupitorApplyTextTransforms && window.__cupitorApplyTextTransforms();'
+            : '';
+        await _controller.runJavaScript(
+          'window.__cupitorTextTransforms = ${jsonEncode(payload)};'
+          'window.__cupitorTransformsEnabled = $_tagTransformsEnabled;'
+          '$applyCall',
+        );
+      } catch (_) { /* transforms are a soft dependency */ }
+      await _rehydrateTagsForCurrentPage();
+      if (_tagFilterTagIds.isNotEmpty) {
+        await _controller.runJavaScript(
+          "window.__cupitorApplyFilter && window.__cupitorApplyFilter(${jsonEncode(jsonEncode(_tagFilterTagIds.toList()))});",
+        );
+      }
+      if (_tagMasksVisible) {
+        await _controller.runJavaScript(
+          'window.__cupitorSetMasksVisible && window.__cupitorSetMasksVisible(true);',
+        );
+      }
+    } catch (_) { /* sentence_tag is a soft dependency */ }
+  }
+
+  Future<void> _loadProfileScopedPrefs() async {
+    final id = ProfileService.currentId;
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getStringList(ProfileService.filterKey('web', id));
+    Set<int> parsed = const {};
+    if (raw != null && raw.isNotEmpty) {
+      parsed = raw.map(int.tryParse).whereType<int>().toSet();
+    }
+    final masks = prefs.getBool(ProfileService.masksKey('web', id)) ?? false;
+    final xformOn = prefs.getBool('tagXformEnabled:web:$id') ?? true;
+    if (!mounted) return;
+    setState(() {
+      _tagFilterTagIds = parsed;
+      _tagMasksVisible = masks;
+      _tagTransformsEnabled = xformOn;
+    });
+  }
+
+  Future<void> _onProfileChanged() async {
+    // Clear all existing paint/state from the JS side, load the new
+    // profile's filter + mask prefs, then re-rehydrate the current
+    // page under the new profile.
+    await _controller.runJavaScript(
+      'window.__cupitorClearAllTags && window.__cupitorClearAllTags();',
+    );
+    await _loadProfileScopedPrefs();
+    await _rehydrateTagsForCurrentPage();
+    if (_tagFilterTagIds.isNotEmpty) {
+      await _controller.runJavaScript(
+        "window.__cupitorApplyFilter && window.__cupitorApplyFilter(${jsonEncode(jsonEncode(_tagFilterTagIds.toList()))});",
+      );
+    } else {
+      await _controller.runJavaScript(
+        "window.__cupitorApplyFilter && window.__cupitorApplyFilter('[]');",
+      );
+    }
+    await _controller.runJavaScript(
+      'window.__cupitorSetMasksVisible && window.__cupitorSetMasksVisible($_tagMasksVisible);',
+    );
+  }
+
+  Future<void> _rehydrateTagsForCurrentPage() async {
+    // Always emit an entry-point ping so we can tell from logs whether the
+    // method is even being invoked (vs gated out by _tagDbReady) and what
+    // profile is active at the time.
+    _appendSnippetLog(
+      'log',
+      '[tagging] rehydrate-entry dbReady=$_tagDbReady profile=${ProfileService.currentId}',
+    );
+    if (!_tagDbReady) return;
+    try {
+      final url = await _controller.currentUrl();
+      if (url == null) return;
+      final locator = canonUrl(url);
+      final pid = ProfileService.currentId;
+      final rows = await CupitorDb.instance.sentencesForPage(
+        profileId: pid,
+        surface: 'web',
+        locator: locator,
+      );
+      final totalTags = rows.fold<int>(0, (a, r) => a + r.tags.length);
+      // Snapshot a sample row (id + tag list) so we can see whether the
+      // join through sentence_tags resolved tags or returned an empty list.
+      String sample = '(none)';
+      if (rows.isNotEmpty) {
+        final r = rows.first;
+        sample = 'id=${r.id} tagIds=${r.tags.map((t) => t.id).toList()} '
+            'tagNames=${r.tags.map((t) => t.name).toList()}';
+      }
+      _appendSnippetLog(
+        'log',
+        '[tagging] rehydrate-query profile=$pid locator=$locator '
+            'rows=${rows.length} totalTags=$totalTags first=$sample',
+      );
+      if (totalTags == 0 && rows.isNotEmpty) {
+        final snap = await CupitorDb.instance.diagnosticsSnapshot();
+        _appendSnippetLog('log', '[tagging] diag $snap');
+      }
+      if (rows.isEmpty) {
+        // Surface the URL so we can spot locator drift between initial
+        // load / back-forward / SPA pushState. Helpful when filter and
+        // mask silently no-op because the locator changed shape.
+        final msg = '[tagging] no-rows url=$url locator=$locator';
+        await _controller.runJavaScript(
+          'window.SnippetLogChannel && window.SnippetLogChannel.postMessage(${jsonEncode(msg)});',
+        );
+        return;
+      }
+      final json = jsonEncode(rows.map((r) => r.toJson()).toList());
+      await _controller.runJavaScript(
+        'window.__cupitorApplyTags && window.__cupitorApplyTags(${jsonEncode(json)});',
+      );
+    } catch (_) {}
+  }
+
+  // ---- Sentence-tag JS bridge handlers ----
+
+  void _onSentenceTagMessage(String raw) {
+    try {
+      final m = jsonDecode(raw) as Map<String, dynamic>;
+      switch (m['op']) {
+        case 'capture':
+          _openCaptureSheet(
+            sid: m['sentenceId'] as String,
+            text: (m['text'] as String?) ?? '',
+            prevFp: (m['prevFp'] as String?) ?? '',
+            nextFp: (m['nextFp'] as String?) ?? '',
+          );
+          break;
+        case 'extend':
+          _pendingTagExtend?.complete(ExtendResult(
+            text: m['text'] as String?,
+            prevFp: (m['prevFp'] as String?) ?? '',
+            nextFp: (m['nextFp'] as String?) ?? '',
+          ));
+          _pendingTagExtend = null;
+          break;
+        case 'editRequest':
+          final dbid = (m['dbid'] as num?)?.toInt();
+          if (dbid != null) _openEditSheetForDbId(dbid);
+          break;
+        case 'taggedChoice':
+          final raw = m['dbids'];
+          final dbids = (raw is List)
+              ? raw.map((e) => (e as num).toInt()).toList()
+              : <int>[];
+          if (dbids.isNotEmpty) _showWebTaggedSentenceChoice(dbids);
+          break;
+      }
+    } catch (e) {
+      debugPrint('SentenceTagHandler parse error: $e');
+    }
+  }
+
+  Future<void> _showWebTaggedSentenceChoice(List<int> dbids) async {
+    if (!mounted) return;
+    final entries = <({int dbid, TaggedSentenceRow row})>[];
+    for (final d in dbids) {
+      final r = await CupitorDb.instance.sentenceById(d);
+      if (r != null) entries.add((dbid: d, row: r));
+    }
+    if (!mounted || entries.isEmpty) return;
+    final picked = await showModalBottomSheet<int>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+              child: Text(
+                'This sentence belongs to ${entries.length} tagged groups.',
+                style: Theme.of(ctx).textTheme.bodyMedium,
+              ),
+            ),
+            const SizedBox(height: 8),
+            for (final e in entries)
+              ListTile(
+                leading: const Icon(Icons.edit_outlined),
+                title: Text(
+                  e.row.sentence.tags.isEmpty
+                      ? 'Edit existing (no tags)'
+                      : 'Edit "${e.row.sentence.tags.map((t) => t.name).join(', ')}"',
+                ),
+                subtitle: Text(
+                  e.row.sentence.text,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                onTap: () => Navigator.of(ctx).pop(e.dbid),
+              ),
+            ListTile(
+              leading: const Icon(Icons.close),
+              title: const Text('Cancel'),
+              onTap: () => Navigator.of(ctx).pop(null),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (picked != null) _openEditSheetForDbId(picked);
+  }
+
+  /// Persist any media the user attached / removed in the capture sheet.
+  /// [sentenceId] is the just-upserted row id. Called by both the fresh-
+  /// capture and edit-existing paths after the sentence itself is saved.
+  Future<void> _applyMediaChanges(CaptureSaveResult res, int sentenceId) async {
+    for (final id in res.removedMediaIds) {
+      final orphanSha = await CupitorDb.instance.deleteMediaReturningOrphanSha1(id);
+      if (orphanSha != null) {
+        await MediaStore.instance.deleteFile(orphanSha);
+      }
+    }
+    for (final pending in res.pendingMedia) {
+      try {
+        final info = await MediaStore.instance.ingest(
+          pending.file,
+          originalFilename: pending.originalFilename,
+        );
+        final ext = info.extension;
+        final kind = MediaStore.kindFromMime(null, ext);
+        await CupitorDb.instance.addSentenceMedia(
+          sentenceId: sentenceId,
+          kind: kind,
+          sha1: info.sha1,
+          filename: info.originalFilename,
+          sizeBytes: info.sizeBytes,
+        );
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Attach failed: $e')),
+          );
+        }
+      }
+    }
+    for (final urlAtt in res.pendingUrls) {
+      try {
+        await CupitorDb.instance.addSentenceMedia(
+          sentenceId: sentenceId,
+          kind: urlAtt.kind,
+          sha1: '', // URL rows carry no file bytes.
+          url: urlAtt.url,
+          filename: (urlAtt.label != null && urlAtt.label!.isNotEmpty)
+              ? urlAtt.label!
+              : urlAtt.url,
+        );
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('URL attach failed: $e')),
+          );
+        }
+      }
+    }
+  }
+
+  Future<void> _openEditSheetForDbId(int dbid) async {
+    if (!_tagDbReady) return;
+    final row = await CupitorDb.instance.sentenceById(dbid);
+    if (row == null || !mounted) return;
+    final s = row.sentence;
+    // Edits don't go through capture mode, so no transient JS sid exists;
+    // we use 's_db_<id>' to match what rehydrate stamps on the spans.
+    final sid = 's_db_$dbid';
+    final res = await showTagCaptureSheet(
+      context: context,
+      initial: CapturePayload(
+        sentenceId: sid,
+        text: s.text,
+        prevFp: s.prevFp ?? '',
+        nextFp: s.nextFp ?? '',
+      ),
+      // Use the ORIGINAL page's surface + locator + profile so the
+      // upsert lands on the same row, regardless of the currently
+      // active profile or page.
+      profileId: row.profileId,
+      surface: row.surface,
+      locator: row.locator,
+      onExtendRequested: (_) async =>
+          const ExtendResult(text: null, prevFp: '', nextFp: ''),
+      preselectedTagIds: s.tags.map((t) => t.id),
+      initialMask: s.mask ?? '',
+      extendDisabled: true,
+      existingDbId: dbid,
+    );
+    if (res == null) return;
+    if (res.deleted) {
+      try {
+        await CupitorDb.instance.deleteSentence(dbid);
+        String? currentUrl;
+        try { currentUrl = await _controller.currentUrl(); } catch (_) {}
+        final inCurrentWebPage = row.surface == 'web' &&
+            currentUrl != null &&
+            canonUrl(currentUrl) == row.locator;
+        if (inCurrentWebPage) {
+          // Drop this group's stamp from every covered span and let the
+          // helper recompute attrs (preserves overlapping groups).
+          await _controller.runJavaScript(
+            'window.__cupitorUnstampGroup && window.__cupitorUnstampGroup($dbid);',
+          );
+        } else if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Tagged sentence deleted.')),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Delete failed: $e')),
+          );
+        }
+      }
+      return;
+    }
+    try {
+      final upsertedId = await CupitorDb.instance.upsertSentenceWithTags(
+        profileId: row.profileId,
+        surface: row.surface,
+        locator: row.locator,
+        title: row.pageTitle,
+        text: res.text,
+        prevFp: res.prevFp.isEmpty ? null : res.prevFp,
+        nextFp: res.nextFp.isEmpty ? null : res.nextFp,
+        tagIds: res.tagIds,
+        mask: res.mask,
+      );
+      await _applyMediaChanges(res, upsertedId ?? dbid);
+      final tags = await CupitorDb.instance.listTags(row.profileId);
+      final tagColors = res.tagIds
+          .map((id) => tags.firstWhere((t) => t.id == id,
+              orElse: () => TagRow(id: 0, profileId: row.profileId, name: '', color: '#FFC107')))
+          .where((t) => t.id != 0)
+          .map((t) => t.color)
+          .toList();
+      final tagIdsCsv = res.tagIds.join(',');
+      // Repaint via JS only if the edited sentence belongs to a `web`
+      // page that's also the page currently in the main WebView; for
+      // EPUB edits or web edits on a different URL the JS call is a
+      // harmless no-op (no matching spans) — skip it for clarity.
+      String? currentUrl;
+      try { currentUrl = await _controller.currentUrl(); } catch (_) {}
+      final inCurrentWebPage = row.surface == 'web' &&
+          currentUrl != null &&
+          canonUrl(currentUrl) == row.locator;
+      if (inCurrentWebPage) {
+        await _controller.runJavaScript(
+          "(function(d,s){document.querySelectorAll('[data-cupitor-dbid=\"'+d+'\"]')"
+          ".forEach(function(el){el.setAttribute('data-cupitor-sent',s);});})('$dbid','$sid');",
+        );
+        await _controller.runJavaScript(
+          "window.__cupitorCommitTags && window.__cupitorCommitTags('$sid', $dbid, "
+          "${jsonEncode(jsonEncode(tagColors))}, ${jsonEncode(tagIdsCsv)}, ${jsonEncode(res.mask)});",
+        );
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Saved. Visual update will appear next time the page is open.')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Save failed: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _setMasksVisible(bool active) async {
+    setState(() => _tagMasksVisible = active);
+    await _controller.runJavaScript(
+      'window.__cupitorSetMasksVisible && window.__cupitorSetMasksVisible($active);',
+    );
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(ProfileService.masksKey('web', ProfileService.currentId), active);
+  }
+
+  Future<void> _setTransformsEnabled(bool active) async {
+    setState(() => _tagTransformsEnabled = active);
+    // On flip: apply or revert immediately. Revert restores each
+    // clickable-word's data-cupitor-orig; apply re-runs the substring
+    // rewrite pass. No page reload needed.
+    final applyCall = active
+        ? 'window.__cupitorApplyTextTransforms && window.__cupitorApplyTextTransforms();'
+        : 'window.__cupitorRevertTextTransforms && window.__cupitorRevertTextTransforms();';
+    await _controller.runJavaScript(
+      'window.__cupitorTransformsEnabled = $active;$applyCall',
+    );
+    final p = await SharedPreferences.getInstance();
+    await p.setBool('tagXformEnabled:web:${ProfileService.currentId}', active);
+  }
+
+  Future<void> _setSegmentationScope(String scope) async {
+    if (scope != 'block' && scope != 'document') return;
+    setState(() => _tagSegmentationScope = scope);
+    await _controller.runJavaScript(
+      "window.__cupitorSetSegmentationScope && window.__cupitorSetSegmentationScope('$scope');",
+    );
+    final p = await SharedPreferences.getInstance();
+    await p.setString('tagScope:web', scope);
+  }
+
+  Future<void> _openTagSettingsSheet() async {
+    if (!_tagDbReady) return;
+    await showTagSettingsSheet(
+      context: context,
+      initial: TagSettingsValues(
+        dbReady: _tagDbReady,
+        captureChipVisible: _tagCaptureToggleVisible,
+        masksVisible: _tagMasksVisible,
+        filterTagIds: _tagFilterTagIds,
+        segmentationScope: _tagSegmentationScope,
+        showSegmentation: true,
+        transformsEnabled: _tagTransformsEnabled,
+        // Image-maskover is EPUB-only for now — hide the switch here.
+        showMaskImagesOption: false,
+      ),
+      callbacks: TagSettingsCallbacks(
+        onSetCaptureChipVisible: (_) => _toggleCaptureChipVisibility(),
+        onSetMasksVisible: (v) => _setMasksVisible(v),
+        onSetTransformsEnabled: (v) => _setTransformsEnabled(v),
+        onOpenMemoryManager: () {
+          Navigator.of(context).push(MaterialPageRoute<void>(
+            builder: (_) => const MemoryManagerScreen(),
+          ));
+        },
+        onOpenFilterSheet: () async {
+          final pid = ProfileService.currentId;
+          final r = await showTagFilterSheet(
+            context: context,
+            initial: _tagFilterTagIds,
+            profileId: pid,
+          );
+          if (r == null) return null;
+          setState(() => _tagFilterTagIds = r);
+          await _controller.runJavaScript(
+            "window.__cupitorApplyFilter && window.__cupitorApplyFilter(${jsonEncode(jsonEncode(r.toList()))});",
+          );
+          final p = await SharedPreferences.getInstance();
+          await p.setStringList(
+            ProfileService.filterKey('web', pid),
+            r.map((e) => e.toString()).toList(),
+          );
+          return r;
+        },
+        onApplyFilter: (s) async {
+          setState(() => _tagFilterTagIds = s);
+          await _controller.runJavaScript(
+            "window.__cupitorApplyFilter && window.__cupitorApplyFilter(${jsonEncode(jsonEncode(s.toList()))});",
+          );
+          final p = await SharedPreferences.getInstance();
+          await p.setStringList(
+            ProfileService.filterKey('web', ProfileService.currentId),
+            s.map((e) => e.toString()).toList(),
+          );
+        },
+        onSetSegmentationScope: (s) => _setSegmentationScope(s),
+        onOpenBrowser: _openTagBrowser,
+      ),
+    );
+  }
+
+  Future<void> _openTagBrowser() async {
+    if (!_tagDbReady) return;
+    String? url;
+    try { url = await _controller.currentUrl(); } catch (_) {}
+    final locator = (url != null && url.isNotEmpty) ? canonUrl(url) : null;
+    if (!mounted) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => TagBrowserScreen(
+          currentSurface: 'web',
+          currentLocator: locator,
+          onNavigate: (target) {
+            // Browser asked us to open a page — load it in the main
+            // webview. The route is already popped by the browser.
+            _urlController.text = target;
+            _loadUrl();
+          },
+          onEdit: (dbid) => _openEditSheetForDbId(dbid),
+        ),
+      ),
+    );
+  }
+
+  void _onSentenceFilterMessage(String _) {
+    // Only 'ready' for now — Dart pushes state proactively from _injectJs.
+  }
+
+  Future<ExtendResult> _requestExtend(String sid, String direction) {
+    _pendingTagExtend?.complete(const ExtendResult(text: null, prevFp: '', nextFp: ''));
+    final c = Completer<ExtendResult>();
+    _pendingTagExtend = c;
+    _controller.runJavaScript(
+      "window.__cupitorRequestExtend && window.__cupitorRequestExtend('$sid','$direction');",
+    );
+    // Safety net: if JS never replies (page reloaded mid-capture), unblock.
+    Future.delayed(const Duration(seconds: 3), () {
+      if (!c.isCompleted) {
+        c.complete(const ExtendResult(text: null, prevFp: '', nextFp: ''));
+        _pendingTagExtend = null;
+      }
+    });
+    return c.future;
+  }
+
+  Future<void> _openCaptureSheet({
+    required String sid,
+    required String text,
+    required String prevFp,
+    required String nextFp,
+  }) async {
+    if (!_tagDbReady) return;
+    final url = await _controller.currentUrl() ?? '';
+    final locator = canonUrl(url);
+    final title = await _controller.getTitle();
+    final res = await showTagCaptureSheet(
+      context: context,
+      initial: CapturePayload(
+        sentenceId: sid,
+        text: text,
+        prevFp: prevFp,
+        nextFp: nextFp,
+      ),
+      profileId: ProfileService.currentId,
+      surface: 'web',
+      locator: locator,
+      onExtendRequested: (dir) => _requestExtend(sid, dir),
+    );
+    if (res == null) {
+      // Cancelled.
+      _controller.runJavaScript(
+        "window.__cupitorClearTempHighlight && window.__cupitorClearTempHighlight('$sid');",
+      );
+      return;
+    }
+    // Persist + commit visual. We pass the new sentence's DB id and its
+    // tag-IDs CSV to commitTags so the JS side stamps both on every
+    // span — the filter then sees this sentence without needing a
+    // rehydrate text-match round-trip (which is unreliable on some
+    // Angular-rendered pages).
+    try {
+      final profileId = ProfileService.currentId;
+      final dbid = await CupitorDb.instance.upsertSentenceWithTags(
+        profileId: profileId,
+        surface: 'web',
+        locator: locator,
+        title: title,
+        text: res.text,
+        prevFp: res.prevFp.isEmpty ? null : res.prevFp,
+        nextFp: res.nextFp.isEmpty ? null : res.nextFp,
+        tagIds: res.tagIds,
+        mask: res.mask,
+      );
+      if (dbid != null) await _applyMediaChanges(res, dbid);
+      final tags = await CupitorDb.instance.listTags(profileId);
+      final tagColors = res.tagIds
+          .map((id) => tags.firstWhere((t) => t.id == id, orElse: () => TagRow(id: 0, profileId: profileId, name: '', color: '#FFC107')))
+          .where((t) => t.id != 0)
+          .map((t) => t.color)
+          .toList();
+      final tagIdsCsv = res.tagIds.join(',');
+      _controller.runJavaScript(
+        "window.__cupitorCommitTags && window.__cupitorCommitTags('$sid', ${dbid ?? 'null'}, ${jsonEncode(jsonEncode(tagColors))}, ${jsonEncode(tagIdsCsv)}, ${jsonEncode(res.mask)});",
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Save failed: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _showTagFilterSheet() async {
+    if (!_tagDbReady) return;
+    final profileId = ProfileService.currentId;
+    final result = await showTagFilterSheet(
+      context: context,
+      initial: _tagFilterTagIds,
+      profileId: profileId,
+    );
+    if (result == null) return; // cancel
+    setState(() => _tagFilterTagIds = result);
+    _controller.runJavaScript(
+      "window.__cupitorApplyFilter && window.__cupitorApplyFilter(${jsonEncode(jsonEncode(result.toList()))});",
+    );
+    SharedPreferences.getInstance().then((p) {
+      p.setStringList(ProfileService.filterKey('web', profileId),
+          result.map((e) => e.toString()).toList());
+    });
+  }
+
+  void _toggleCaptureChipVisibility() {
+    setState(() {
+      _tagCaptureToggleVisible = !_tagCaptureToggleVisible;
+      if (!_tagCaptureToggleVisible) {
+        _tagCaptureArmed = false;
+      }
+    });
+    _controller.runJavaScript(
+      'window.__cupitorSetCaptureMode && window.__cupitorSetCaptureMode(${_tagCaptureArmed ? 'true' : 'false'});',
+    );
+  }
+
+  void _onCaptureChipTap() {
+    setState(() => _tagCaptureArmed = !_tagCaptureArmed);
+    _controller.runJavaScript(
+      'window.__cupitorSetCaptureMode && window.__cupitorSetCaptureMode(${_tagCaptureArmed ? 'true' : 'false'});',
+    );
   }
 
   void _injectRemoteSnippet() {
@@ -1510,6 +2218,59 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       return false;
     }
   }
+
+  /// Builds an "explain this word to me" prompt and hands it off to any
+  /// installed app via Android's share-text chooser. Users typically pick
+  /// an AI assistant (ChatGPT / Claude / Gemini / Perplexity / etc.) but
+  /// the chooser surface accepts every text consumer the OS knows about.
+  Future<void> _shareSearchTextToAi() async {
+    // Prefer whatever the user copied onto the system clipboard (e.g. text
+    // selected in the reader or elsewhere); fall back to the currently
+    // looked-up word when the clipboard holds no text.
+    final clip = (await Clipboard.getData(Clipboard.kTextPlain))?.text?.trim() ?? '';
+    final word = clip.isNotEmpty ? clip : _currentDialogText.trim();
+    if (word.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Nothing to share — copy or look up a word first.'), duration: Duration(seconds: 2)),
+      );
+      return;
+    }
+    // _languageParams maps language codes ('sv') to friendly names
+    // ('swedish'); title-case them since they're going into a sentence.
+    final src = _titleCase(_languageParams[_selectedLanguage] ?? _selectedLanguage);
+    // Target is English everywhere else in the app (cf. "Translation
+    // ($_selectedLanguage → en)" in the YouTube subtitle dialog).
+    const tgt = 'English';
+    final prompt =
+        'Give me translation of "$word" from $src to $tgt with some usage examples/patterns and nuances including everyday, literary/oldfashioned versions.';
+    if (!Platform.isAndroid) {
+      // iOS/macOS share-sheet would need a different channel — for now,
+      // just put the prompt on the clipboard and tell the user.
+      await Clipboard.setData(ClipboardData(text: prompt));
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Prompt copied to clipboard'), duration: Duration(seconds: 2)),
+      );
+      return;
+    }
+    try {
+      await _permsChannel.invokeMethod<void>('shareText', {
+        'text': prompt,
+        'chooserTitle': 'Ask AI about "$word"',
+        'subject': 'Translate "$word"',
+      });
+    } catch (e) {
+      debugPrint('share intent failed: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not open share sheet: $e'), duration: const Duration(seconds: 2)),
+      );
+    }
+  }
+
+  String _titleCase(String s) =>
+      s.isEmpty ? s : (s[0].toUpperCase() + s.substring(1).toLowerCase());
 
   /// Release the mic from `speech_to_text` so a subsequent
   /// `getUserMedia({audio:true})` inside dialog1's WebView can open it.
@@ -1962,6 +2723,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         setModalState(() {});
                       },
                     ),
+                    if (_tagDbReady)
+                      ListTile(
+                        leading: const Icon(Icons.label_outline),
+                        title: const Text('Tag sentences…'),
+                        subtitle: const Text(
+                          'Capture chip, masks, filter, segmentation scope, '
+                          'and the global browser — all in one place.',
+                        ),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _openTagSettingsSheet();
+                        },
+                      ),
                     ListTile(
                       leading: Icon(Icons.format_size),
                       title: Text('Page font size'),
@@ -2713,6 +3488,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       ..setUserAgent(_userAgent)
       ..addJavaScriptChannel('FilmotBridge', onMessageReceived: (msg) => _handleFilmotMessage(dialogIdForBridge, msg.message))
       ..addJavaScriptChannel('WiktCollect', onMessageReceived: (msg) => _handleWiktCollectMessage(msg.message))
+      ..addJavaScriptChannel('LinkLongPress', onMessageReceived: (msg) => _handleLinkLongPress(msg.message))
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (request) {
           if (!request.isMainFrame) return NavigationDecision.navigate;
@@ -2734,6 +3510,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         },
         onPageFinished: (finishedUrl) {
           _injectAdBlocker(dialog2Controller);
+          dialog2Controller.runJavaScript(_linkLongPressJs);
+          // Auto-unmute any YouTube/HTML5 media that autoplayed muted.
+          dialog2Controller.runJavaScript(_autoUnmuteYouTubeJs);
           if (_isFilmotUrl(finishedUrl)) {
             _injectFilmotHelper(dialog2Controller);
           }
@@ -4086,7 +4865,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final js = result != null
         ? 'window.__cupTranslated && window.__cupTranslated($id, ${jsonEncode(result)});'
         : 'window.__cupTranslated && window.__cupTranslated($id, null, ${jsonEncode(errMsg ?? 'translate failed')});';
+    // TranslateRequest is registered on BOTH controllers (main _controller for
+    // snippet.js, dialogController for the study app), and a JavaScriptMessage
+    // doesn't say which one sent it. Deliver the reply to both — the guard plus
+    // each page's own pending-id map makes it a no-op on the page that didn't
+    // originate the request. Without this, a request from the dialog webview
+    // (the study page's 🌐 translate) got its reply run in the main webview and
+    // never arrived → translate-timeout.
     try { _controller.runJavaScript(js); } catch (_) {}
+    try { dialogController?.runJavaScript(js); } catch (_) {}
   }
 
   // Maps our ISO-639-1 codes to ML Kit's TranslateLanguage enum. Returns null
@@ -5790,6 +6577,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('TtsBridge', onMessageReceived: _handleTtsBridge)
         ..addJavaScriptChannel('MediaState', onMessageReceived: _handleMediaStateBridge)
         ..addJavaScriptChannel('AudioBridge', onMessageReceived: _handleAudioBridge)
+        // The study page (satyendra.website/language.html) loads in THIS
+        // (dialog) controller, so its 🌐 translate button needs the channel
+        // here too. The main _controller registers TranslateRequest as well,
+        // but that controller isn't the one hosting the study app. The handler
+        // (_handleTranslateRequest → window.__cupTranslated) is shared.
+        ..addJavaScriptChannel('TranslateRequest', onMessageReceived: _handleTranslateRequest)
+        ..addJavaScriptChannel('LinkLongPress', onMessageReceived: (msg) => _handleLinkLongPress(msg.message))
+        // Language-app ↔ Cupitor bridge for the playlist feature.
+        //   { op: 'getPlaylists' } → Cupitor pushes the full playlists
+        //     payload as a `cupitorPlaylists` CustomEvent.
+        //   { op: 'openEpub', book_key, chapter_idx } → Cupitor closes
+        //     dialog1 and opens the EPUB reader at the given chapter.
+        ..addJavaScriptChannel('PlaylistBridge',
+            onMessageReceived: (msg) => _handlePlaylistBridge(msg.message))
         ..setNavigationDelegate(
           NavigationDelegate(
             onPageStarted: (url) {
@@ -5821,12 +6622,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             },
             onPageFinished: (url) {
               _injectAdBlocker(dialogController);
+              dialogController?.runJavaScript(_linkLongPressJs);
               // Polyfill window.speechSynthesis before the page tries to use
               // it. Safe to inject every page-finished — re-entry is gated.
               dialogController?.runJavaScript(_ttsPolyfillJs);
               // Media-key shim: forwards headset events to YT IFrame API and
               // reports YT player state back to native MediaSession.
               dialogController?.runJavaScript(_mediaKeysShimJs);
+              // Auto-unmute any YouTube/HTML5 media that autoplayed muted.
+              dialogController?.runJavaScript(_autoUnmuteYouTubeJs);
               // Activate the MediaSession while we're on our language page
               // (where the YT iframe lives). Other hosts deactivate so we
               // don't steal media keys from other apps in the background.
@@ -5838,6 +6642,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 _pendingCapturedSubtitle = null;
                 dialogController?.runJavaScript(_jsCodeForCapturedSubtitle(pending));
               }
+              // Warm the language app with the current playlist state
+              // so it can render manual cards without an explicit fetch.
+              _pushPlaylistsToDialog();
             },
           ),
         )
@@ -5954,7 +6761,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 ),
               ),
               child: Row(
-                mainAxisAlignment: MainAxisAlignment.end,
+                // Order: Close, CC, AI on the LEFT — Mic, Fullscreen, Minimize,
+                // Close on the RIGHT — Spacer in the middle. This keeps the
+                // left cluster clear of the Android camera notch on the right
+                // edge while preserving access to the secondary close.
+                mainAxisAlignment: MainAxisAlignment.start,
                 children: [
                 IconButton(
                   tooltip: 'Close',
@@ -5965,12 +6776,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     _bumpMinimizedVersion();
                   },
                 ),
-                const Spacer(),  
                 IconButton(
                   tooltip: 'Download YouTube subtitles (translate, send to lookup)',
                   icon: const Icon(Icons.closed_caption_outlined, size: 20),
                   onPressed: () => _startYouTubeSubtitleDownload(ctx),
                 ),
+                IconButton(
+                  tooltip: 'Ask AI about this word (share)',
+                  icon: const Icon(Icons.auto_awesome, size: 20),
+                  onPressed: _shareSearchTextToAi,
+                ),
+                const Spacer(),
                 GestureDetector(
                   // Long-press = enter continuous-listen mode (until next tap
                   // to stop). Tap = original one-shot voice input. Mirrors the
@@ -6015,7 +6831,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 ),
                 IconButton(
                   tooltip: 'Reload page (bypass cache)',
-                  icon: Icon(Icons.refresh),
+                  icon: const Icon(Icons.refresh, size: 20),
                   onPressed: () async {
                     // Clear HTTP cache so we actually pick up server changes —
                     // bare reload() honours cache headers and was returning
@@ -6026,17 +6842,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     try { await ctrl.clearCache(); } catch (_) {}
                     await ctrl.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
                   },
-                ),
-                ValueListenableBuilder<bool>(
-                  valueListenable: _dialog1FullscreenNotifier,
-                  builder: (_, fullscreen, __) => IconButton(
-                    tooltip: fullscreen ? 'Exit fullscreen' : 'Enter fullscreen',
-                    icon: Icon(
-                      fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
-                      size: 20,
-                    ),
-                    onPressed: () => _dialog1FullscreenNotifier.value = !fullscreen,
-                  ),
                 ),
                 IconButton(
                   tooltip: 'Minimize',
@@ -6603,23 +7408,27 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         _audioReply('ensureMicPerm', rid, ok ? 'granted' : 'denied', null);
       } else if (op == 'recordStart') {
         // Native recording path: JS hands us an id, we open MediaRecorder
-        // and write to <docs>/manual_audio/<id>.m4a directly. Bypasses the
-        // WebView's getUserMedia entirely — same AudioRecord plumbing used
-        // by speech_to_text and any native voice recorder. Released by
-        // `recordStop` (keep the file) or `recordCancel` (delete it).
+        // and write to <docs>/manual_audio/<id>.<ext> directly. Bypasses
+        // the WebView's getUserMedia entirely — same AudioRecord plumbing
+        // used by speech_to_text and any native voice recorder. Released
+        // by `recordStop` (keep the file) or `recordCancel` (delete it).
+        //
+        // The native side picks the container: OPUS/OGG on API 29+, AAC/
+        // M4A below. We hand over just the path stem and use whatever
+        // extension the recorder actually wrote.
         final id = _safeFileId((req['id'] as String?) ?? '');
         if (id.isEmpty) { _audioReply('recordStart', rid, null, 'bad-id'); return; }
         await _releaseMicFromSpeechToText();
         final permOk = await _ensureMicPermission();
         if (!permOk) { _audioReply('recordStart', rid, null, 'permission-denied'); return; }
         final dir = await _manualAudioDir();
-        final path = '${dir.path}/$id.m4a';
+        final pathStem = '${dir.path}/$id';
         try {
-          final ok = await _permsChannel.invokeMethod<bool>(
-            'startNativeRecording', {'path': path},
+          final actualPath = await _permsChannel.invokeMethod<String>(
+            'startNativeRecording', {'pathStem': pathStem},
           );
-          if (ok == true) {
-            _audioReply('recordStart', rid, _fileUrlForPath(path), null);
+          if (actualPath != null && actualPath.isNotEmpty) {
+            _audioReply('recordStart', rid, _fileUrlForPath(actualPath), null);
           } else {
             _audioReply('recordStart', rid, null, 'start-failed');
           }
@@ -6865,6 +7674,206 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 })();
 ''';
+
+  // Long-press on a link → "Copy Link". Android dispatches a 'contextmenu'
+  // event on long-press; when it lands on (or inside) an <a href> we suppress
+  // the native selection menu and hand the absolute URL to Dart via the
+  // LinkLongPress channel. Idempotent — safe to re-run on every page-finished.
+  static const String _linkLongPressJs = r'''
+(function() {
+  if (window.__cupLinkLongPress) return;
+  window.__cupLinkLongPress = true;
+  document.addEventListener('contextmenu', function(e) {
+    var t = e.target;
+    var a = (t && t.closest) ? t.closest('a[href]') : null;
+    if (a && a.href) {
+      e.preventDefault();
+      try { LinkLongPress.postMessage(a.href); } catch (_) {}
+    }
+  }, true);
+})();
+''';
+
+  // Auto-unmute YouTube (and any HTML5 media) opened inside a dialog. Videos
+  // autoplay muted under the browser's autoplay policy; the WebView already
+  // sets mediaPlaybackRequiresUserGesture(false), so unmuting keeps playback
+  // going rather than pausing it. The player/video mounts asynchronously, so
+  // we retry on a short interval (~10s) and cover all three shapes:
+  //   1. window.ytPlayer  — YT IFrame API player (our language.html)
+  //   2. <video>/<audio>  — Invidious / Piped / bare YouTube page
+  //   3. enablejsapi embed iframes — postMessage unMute command
+  static const String _autoUnmuteYouTubeJs = r'''
+(function() {
+  if (window.__cupAutoUnmute) return;
+  window.__cupAutoUnmute = true;
+  var tries = 0;
+  var timer = setInterval(function() {
+    tries++;
+    try {
+      var p = window.ytPlayer;
+      if (p && typeof p.unMute === 'function') {
+        p.unMute();
+        if (typeof p.setVolume === 'function') p.setVolume(100);
+      }
+    } catch (e) {}
+    try {
+      var els = document.querySelectorAll('video, audio');
+      for (var i = 0; i < els.length; i++) {
+        if (els[i].muted) els[i].muted = false;
+      }
+    } catch (e) {}
+    try {
+      var ifr = document.querySelectorAll(
+        'iframe[src*="youtube.com/embed"], iframe[src*="youtube-nocookie.com/embed"]');
+      for (var j = 0; j < ifr.length; j++) {
+        try {
+          ifr[j].contentWindow.postMessage(
+            '{"event":"command","func":"unMute","args":[]}', '*');
+        } catch (e) {}
+      }
+    } catch (e) {}
+    if (tries > 20) clearInterval(timer);
+  }, 500);
+})();
+''';
+
+  /// A long-pressed link's URL arrives here from any WebView. Show a small
+  /// sheet whose primary action copies the link to the clipboard.
+  /// Push the current playlist state into dialog1's WebView. Called
+  /// on: playlist mutations (via [PlaylistService.changes]), dialog1
+  /// page finish, and any time we want the language app to refresh.
+  /// Silent no-op if the controller isn't up — the JS side listens
+  /// for the CustomEvent so it never has to poll.
+  Future<void> _pushPlaylistsToDialog() async {
+    final ctrl = dialogController;
+    if (ctrl == null) return;
+    try {
+      final payload = await PlaylistService.buildPayloadJson();
+      // Wrap the payload string so we can embed it into a JS literal
+      // without worrying about internal quotes.
+      final js = "window.__cupitorPlaylistsPayload = $payload;"
+          "window.dispatchEvent(new CustomEvent('cupitorPlaylists', { detail: window.__cupitorPlaylistsPayload }));";
+      await ctrl.runJavaScript(js);
+    } catch (_) { /* dialog1 not loaded yet — safe to ignore */ }
+  }
+
+  /// Handle a JSON message from the language app via the
+  /// `PlaylistBridge` JavaScript channel.
+  ///
+  /// Supported ops:
+  ///  * `getPlaylists` — dispatch the current payload as a
+  ///    `cupitorPlaylists` CustomEvent for the requester to read.
+  ///  * `openEpub` — find an EPUB by `book_key` (SHA-1) in the persisted
+  ///    library, close dialog1, and open the reader at the given
+  ///    `chapter_idx`. Reports failure back via the same CustomEvent
+  ///    channel so the language app can surface an error.
+  Future<void> _handlePlaylistBridge(String raw) async {
+    Map<String, dynamic>? m;
+    try {
+      m = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) { return; }
+    final op = m['op'] as String?;
+    if (op == 'getPlaylists') {
+      await _pushPlaylistsToDialog();
+      return;
+    }
+    if (op == 'openEpub') {
+      final bookKey = (m['book_key'] as String?) ?? '';
+      final chapterIdx = (m['chapter_idx'] as num?)?.toInt() ?? 0;
+      if (bookKey.isEmpty) return;
+      await _openEpubByKey(bookKey, chapterIdx);
+      return;
+    }
+  }
+
+  /// Look up a persisted EPUB library entry by SHA-1 key, then open
+  /// the EPUB reader at the given chapter. Closes dialog1 first so the
+  /// reader takes over the screen. If the file has moved / been
+  /// deleted since the library entry was recorded, shows a snackbar
+  /// and leaves dialog1 open.
+  Future<void> _openEpubByKey(String bookKey, int chapterIdx) async {
+    try {
+      final lib = await _ensureEpubLibrary();
+      final entry = lib.entries.firstWhere(
+        (e) => e.key == bookKey,
+        orElse: () => EpubLibraryEntry(key: '', path: '', title: ''),
+      );
+      if (entry.key.isEmpty) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text(
+            'EPUB not in library on this device.',
+          )),
+        );
+        return;
+      }
+      final file = File(entry.path);
+      if (!await file.exists()) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('EPUB file missing: ${entry.path}')),
+        );
+        return;
+      }
+      // Rewrite the reading state's chapterIdx BEFORE opening so the
+      // reader loads at the requested chapter (there's no init-param
+      // for it on EpubReaderScreen — resume state is the mechanism).
+      final state = await EpubReadingState.load(bookKey);
+      // Clamp against the parsed book after openFile — but chapter
+      // count is close enough via a load-then-clamp inside the reader
+      // itself when the file opens.
+      state.chapterIdx = chapterIdx < 0 ? 0 : chapterIdx;
+      state.scrollPct = 0.0;
+      await state.save(bookKey);
+      if (!mounted) return;
+      // Dismiss dialog1 (if visible) so the reader can present cleanly.
+      if (_dialog1Visible) {
+        Navigator.of(context, rootNavigator: true).maybePop();
+      }
+      await _launchEpubReader(file);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not open EPUB: $e')),
+      );
+    }
+  }
+
+  void _handleLinkLongPress(String url) {
+    final link = url.trim();
+    if (link.isEmpty || !mounted) return;
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetCtx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text(
+                link,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(sheetCtx).textTheme.bodySmall,
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.link),
+              title: const Text('Copy Link'),
+              onTap: () {
+                Navigator.of(sheetCtx).pop();
+                Clipboard.setData(ClipboardData(text: link));
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Link copied'), duration: Duration(seconds: 1)),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
   Future<void> _ensureDialog1Tts() async {
     if (_dialog1Tts != null) return;
@@ -7412,6 +8421,22 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             // Minimized-dialog chips live on the root overlay (see
             // _ensureFloatingChipsOverlay) so they stay on top of any open
             // dialog and can be dragged freely.
+            if (_tagCaptureToggleVisible)
+              TagCaptureFloatingChip(
+                armed: _tagCaptureArmed,
+                initialPos: _tagCaptureChipPos,
+                onTap: _onCaptureChipTap,
+                onHide: () {
+                  setState(() {
+                    _tagCaptureToggleVisible = false;
+                    _tagCaptureArmed = false;
+                  });
+                  _controller.runJavaScript(
+                    'window.__cupitorSetCaptureMode && window.__cupitorSetCaptureMode(false);',
+                  );
+                },
+                onMoved: (pos) => _tagCaptureChipPos = pos,
+              ),
           ],
         ),
       ),

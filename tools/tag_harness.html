@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Cupitor sentence-tag JS harness</title>
+<style>
+  :root { color-scheme: light; }
+  body { font: 14px/1.5 -apple-system, system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
+  #left  { flex: 1 1 auto; padding: 16px; overflow: auto; border-right: 1px solid #ddd; }
+  #right { flex: 0 0 380px; padding: 12px; overflow: auto; background: #fafafa; }
+  h2 { font-size: 14px; margin: 16px 0 6px; color: #444; text-transform: uppercase; letter-spacing: 0.06em; }
+  fieldset { border: 1px solid #ddd; border-radius: 6px; padding: 8px 10px; margin: 0 0 10px; }
+  legend { font-size: 12px; color: #666; padding: 0 4px; }
+  button { font: inherit; padding: 4px 8px; margin: 2px 0; cursor: pointer; }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 4px; }
+  textarea, input[type=text] {
+    width: 100%; box-sizing: border-box; font: 12px/1.4 ui-monospace, Menlo, monospace;
+    border: 1px solid #ccc; border-radius: 4px; padding: 4px 6px;
+  }
+  textarea { min-height: 56px; resize: vertical; }
+  label.row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  #log {
+    background: #1e1e1e; color: #e0e0e0; padding: 8px; border-radius: 4px;
+    font: 11px/1.4 ui-monospace, Menlo, monospace; min-height: 180px; max-height: 320px;
+    overflow: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  .log-line { padding: 2px 0; border-bottom: 1px solid #2a2a2a; }
+  .log-line.in  { color: #8fd0ff; }
+  .log-line.out { color: #f0c674; }
+  .log-line.sys { color: #888; }
+  .pill {
+    display: inline-block; padding: 1px 6px; border-radius: 9px; font-size: 11px;
+    background: #eee; color: #444; margin-left: 4px;
+  }
+  .pill.on { background: #d4ffd4; color: #176f17; }
+  .clickable-word { cursor: pointer; padding: 0 1px; border-radius: 2px; }
+  .clickable-word:hover { background: rgba(0,0,0,0.04); }
+  /* Mirror the in-app styles the script also injects so visuals match. */
+  .cupitor-temp-highlight { background-color: rgba(255,235,59,0.35) !important; }
+  .cupitor-fade { opacity: 0.25 !important; transition: opacity 0.15s; }
+</style>
+</head>
+<body>
+
+<section id="left">
+  <h1 style="font-size:18px;">Cupitor sentence-tag harness</h1>
+  <p style="color:#666;font-size:12px;">
+    Loads <code>assets/js/sentence_tag.js</code> from this checkout. Click words
+    while capture mode is ON to trigger a capture event. Use the panel on the
+    right to simulate Dart → JS calls (apply tags, apply filter, commit save,
+    set masks visible). Every JS → Dart channel post lands in the log.
+  </p>
+
+  <article>
+    <p>
+      <span class="clickable-word" data-word="The">The</span>
+      <span class="clickable-word" data-word="quick">quick</span>
+      <span class="clickable-word" data-word="brown">brown</span>
+      <span class="clickable-word" data-word="fox">fox</span>
+      <span class="clickable-word" data-word="jumps">jumps</span>
+      <span class="clickable-word" data-word="over">over</span>
+      <span class="clickable-word" data-word="the">the</span>
+      <span class="clickable-word" data-word="lazy">lazy</span>
+      <span class="clickable-word" data-word="dog">dog</span>.
+      <span class="clickable-word" data-word="Pack">Pack</span>
+      <span class="clickable-word" data-word="my">my</span>
+      <span class="clickable-word" data-word="box">box</span>
+      <span class="clickable-word" data-word="with">with</span>
+      <span class="clickable-word" data-word="five">five</span>
+      <span class="clickable-word" data-word="dozen">dozen</span>
+      <span class="clickable-word" data-word="liquor">liquor</span>
+      <span class="clickable-word" data-word="jugs">jugs</span>.
+      <span class="clickable-word" data-word="How">How</span>
+      <span class="clickable-word" data-word="vexingly">vexingly</span>
+      <span class="clickable-word" data-word="quick">quick</span>
+      <span class="clickable-word" data-word="daft">daft</span>
+      <span class="clickable-word" data-word="zebras">zebras</span>
+      <span class="clickable-word" data-word="jump">jump</span>!
+    </p>
+    <p>
+      <span class="clickable-word" data-word="Bright">Bright</span>
+      <span class="clickable-word" data-word="vixens">vixens</span>
+      <span class="clickable-word" data-word="jump">jump</span>;
+      <span class="clickable-word" data-word="dozy">dozy</span>
+      <span class="clickable-word" data-word="fowl">fowl</span>
+      <span class="clickable-word" data-word="quack">quack</span>.
+      <span class="clickable-word" data-word="Sphinx">Sphinx</span>
+      <span class="clickable-word" data-word="of">of</span>
+      <span class="clickable-word" data-word="black">black</span>
+      <span class="clickable-word" data-word="quartz">quartz</span>,
+      <span class="clickable-word" data-word="judge">judge</span>
+      <span class="clickable-word" data-word="my">my</span>
+      <span class="clickable-word" data-word="vow">vow</span>.
+    </p>
+    <p>
+      <span class="clickable-word" data-word="Hej">Hej</span>
+      <span class="clickable-word" data-word="alla">alla</span>!
+      <span class="clickable-word" data-word="Doktor">Doktor</span>
+      <span class="clickable-word" data-word="Glas">Glas</span>
+      <span class="clickable-word" data-word="är">är</span>
+      <span class="clickable-word" data-word="en">en</span>
+      <span class="clickable-word" data-word="roman">roman</span>
+      <span class="clickable-word" data-word="av">av</span>
+      <span class="clickable-word" data-word="Hjalmar">Hjalmar</span>
+      <span class="clickable-word" data-word="Söderberg">Söderberg</span>.
+    </p>
+  </article>
+</section>
+
+<aside id="right">
+  <fieldset>
+    <legend>Capture mode</legend>
+    <div class="btn-row">
+      <button onclick="setCap(true)">Arm capture</button>
+      <button onclick="setCap(false)">Disarm</button>
+      <span id="capPill" class="pill">OFF</span>
+      <button style="margin-left:auto;" onclick="resetHarness()">Reset</button>
+    </div>
+    <p style="color:#666;font-size:11px;margin:6px 0 0;">
+      With capture ON, clicking a word triggers <code>__cupitorOnWordTap</code>.
+      The script highlights the detected sentence and posts a
+      <code>capture</code> event to the simulated SentenceTagHandler — visible
+      in the log below. <strong>Reset</strong> reloads sentence_tag.js,
+      strips all stamps / highlights / mask injections, and clears the log.
+    </p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Extend the active capture</legend>
+    <div class="btn-row">
+      <input id="extSid" type="text" placeholder="sentenceId from log (e.g. s_1)" style="flex:1;" />
+    </div>
+    <div class="btn-row" style="margin-top:4px;">
+      <button onclick="ext('prev')">‹ Prev</button>
+      <button onclick="ext('next')">Next ›</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Simulate Save (commit)</legend>
+    <label class="row">sid: <input id="cmSid" type="text" placeholder="s_1" style="flex:1;" /></label>
+    <label class="row">dbid: <input id="cmDbid" type="text" value="101" style="flex:1;" /></label>
+    <label class="row">colors: <input id="cmColors" type="text" value='["#FFC107","#2196F3"]' style="flex:1;" /></label>
+    <label class="row">tagIds: <input id="cmTagIds" type="text" value="5,9" style="flex:1;" /></label>
+    <label class="row">mask:   <input id="cmMask" type="text" placeholder="(optional replacement text)" style="flex:1;" /></label>
+    <div class="btn-row">
+      <button onclick="commit()">Commit</button>
+      <button onclick="clearTemp()">Clear temp</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Page-load rehydrate (__cupitorApplyTags)</legend>
+    <textarea id="applyJson">[{"id":101,"text":"The quick brown fox jumps over the lazy dog.","prevFp":"","nextFp":"","tagIds":[5],"tagColors":["#FFC107"],"tagNames":["A"]},{"id":102,"text":"Sphinx of black quartz, judge my vow.","prevFp":"","nextFp":"","tagIds":[9],"tagColors":["#2196F3"],"tagNames":["B"]}]</textarea>
+    <div class="btn-row">
+      <button onclick="applyTags()">Apply tags</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Filter (__cupitorApplyFilter)</legend>
+    <label class="row">tagIds: <input id="flTagIds" type="text" value="5" style="flex:1;" /></label>
+    <div class="btn-row">
+      <button onclick="applyFilter()">Apply</button>
+      <button onclick="clearFilter()">Clear</button>
+    </div>
+  </fieldset>
+
+  <fieldset id="masksFs" style="display:none;">
+    <legend>Masks (__cupitorSetMasksVisible)</legend>
+    <div class="btn-row">
+      <button onclick="setMasks(true)">Show masks</button>
+      <button onclick="setMasks(false)">Hide masks</button>
+      <span id="maskPill" class="pill">OFF</span>
+    </div>
+    <p style="color:#666;font-size:11px;margin:6px 0 0;">
+      Shows the mask in place of the original sentence text when set.
+      Long-press a masked sentence to fire an <code>editRequest</code>
+      to Dart (will appear in the log).
+    </p>
+  </fieldset>
+
+  <h2>Event log <button style="float:right;font-size:11px;" onclick="document.getElementById('log').innerHTML=''">clear</button></h2>
+  <div id="log"></div>
+</aside>
+
+<script>
+  // ─── JS channel stubs ────────────────────────────────────────────
+  // The bundled script posts JSON strings to these globals. We forward
+  // them into the on-page log.
+  function logLine(kind, txt) {
+    var el = document.createElement('div');
+    el.className = 'log-line ' + kind;
+    var when = new Date().toISOString().substring(11, 19);
+    el.textContent = '[' + when + '] ' + txt;
+    var log = document.getElementById('log');
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  }
+  window.SentenceTagHandler = {
+    postMessage: function (s) {
+      logLine('in', 'SentenceTagHandler ← ' + s);
+      // If the script just emitted a 'capture' event, copy the sid into
+      // the helper fields so the user doesn't have to retype it.
+      try {
+        var m = JSON.parse(s);
+        if (m && m.op === 'capture' && m.sentenceId) {
+          document.getElementById('extSid').value = m.sentenceId;
+          document.getElementById('cmSid').value  = m.sentenceId;
+        }
+      } catch (_) {}
+    },
+  };
+  window.SentenceFilterHandler = {
+    postMessage: function (s) { logLine('in', 'SentenceFilterHandler ← ' + s); },
+  };
+  window.SnippetLogChannel = {
+    postMessage: function (s) { logLine('sys', 'SnippetLogChannel ← ' + s); },
+  };
+
+  // ─── Driver buttons ─────────────────────────────────────────────
+  function missing(fn) {
+    logLine('sys', '⚠ ' + fn + ' is not defined — sentence_tag.js failed to load or threw before exposing it. Try Reset.');
+  }
+  function setCap(on) {
+    if (typeof window.__cupitorSetCaptureMode !== 'function') { missing('__cupitorSetCaptureMode'); return; }
+    window.__cupitorSetCaptureMode(on);
+    var pill = document.getElementById('capPill');
+    pill.textContent = on ? 'ON' : 'OFF';
+    pill.classList.toggle('on', on);
+    logLine('out', '__cupitorSetCaptureMode(' + on + ')');
+  }
+  function ext(dir) {
+    var sid = document.getElementById('extSid').value.trim();
+    if (!sid) { logLine('sys', 'set a sentenceId first (capture a word with capture mode ON)'); return; }
+    if (typeof window.__cupitorRequestExtend !== 'function') { missing('__cupitorRequestExtend'); return; }
+    logLine('out', '__cupitorRequestExtend("' + sid + '","' + dir + '")');
+    window.__cupitorRequestExtend(sid, dir);
+  }
+  function commit() {
+    var sid    = document.getElementById('cmSid').value.trim();
+    var dbid   = document.getElementById('cmDbid').value.trim();
+    var colors = document.getElementById('cmColors').value;
+    var tagIds = document.getElementById('cmTagIds').value;
+    var mask   = document.getElementById('cmMask').value;
+    if (!sid) { logLine('sys', 'set sid first'); return; }
+    if (typeof window.__cupitorCommitTags !== 'function') { missing('__cupitorCommitTags'); return; }
+    logLine('out', '__cupitorCommitTags("' + sid + '",' + dbid + ',' + colors + ',"' + tagIds + '"' + (mask ? ',"' + mask + '"' : '') + ')');
+    window.__cupitorCommitTags(sid, parseInt(dbid, 10), colors, tagIds, mask || '');
+  }
+  function clearTemp() {
+    var sid = document.getElementById('cmSid').value.trim();
+    if (typeof window.__cupitorClearTempHighlight !== 'function') { missing('__cupitorClearTempHighlight'); return; }
+    logLine('out', '__cupitorClearTempHighlight(' + (sid ? '"' + sid + '"' : '') + ')');
+    window.__cupitorClearTempHighlight(sid || undefined);
+  }
+  function applyTags() {
+    var json = document.getElementById('applyJson').value;
+    if (typeof window.__cupitorApplyTags !== 'function') { missing('__cupitorApplyTags'); return; }
+    logLine('out', '__cupitorApplyTags(' + json.substring(0, 60) + (json.length > 60 ? '…' : '') + ')');
+    try {
+      window.__cupitorApplyTags(json);
+    } catch (e) {
+      logLine('sys', '⚠ __cupitorApplyTags threw: ' + (e && e.message ? e.message : e));
+    }
+  }
+  function applyFilter() {
+    var ids = document.getElementById('flTagIds').value.trim();
+    var arr = '[' + ids + ']';
+    if (typeof window.__cupitorApplyFilter !== 'function') { missing('__cupitorApplyFilter'); return; }
+    logLine('out', '__cupitorApplyFilter(' + arr + ')');
+    window.__cupitorApplyFilter(arr);
+  }
+  function clearFilter() {
+    if (typeof window.__cupitorApplyFilter !== 'function') { missing('__cupitorApplyFilter'); return; }
+    logLine('out', '__cupitorApplyFilter([])');
+    window.__cupitorApplyFilter('[]');
+  }
+  function setMasks(on) {
+    if (typeof window.__cupitorSetMasksVisible !== 'function') { missing('__cupitorSetMasksVisible'); return; }
+    window.__cupitorSetMasksVisible(on);
+    var pill = document.getElementById('maskPill');
+    pill.textContent = on ? 'ON' : 'OFF';
+    pill.classList.toggle('on', on);
+    logLine('out', '__cupitorSetMasksVisible(' + on + ')');
+  }
+
+  // ─── Word-tap router (mirrors utils.js in the app) ──────────────
+  // sentence_tag.js exposes window.__cupitorOnWordTap but doesn't bind
+  // it to clicks itself — in the real app, utils.js owns the listener.
+  // The harness loads sentence_tag.js standalone, so we install the
+  // shim here.
+  document.addEventListener('click', function (e) {
+    var t = e.target && e.target.closest && e.target.closest('.clickable-word');
+    if (!t) return;
+    if (window.__cupitorCaptureMode && typeof window.__cupitorOnWordTap === 'function') {
+      e.preventDefault();
+      e.stopPropagation();
+      window.__cupitorOnWordTap(t);
+    } else {
+      // Useful for debugging: shows the user that the click was seen
+      // but capture mode wasn't on, so the script wasn't invoked.
+      logLine('sys', 'clicked "' + (t.textContent || '').trim() + '" — capture mode is OFF, no event fires (Arm capture first)');
+    }
+  }, true);
+
+  // ─── Reset ──────────────────────────────────────────────────────
+  // Re-load sentence_tag.js (fresh URL so the cache is bypassed),
+  // remove every harness-side stamp / class / mask injection, clear
+  // the log, drop capture/mask pills.
+  function resetHarness() {
+    document.getElementById('log').innerHTML = '';
+    // Remove any injected mask elements + style block left by the prior script.
+    document.querySelectorAll('.cupitor-mask').forEach(function (el) { el.remove(); });
+    var styleEl = document.getElementById('__cupitor_st_styles');
+    if (styleEl) styleEl.remove();
+    // Strip stamps and inline backgrounds on every clickable-word.
+    document.querySelectorAll('.clickable-word').forEach(function (el) {
+      el.classList.remove('cupitor-temp-highlight', 'cupitor-tagged', 'cupitor-fade', 'cupitor-masked-out');
+      el.style.backgroundColor = '';
+      el.removeAttribute('data-cupitor-sent');
+      el.removeAttribute('data-cupitor-dbid');
+      el.removeAttribute('data-cupitor-tagids');
+      el.removeAttribute('data-cupitor-mask');
+      el.removeAttribute('data-cupitor-extra-tags');
+    });
+    // Drop globals the script created so the new load gets a clean slate.
+    delete window.__cupitorSentenceTagLoaded;
+    delete window.__cupitorCaptureMode;
+    delete window.__cupitorOnWordTap;
+    delete window.__cupitorRequestExtend;
+    delete window.__cupitorClearTempHighlight;
+    delete window.__cupitorCommitTags;
+    delete window.__cupitorApplyTags;
+    delete window.__cupitorApplyFilter;
+    delete window.__cupitorSetCaptureMode;
+    delete window.__cupitorSetMasksVisible;
+    // Reset UI bits.
+    document.getElementById('capPill').textContent = 'OFF';
+    document.getElementById('capPill').classList.remove('on');
+    document.getElementById('maskPill').textContent = 'OFF';
+    document.getElementById('maskPill').classList.remove('on');
+    document.getElementById('extSid').value = '';
+    document.getElementById('cmSid').value = '';
+    document.getElementById('cmMask').value = '';
+    loadScript();
+  }
+
+  // ─── Boot ───────────────────────────────────────────────────────
+  function loadScript() {
+    logLine('sys', 'Loading sentence_tag.js …');
+    var s = document.createElement('script');
+    s.src = '../assets/js/sentence_tag.js?t=' + Date.now();
+    s.onload = function () {
+      logLine('sys', 'sentence_tag.js loaded.');
+      var has = {
+        setCaptureMode:   typeof window.__cupitorSetCaptureMode   === 'function',
+        onWordTap:        typeof window.__cupitorOnWordTap        === 'function',
+        applyTags:        typeof window.__cupitorApplyTags        === 'function',
+        applyFilter:      typeof window.__cupitorApplyFilter      === 'function',
+        commitTags:       typeof window.__cupitorCommitTags       === 'function',
+        requestExtend:    typeof window.__cupitorRequestExtend    === 'function',
+        clearTemp:        typeof window.__cupitorClearTempHighlight === 'function',
+        setMasksVisible:  typeof window.__cupitorSetMasksVisible  === 'function',
+      };
+      logLine('sys', 'exported: ' + Object.keys(has).filter(function (k) { return has[k]; }).join(', '));
+      var missing = Object.keys(has).filter(function (k) { return !has[k]; });
+      if (missing.length) logLine('sys', '⚠ missing: ' + missing.join(', '));
+      if (has.setMasksVisible) document.getElementById('masksFs').style.display = '';
+    };
+    s.onerror = function () { logLine('sys', '⚠ FAILED to load sentence_tag.js (check the relative path: ../assets/js/sentence_tag.js)'); };
+    document.body.appendChild(s);
+  }
+  loadScript();
+</script>
+
+</body>
+</html>
