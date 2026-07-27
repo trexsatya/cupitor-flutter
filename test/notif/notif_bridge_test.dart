@@ -124,4 +124,130 @@ void main() {
       expect((first['config'] as Map)['offsets_waking_hours'], isA<List>());
     });
   });
+
+  group('createList', () {
+    test('series list: items at step 0, due at offsets[0], events pushed',
+        () async {
+      await createFrenchList();
+      expect(lastAck()['ok'], true);
+      final lists = lastEvent('cupitorNotifLists')!['lists'] as List;
+      final l = lists.single as Map;
+      expect(l['external_key'], 'fr-1');
+      expect(l['schedule_key'], 'ebbinghaus');
+      expect(l['status'], 'active');
+      final items = l['items'] as List;
+      expect(items, hasLength(2));
+      final c1 = items.first as Map;
+      expect(c1['external_id'], 'c1');
+      expect(c1['step'], 0);
+      expect(c1['payload'], {'deck': 7});
+      // ebbinghaus offsets[0] = 0.25 wh from Mon 10:00 → 10:15.
+      final expected = tz.TZDateTime(ny, 2026, 7, 27, 10, 15)
+          .millisecondsSinceEpoch;
+      expect(c1['next_due_at'], expected);
+      // No internal row ids cross the bridge.
+      expect(c1.containsKey('id'), isFalse);
+      expect(l.containsKey('id'), isFalse);
+    });
+    test('recurring list: items undue, list gets next_fire_at', () async {
+      await createFrenchList(scheduleKey: 'daily_0900');
+      final l = (lastEvent('cupitorNotifLists')!['lists'] as List).single as Map;
+      expect((l['items'] as List).first['next_due_at'], isNull);
+      // Mon 10:00 is past 09:00 → Tue 09:00.
+      expect(l['next_fire_at'],
+          tz.TZDateTime(ny, 2026, 7, 28, 9).millisecondsSinceEpoch);
+    });
+    test('duplicate external_key → duplicate_key', () async {
+      await createFrenchList();
+      await createFrenchList();
+      expect(lastAck()['error'], 'duplicate_key');
+    });
+    test('unknown schedule → unknown_schedule', () async {
+      await bridge.handle(jsonEncode({
+        'op': 'createList', 'external_key': 'x', 'name': 'X',
+        'schedule_key': 'nope', 'items': [],
+      }));
+      expect(lastAck()['error'], 'unknown_schedule');
+    });
+    test('item missing title → bad_payload, nothing created', () async {
+      await bridge.handle(jsonEncode({
+        'op': 'createList', 'external_key': 'x', 'name': 'X',
+        'schedule_key': 'ebbinghaus',
+        'items': [{'external_id': 'c1'}],
+      }));
+      expect(lastAck()['error'], 'bad_payload');
+      expect(await dao.listByExternalKey(1, 'x'), isNull);
+    });
+    test('duplicate external_id within payload → bad_payload', () async {
+      await bridge.handle(jsonEncode({
+        'op': 'createList', 'external_key': 'x', 'name': 'X',
+        'schedule_key': 'ebbinghaus',
+        'items': [
+          {'external_id': 'c1', 'title': 'a'},
+          {'external_id': 'c1', 'title': 'b'},
+        ],
+      }));
+      expect(lastAck()['error'], 'bad_payload');
+    });
+  });
+
+  group('syncItems', () {
+    test('merge: updates content, preserves SRS state, inserts new', () async {
+      await createFrenchList();
+      final list = (await dao.listByExternalKey(1, 'fr-1'))!;
+      final c1 = (await dao.itemByExternalId(list.id, 'c1'))!;
+      await dao.updateItem(c1.id, {'step': 4, 'next_due_at': 123456});
+
+      await bridge.handle(jsonEncode({
+        'op': 'syncItems', 'request_id': 'r-sync', 'external_key': 'fr-1',
+        'items': [
+          {'external_id': 'c1', 'title': 'le dénouement (fixed)'},
+          {'external_id': 'c3', 'title': 'quoi qu\'il en soit'},
+        ],
+      }));
+      expect(lastAck()['ok'], true);
+
+      final c1After = (await dao.itemByExternalId(list.id, 'c1'))!;
+      expect(c1After.title, 'le dénouement (fixed)');
+      expect(c1After.step, 4); // three weeks of progress survives a typo fix
+      expect(c1After.nextDueAt, 123456);
+      // c2 absent from payload: merge leaves it alone.
+      expect(await dao.itemByExternalId(list.id, 'c2'), isNotNull);
+      // c3 inserted fresh at step 0.
+      expect((await dao.itemByExternalId(list.id, 'c3'))!.step, 0);
+    });
+    test('replace: absent items are deleted', () async {
+      await createFrenchList();
+      await bridge.handle(jsonEncode({
+        'op': 'syncItems', 'external_key': 'fr-1', 'mode': 'replace',
+        'items': [{'external_id': 'c1', 'title': 'le dénouement'}],
+      }));
+      final list = (await dao.listByExternalKey(1, 'fr-1'))!;
+      expect(await dao.itemByExternalId(list.id, 'c2'), isNull);
+      expect(await dao.itemByExternalId(list.id, 'c1'), isNotNull);
+    });
+    test('unknown list → unknown_list', () async {
+      await bridge.handle(jsonEncode(
+          {'op': 'syncItems', 'external_key': 'zzz', 'items': []}));
+      expect(lastAck()['error'], 'unknown_list');
+    });
+    test('bad mode → bad_payload', () async {
+      await createFrenchList();
+      await bridge.handle(jsonEncode({
+        'op': 'syncItems', 'external_key': 'fr-1', 'mode': 'upsert',
+        'items': [],
+      }));
+      expect(lastAck()['error'], 'bad_payload');
+    });
+  });
+
+  group('getLists', () {
+    test('pushes cupitorNotifLists and acks', () async {
+      await createFrenchList();
+      events.clear();
+      await bridge.handle('{"op":"getLists","request_id":"r-gl"}');
+      expect(lastAck()['ok'], true);
+      expect(lastEvent('cupitorNotifLists'), isNotNull);
+    });
+  });
 }
