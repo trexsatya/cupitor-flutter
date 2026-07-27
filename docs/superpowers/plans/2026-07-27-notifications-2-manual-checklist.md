@@ -44,3 +44,17 @@ these are claimed as verified yet — this is the hand-off list.
       guarded in rearm()).
 - [ ] Windows/web: NoopNotifChannel — state advances silently on the tick;
       `getCapabilities` reports `actions:false`.
+
+## Manager UI (Plan 3 — any platform)
+- [ ] Tools sheet (web + EPUB surfaces) shows "Notification manager"; opens.
+- [ ] With permission denied, the manager shows the banner; Enable triggers
+      the OS prompt and the banner clears after grant.
+- [ ] Changing the waking window / per-fire cap re-arms (verify: a pending
+      fire inside the new sleep window disappears from the shade schedule).
+- [ ] Create an app list with a short-offset custom series; add an item; it
+      fires without any webpage involvement.
+- [ ] Editing a custom schedule used by a list re-anchors the list's next
+      fire; deleting is blocked (disabled trash icon) until reassigned.
+- [ ] Manager mutations made while dialog1 is open push fresh
+      `cupitorNotifLists` to the webpage on returning from the screen (web
+      surface only).
