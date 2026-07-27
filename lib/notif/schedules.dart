@@ -56,7 +56,7 @@ Map<String, Object?> validateScheduleConfig(
     if (raw is! List || raw.isEmpty) throw ScheduleConfigError('bad_offsets');
     final offsets = <double>[];
     for (final e in raw) {
-      if (e is! num || e <= 0) throw ScheduleConfigError('bad_offsets');
+      if (e is! num || !e.isFinite || e <= 0) throw ScheduleConfigError('bad_offsets');
       final v = e.toDouble();
       if (offsets.isNotEmpty && v <= offsets.last) {
         throw ScheduleConfigError('bad_offsets');

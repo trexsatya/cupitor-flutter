@@ -36,6 +36,16 @@ void main() {
           () => validateScheduleConfig('series', {'offsets_waking_hours': [4, 4]}),
           throwsA(isA<ScheduleConfigError>()));
     });
+    test('non-finite offset rejected', () {
+      expect(
+          () => validateScheduleConfig(
+              'series', {'offsets_waking_hours': [1, double.nan]}),
+          throwsA(isA<ScheduleConfigError>()));
+      expect(
+          () => validateScheduleConfig(
+              'series', {'offsets_waking_hours': [1, double.infinity]}),
+          throwsA(isA<ScheduleConfigError>()));
+    });
   });
 
   group('validateScheduleConfig — recurring', () {
