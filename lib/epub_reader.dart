@@ -34,6 +34,7 @@ import 'book_transfer.dart';
 import 'db.dart';
 import 'jslog.dart';
 import 'memory_manager.dart';
+import 'notif/notification_manager.dart';
 import 'playlist_screen.dart';
 import 'playlist_service.dart';
 import 'profile_service.dart';
@@ -2696,6 +2697,11 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
         onOpenMemoryManager: () {
           Navigator.of(context).push(MaterialPageRoute<void>(
             builder: (_) => const MemoryManagerScreen(),
+          ));
+        },
+        onOpenNotificationManager: () {
+          Navigator.of(context).push(MaterialPageRoute<void>(
+            builder: (_) => const NotificationManagerScreen(),
           ));
         },
         onOpenFilterSheet: () async {

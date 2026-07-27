@@ -66,6 +66,8 @@ class TagSettingsCallbacks {
   final VoidCallback? onExportBook;
   /// Available on both surfaces — opens the top-level storage overview.
   final VoidCallback? onOpenMemoryManager;
+  /// Available on both surfaces — opens the notification manager.
+  final VoidCallback? onOpenNotificationManager;
   const TagSettingsCallbacks({
     required this.onSetCaptureChipVisible,
     required this.onSetMasksVisible,
@@ -79,6 +81,7 @@ class TagSettingsCallbacks {
     this.onOpenPlaylistScreen,
     this.onExportBook,
     this.onOpenMemoryManager,
+    this.onOpenNotificationManager,
   });
 }
 
@@ -357,6 +360,27 @@ class _TagSettingsSheetState extends State<_TagSettingsSheet> {
                       widget.callbacks.onOpenPlaylistScreen!();
                     },
                   ),
+              ],
+              if (widget.callbacks.onOpenNotificationManager != null) ...[
+                const Divider(height: 1),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                  child:
+                      Text('Notifications', style: theme.textTheme.titleSmall),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.notifications_active_outlined),
+                  title: const Text('Notification manager'),
+                  subtitle: const Text(
+                    'Review lists, schedules, the waking window, and the '
+                    'per-fire cap.',
+                  ),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () {
+                    Navigator.of(context).pop();
+                    widget.callbacks.onOpenNotificationManager!();
+                  },
+                ),
               ],
               if (widget.callbacks.onExportBook != null ||
                   widget.callbacks.onOpenMemoryManager != null) ...[

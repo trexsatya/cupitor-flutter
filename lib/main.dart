@@ -31,6 +31,7 @@ import 'notif/notification_channel.dart';
 import 'notif/notif_runtime.dart';
 import 'notif/notif_settings.dart';
 import 'notif/notif_timer.dart';
+import 'notif/notification_manager.dart';
 import 'playlist_service.dart';
 import 'profile_service.dart';
 import 'tag_browser.dart';
@@ -1933,6 +1934,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           Navigator.of(context).push(MaterialPageRoute<void>(
             builder: (_) => const MemoryManagerScreen(),
           ));
+        },
+        onOpenNotificationManager: () async {
+          await Navigator.of(context).push(MaterialPageRoute<void>(
+            builder: (_) => const NotificationManagerScreen(),
+          ));
+          // Manager mutations happened outside the bridge — refresh the
+          // webpage's view of lists/schedules when we come back.
+          await _pushNotifStateToDialog();
         },
         onOpenFilterSheet: () async {
           final pid = ProfileService.currentId;
