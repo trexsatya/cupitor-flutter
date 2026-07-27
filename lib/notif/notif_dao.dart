@@ -156,11 +156,13 @@ class NotifDao {
     return r.isEmpty ? null : NotifScheduleRow.fromMap(r.first);
   }
 
-  /// Resolves both bridge forms: a builtin_key, or 'custom:<id>'.
+  /// Resolves both bridge forms: a builtin_key, or `custom:<id>`.
   Future<NotifScheduleRow?> scheduleByKey(String key) async {
     if (key.startsWith('custom:')) {
       final id = int.tryParse(key.substring(7));
-      return id == null ? null : scheduleById(id);
+      if (id == null) return null;
+      final s = await scheduleById(id);
+      return (s == null || s.builtinKey != null) ? null : s;
     }
     final r = await db.query('notif_schedules',
         where: 'builtin_key = ?', whereArgs: [key], limit: 1);
