@@ -80,6 +80,11 @@ dependencies:
   # flutter_timezone: device IANA zone name to seed tz.local.
   timezone: ^0.9.4
   flutter_timezone: ^2.1.0
+  # Delivery layer (Plan 2). flutter_local_notifications: pre-armed OS alarms
+  # + offline action buttons on Android/iOS/macOS/Linux. workmanager: Android
+  # periodic safety net (rearm + sweep) — spec §Delivery.
+  flutter_local_notifications: ^18.0.1
+  workmanager: ^0.5.2
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
