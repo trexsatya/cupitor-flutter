@@ -296,6 +296,53 @@ class NotifDao {
           .map(NotifItemRow.fromMap)
           .toList(growable: false);
 
+  /// Active items in active lists due strictly AFTER [fromMs] and at or
+  /// before [toMs] — the rearm window. Profile-agnostic by design: reviews
+  /// keep firing for every profile (spec §Delivery).
+  Future<List<NotifItemRow>> upcomingItems(int fromMs, int toMs) async =>
+      (await db.rawQuery('''
+        SELECT i.* FROM notif_items i
+        JOIN notif_lists l ON l.id = i.list_id
+        WHERE i.status = 'active' AND l.status = 'active'
+          AND i.next_due_at IS NOT NULL
+          AND i.next_due_at > ? AND i.next_due_at <= ?
+        ORDER BY i.next_due_at ASC, i.id ASC
+      ''', [fromMs, toMs]))
+          .map(NotifItemRow.fromMap)
+          .toList(growable: false);
+
+  /// Active lists whose recurring fire time has passed. Profile-agnostic.
+  Future<List<NotifListRow>> recurringDueLists(int nowMs) async =>
+      (await db.query('notif_lists',
+              where: "status = 'active' AND next_fire_at IS NOT NULL "
+                  'AND next_fire_at <= ?',
+              whereArgs: [nowMs],
+              orderBy: 'next_fire_at ASC, id ASC'))
+          .map(NotifListRow.fromMap)
+          .toList(growable: false);
+
+  /// Active lists firing inside the rearm window (strictly future).
+  Future<List<NotifListRow>> recurringUpcomingLists(int fromMs, int toMs) async =>
+      (await db.query('notif_lists',
+              where: "status = 'active' AND next_fire_at IS NOT NULL "
+                  'AND next_fire_at > ? AND next_fire_at <= ?',
+              whereArgs: [fromMs, toMs],
+              orderBy: 'next_fire_at ASC, id ASC'))
+          .map(NotifListRow.fromMap)
+          .toList(growable: false);
+
+  Future<NotifItemRow?> itemById(int id) async {
+    final r = await db.query('notif_items',
+        where: 'id = ?', whereArgs: [id], limit: 1);
+    return r.isEmpty ? null : NotifItemRow.fromMap(r.first);
+  }
+
+  Future<NotifListRow?> listById(int id) async {
+    final r = await db.query('notif_lists',
+        where: 'id = ?', whereArgs: [id], limit: 1);
+    return r.isEmpty ? null : NotifListRow.fromMap(r.first);
+  }
+
   // ── events ─────────────────────────────────────────────────────────
 
   Future<int> insertEvent({

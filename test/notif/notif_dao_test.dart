@@ -105,4 +105,51 @@ void main() {
     await dao.insertItem(listId: list.id, title: 'two', position: 1);
     expect(await dao.itemsForList(list.id), hasLength(2));
   });
+
+  test('upcomingItems: future window, active∩active, ordered', () async {
+    final eb = await dao.scheduleByKey('ebbinghaus');
+    final a = await dao.createList(
+        profileId: 1, name: 'A', source: 'app', scheduleId: eb!.id);
+    await dao.insertItem(listId: a.id, title: 'past', position: 0, nextDueAt: 50);
+    await dao.insertItem(listId: a.id, title: 'in-window', position: 1, nextDueAt: 150);
+    await dao.insertItem(listId: a.id, title: 'beyond', position: 2, nextDueAt: 950);
+    final up = await dao.upcomingItems(100, 900);
+    expect(up.map((i) => i.title), ['in-window']);
+  });
+
+  test('recurringDueLists / recurringUpcomingLists filter on next_fire_at and status',
+      () async {
+    final daily = await dao.scheduleByKey('daily_0900');
+    final l1 = await dao.createList(
+        profileId: 1, name: 'due', source: 'app',
+        scheduleId: daily!.id, nextFireAt: 100);
+    final l2 = await dao.createList(
+        profileId: 1, name: 'upcoming', source: 'app',
+        scheduleId: daily.id, nextFireAt: 500);
+    final l3 = await dao.createList(
+        profileId: 1, name: 'paused', source: 'app',
+        scheduleId: daily.id, nextFireAt: 100);
+    await dao.updateList(l3.id, {'status': 'paused'});
+    // Second profile — must still be visible (notifications are profile-agnostic).
+    await db.insert('profiles',
+        {'id': 2, 'name': 'P2', 'created_at': 1});
+    final other = await dao.createList(
+        profileId: 2, name: 'other-profile', source: 'app',
+        scheduleId: daily.id, nextFireAt: 100);
+
+    final due = await dao.recurringDueLists(200);
+    expect(due.map((l) => l.id), containsAll([l1.id, other.id]));
+    expect(due.map((l) => l.id), isNot(contains(l3.id)));
+    final up = await dao.recurringUpcomingLists(200, 900);
+    expect(up.map((l) => l.id), [l2.id]);
+  });
+
+  test('itemById / listById', () async {
+    final l = await dao.createList(profileId: 1, name: 'L', source: 'app');
+    final i = await dao.insertItem(listId: l.id, title: 'x', position: 0);
+    expect((await dao.itemById(i.id))!.title, 'x');
+    expect((await dao.listById(l.id))!.name, 'L');
+    expect(await dao.itemById(999999), isNull);
+    expect(await dao.listById(999999), isNull);
+  });
 }
