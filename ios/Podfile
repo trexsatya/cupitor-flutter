@@ -1,5 +1,7 @@
-# Uncomment this line to define a global platform for your project
-# platform :ios, '12.0'
+# google_mlkit_commons requires >= 15.5 (flutter build ios error, following
+# it up from audioplayers_darwin's >= 13.0 floor); other notif-feature
+# plugins (flutter_local_notifications, workmanager) are satisfied by this.
+platform :ios, '15.5'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
