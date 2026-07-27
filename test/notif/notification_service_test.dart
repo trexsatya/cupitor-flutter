@@ -152,4 +152,107 @@ void main() {
       await dead.rearm(); // must not throw
     });
   });
+
+  group('sweep', () {
+    test('overdue within grace: posts now, auto-advances, records fire event',
+        () async {
+      final l = await seriesList();
+      final item = await dao.insertItem(
+          listId: l.id, title: 'due', position: 0,
+          nextDueAt: nowMs() - 3600000); // 1 waking hour ago (10:00 Mon)
+      await service.sweep();
+
+      expect(channel.shown, hasLength(1));
+      expect(channel.shown.single.notifId,
+          NotificationService.itemNotifId(item.id));
+      final after = (await dao.itemById(item.id))!;
+      expect(after.step, 1); // auto-advance = the automatic fading
+      expect(after.nextDueAt, greaterThan(nowMs()));
+      expect(after.lastFiredAt, nowMs());
+      final ev = (await dao.lastEventForItem(item.id))!;
+      expect(ev.respondedAt, isNull);
+      expect(ev.source, isNull); // a real posted fire
+    });
+
+    test('overdue beyond grace: silent auto-advance, source auto', () async {
+      final l = await seriesList();
+      final item = await dao.insertItem(
+          listId: l.id, title: 'stale', position: 0,
+          nextDueAt: nowMs() - 4 * 3600000); // 4 waking hours ago
+      await service.sweep();
+      expect(channel.shown, isEmpty);
+      final after = (await dao.itemById(item.id))!;
+      expect(after.step, 1);
+      expect((await dao.lastEventForItem(item.id))!.source, 'auto');
+    });
+
+    test('already-handled fire (event at/after due) is not re-fired', () async {
+      final l = await seriesList();
+      final item = await dao.insertItem(
+          listId: l.id, title: 'handled', position: 0,
+          nextDueAt: nowMs() - 1000);
+      await dao.insertEvent(
+          itemId: item.id, firedAt: nowMs() - 500, respondedAt: nowMs() - 400,
+          grade: 3, source: 'webpage');
+      await service.sweep();
+      expect(channel.shown, isEmpty);
+      expect((await dao.itemById(item.id))!.step, 0); // untouched
+    });
+
+    test('due recurring list within grace: fires rotation, advances cursor, reschedules',
+        () async {
+      final daily = await dao.scheduleByKey('daily_0900');
+      final l = await dao.createList(
+          profileId: 1, name: 'R', source: 'app',
+          scheduleId: daily!.id, nextFireAt: nowMs() - 3600000);
+      await dao.insertItem(listId: l.id, title: 'r0', position: 0);
+      await dao.insertItem(listId: l.id, title: 'r1', position: 1);
+      await service.sweep();
+
+      expect(channel.shown, hasLength(1));
+      expect(channel.shown.single.title, 'r0');
+      final after = (await dao.listById(l.id))!;
+      expect(after.cursor, 1);
+      expect(after.lastFiredAt, nowMs());
+      // Mon 10:00 → next daily 09:00 is Tue 09:00.
+      expect(after.nextFireAt,
+          tz.TZDateTime(ny, 2026, 7, 28, 9).millisecondsSinceEpoch);
+    });
+
+    test('stale recurring fire: skipped, just rescheduled', () async {
+      final daily = await dao.scheduleByKey('daily_0900');
+      final l = await dao.createList(
+          profileId: 1, name: 'R', source: 'app',
+          scheduleId: daily!.id, nextFireAt: nowMs() - 8 * 3600000);
+      await dao.insertItem(listId: l.id, title: 'r0', position: 0);
+      await service.sweep();
+      expect(channel.shown, isEmpty);
+      final after = (await dao.listById(l.id))!;
+      expect(after.cursor, 0); // nothing consumed
+      expect(after.nextFireAt, greaterThan(nowMs()));
+    });
+
+    test('sweep respects the per-fire cap on the posted batch', () async {
+      final l = await seriesList();
+      for (var i = 0; i < 8; i++) {
+        await dao.insertItem(
+            listId: l.id, title: 'i$i', position: i,
+            nextDueAt: nowMs() - 1000 - i);
+      }
+      await service.sweep();
+      expect(channel.shown, hasLength(5));
+      // The other 3 still advanced silently (auto) so the backlog drains.
+      final items = await dao.itemsForList(l.id);
+      expect(items.where((i) => i.step == 1), hasLength(8));
+    });
+
+    test('sweep ends by rearming the future window', () async {
+      final l = await seriesList();
+      await dao.insertItem(
+          listId: l.id, title: 'due', position: 0, nextDueAt: nowMs() - 1000);
+      await service.sweep();
+      // The auto-advanced item got a future next_due_at → must now be armed.
+      expect(channel.scheduled, hasLength(1));
+    });
+  });
 }

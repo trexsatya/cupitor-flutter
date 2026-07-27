@@ -131,4 +131,105 @@ class NotificationService {
         await _itemFire(d, item, whenMs, withActions: false)
     ];
   }
+
+  // ── sweep ────────────────────────────────────────────────────────────
+
+  /// Catch-up: process everything whose fire time has passed, then rearm.
+  /// One function, three callers (spec §The sweep): Android worker, app
+  /// launch/resume, desktop/web timer.
+  Future<void> sweep() async {
+    final d = await dao();
+    if (d == null) return;
+    final t = now();
+    final nowMs = t.millisecondsSinceEpoch;
+    final w = window();
+    final cap = perFireCap();
+    var posted = 0;
+
+    // Overdue series items.
+    for (final item in await d.dueItems(nowMs)) {
+      final due = item.nextDueAt!;
+      final last = await d.lastEventForItem(item.id);
+      if (last != null && last.firedAt >= due) continue; // already handled
+      final withinGrace = wakingHoursBetween(
+              tz.TZDateTime.fromMillisecondsSinceEpoch(t.location, due),
+              t, w) <=
+          graceWakingHours;
+      final fireNow = withinGrace && posted < cap;
+      if (fireNow) {
+        posted++;
+        await channel.showNow(await _itemFire(d, item, nowMs,
+            withActions: await _isSeriesList(d, item.listId)));
+      }
+      // Automatic fading: every processed fire advances one step. Items in
+      // recurring lists carry due times only if they have prior series
+      // state; advancing them is harmless and keeps one code path.
+      final offsets = await _offsetsForList(d, item.listId);
+      if (offsets != null) {
+        final o = advanceSeries(
+            step: item.step, done: item.status == 'done',
+            offsetsWakingHours: offsets, now: t, grade: null, window: w);
+        await d.updateItem(item.id, {
+          'step': o.step,
+          'status': o.done ? 'done' : 'active',
+          'next_due_at': o.nextDue?.millisecondsSinceEpoch,
+          'last_fired_at': nowMs,
+        });
+      } else {
+        await d.updateItem(item.id,
+            {'next_due_at': null, 'last_fired_at': nowMs});
+      }
+      await d.insertEvent(
+          itemId: item.id, firedAt: nowMs, source: fireNow ? null : 'auto');
+    }
+
+    // Due recurring lists.
+    for (final list in await d.recurringDueLists(nowMs)) {
+      final schedule = list.scheduleId == null
+          ? null
+          : await d.scheduleById(list.scheduleId!);
+      if (schedule == null || schedule.kind != 'recurring') {
+        await d.updateList(list.id, {'next_fire_at': null});
+        continue;
+      }
+      final cfg = parseRecurring(
+          jsonDecode(schedule.config) as Map<String, dynamic>);
+      final withinGrace = wakingHoursBetween(
+              tz.TZDateTime.fromMillisecondsSinceEpoch(
+                  t.location, list.nextFireAt!),
+              t, w) <=
+          graceWakingHours;
+      var newCursor = list.cursor;
+      if (withinGrace) {
+        final items = await d.itemsForList(list.id);
+        final sel = takeForFire<NotifItemRow>(
+            items, list.cursor, cfg.perFire, (i) => i.status == 'active');
+        for (final item in sel.items) {
+          if (posted >= cap) break;
+          posted++;
+          await channel.showNow(
+              await _itemFire(d, item, nowMs, withActions: false));
+          await d.updateItem(item.id, {'last_fired_at': nowMs});
+          await d.insertEvent(itemId: item.id, firedAt: nowMs);
+        }
+        newCursor = sel.newCursor;
+      }
+      await d.updateList(list.id, {
+        'cursor': newCursor,
+        'last_fired_at': withinGrace ? nowMs : list.lastFiredAt,
+        'next_fire_at':
+            nextRecurringFire(cfg, t, w).millisecondsSinceEpoch,
+      });
+    }
+
+    await rearm();
+  }
+
+  Future<List<double>?> _offsetsForList(NotifDao d, int listId) async {
+    final list = await d.listById(listId);
+    if (list?.scheduleId == null) return null;
+    final s = await d.scheduleById(list!.scheduleId!);
+    if (s == null || s.kind != 'series') return null;
+    return seriesOffsets(jsonDecode(s.config) as Map<String, dynamic>);
+  }
 }
