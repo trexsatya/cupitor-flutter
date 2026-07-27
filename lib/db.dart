@@ -5,6 +5,7 @@ import 'package:crypto/crypto.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 
+import 'notif/notif_dao.dart';
 import 'notif/schedules.dart' show builtinSchedules;
 
 /// First SQLite store in Cupitor. Phase 1: tags, pages, sentences,
@@ -50,6 +51,14 @@ class CupitorDb {
   /// bulk operations (import / export). Follows the same
   /// null-if-unavailable contract as [_open].
   Future<Database?> rawDb() => _open();
+
+  /// Notification DAO, or null when the DB is unavailable — same
+  /// null-if-unavailable contract as [rawDb]. The DAO takes the raw handle
+  /// so its tests run on sqflite_common_ffi (see notif_dao.dart).
+  Future<NotifDao?> notifDao() async {
+    final db = await _open();
+    return db == null ? null : NotifDao(db);
+  }
 
   /// Lazy open. Returns null if the database cannot be opened — callers
   /// must treat this as "feature self-disabled" (the spec's rollout-safety
