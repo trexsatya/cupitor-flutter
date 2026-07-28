@@ -516,7 +516,7 @@ class NotifBridge {
     // the event usable for dedupe and the sweep (spec: notif_events).
     await d.insertEvent(
         itemId: item.id, firedAt: nowMs, respondedAt: nowMs,
-        grade: grade, source: 'webpage');
+        grade: grade, source: 'webpage', step: item.step);
     emit('cupitorNotifGraded', {
       'external_key': list.externalKey,
       'item_external_id': itemExt,

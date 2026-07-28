@@ -154,9 +154,14 @@ class NotifEventRow {
   final int? respondedAt;
   final int? grade;
   final String? source; // 'action' | 'webpage' | 'auto'
+
+  /// Ladder rung the fire SHOWED (v10) — null on pre-v10 rows. A late grade
+  /// applies from this, not the auto-advanced item row.
+  final int? step;
   const NotifEventRow({
     required this.id, required this.itemId, required this.firedAt,
     required this.respondedAt, required this.grade, required this.source,
+    required this.step,
   });
 
   static NotifEventRow fromMap(Map<String, Object?> m) => NotifEventRow(
@@ -166,6 +171,7 @@ class NotifEventRow {
         respondedAt: (m['responded_at'] as num?)?.toInt(),
         grade: (m['grade'] as num?)?.toInt(),
         source: m['source'] as String?,
+        step: (m['step'] as num?)?.toInt(),
       );
 }
 
@@ -444,10 +450,12 @@ class NotifDao {
     int? respondedAt,
     int? grade,
     String? source,
+    int? step,
   }) =>
       db.insert('notif_events', {
         'item_id': itemId, 'fired_at': firedAt,
         'responded_at': respondedAt, 'grade': grade, 'source': source,
+        'step': step,
       });
 
   /// Most-recent fire events for [profileId]'s items, newest first — the

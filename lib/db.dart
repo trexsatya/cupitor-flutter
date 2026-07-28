@@ -47,8 +47,10 @@ class CupitorDb {
   // cadence for series lists (items drip-fired, then follow their ladder).
   // v9: notif_lists.open_url — list-level default notification deep link
   // (items without their own open_url inherit it).
-  // Both additive only: nullable columns, no existing data touched.
-  static const int _schemaVersion = 9;
+  // v10: notif_events.step — the ladder rung a fire SHOWED, so a late grade
+  // applies from what the user saw, not the auto-advanced item row.
+  // All additive only: nullable columns, no existing data touched.
+  static const int _schemaVersion = 10;
   static const String _fileName = 'cupitor.db';
   static const int defaultProfileId = 1;
 
@@ -323,6 +325,16 @@ class CupitorDb {
             'ALTER TABLE notif_lists ADD COLUMN open_url TEXT');
       }
     }
+    if (oldV < 10) {
+      // Same idempotence rationale as the v8 step. An empty PRAGMA result
+      // means the table itself is absent — nothing to migrate then.
+      final cols = await db.rawQuery('PRAGMA table_info(notif_events)');
+      final has = cols.any((c) => c['name'] == 'step');
+      if (cols.isNotEmpty && !has) {
+        await db.execute(
+            'ALTER TABLE notif_events ADD COLUMN step INTEGER');
+      }
+    }
   }
 
   /// v7 notification tables. Shared by createSchema (fresh install) and the
@@ -386,7 +398,8 @@ class CupitorDb {
         fired_at     INTEGER NOT NULL,
         responded_at INTEGER,
         grade        INTEGER,
-        source       TEXT
+        source       TEXT,
+        step         INTEGER
       )''');
     await db.execute(
         'CREATE INDEX idx_notif_events_item ON notif_events(item_id, fired_at)');

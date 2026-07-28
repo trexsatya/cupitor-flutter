@@ -269,8 +269,11 @@ class NotificationService {
         await d.updateItem(item.id,
             {'next_due_at': null, 'last_fired_at': nowMs});
       }
+      // `item` still holds the pre-advance row: `step` is the rung the fire
+      // actually SHOWED, which a late grade must apply from.
       await d.insertEvent(
-          itemId: item.id, firedAt: nowMs, source: fireNow ? null : 'auto');
+          itemId: item.id, firedAt: nowMs, source: fireNow ? null : 'auto',
+          step: item.step);
     }
 
     // Due list-level fires: rotation (recurring main schedule) or the
@@ -316,7 +319,8 @@ class NotificationService {
               }
             }
             await d.updateItem(item.id, {'last_fired_at': nowMs});
-            await d.insertEvent(itemId: item.id, firedAt: nowMs);
+            await d.insertEvent(
+                itemId: item.id, firedAt: nowMs, step: item.step);
           }
           newCursor = sel.newCursor;
           firedAny = sel.items.isNotEmpty;
@@ -380,7 +384,8 @@ class NotificationService {
           }
           await seedItemLadder(d, item, offsets, t, w);
           await d.updateItem(item.id, {'last_fired_at': nowMs});
-          await d.insertEvent(itemId: item.id, firedAt: nowMs);
+          // Intro fires show the very first rung (seedItemLadder rung 0).
+          await d.insertEvent(itemId: item.id, firedAt: nowMs, step: 0);
           firedAny = true;
         }
       }
@@ -431,13 +436,32 @@ class NotificationService {
     if (itemId is! int) return null;
     final item = await d.itemById(itemId);
     if (item == null) return null;
-    if (item.status == 'done' && grade != gradeAgain) return null;
     final offsets = await _offsetsForList(d, item.listId);
     if (offsets == null) return null; // not a series list (or list gone)
 
     final t = now();
+    final nowMs = t.millisecondsSinceEpoch;
+    final latest = await d.lastEventForItem(item.id);
+    // Grade from the state the notification actually SHOWED. Once the sweep
+    // has processed a fire it auto-advances the item — and may graduate it —
+    // so the item row no longer matches what the user responded to: grading
+    // from it skipped ladder rungs, and on an auto-graduated item the grade
+    // was dropped outright (a lost review). The sweep records the shown
+    // rung on the event; firedAt == item.lastFiredAt pins that event to the
+    // item's latest fire. A still-due item means the current fire is not
+    // yet processed, so the item row itself IS the shown state.
+    final stillDue = item.nextDueAt != null && item.nextDueAt! <= nowMs;
+    final shown = (!stillDue &&
+            latest != null &&
+            latest.respondedAt == null &&
+            latest.step != null &&
+            latest.firedAt == item.lastFiredAt)
+        ? (step: latest.step!, done: false) // fires only show active items
+        : (step: item.step, done: item.status == 'done');
+    if (shown.done && grade != gradeAgain) return null;
+
     final o = advanceSeries(
-        step: item.step, done: item.status == 'done',
+        step: shown.step, done: shown.done,
         offsetsWakingHours: offsets, now: t, grade: grade, window: window());
     await d.updateItem(item.id, {
       'step': o.step,
@@ -445,19 +469,18 @@ class NotificationService {
       'next_due_at': o.nextDue?.millisecondsSinceEpoch,
       'last_grade': grade,
     });
-    final nowMs = t.millisecondsSinceEpoch;
     // The sweep usually recorded this fire already (it runs on every timer
     // tick/resume): grade THAT row instead of inserting a second one the
     // feed would show as a permanently-unread duplicate — and stamp any
     // older orphans while at it (a grade acknowledges the whole item).
-    final latest = await d.lastEventForItem(item.id);
     if (latest != null && latest.respondedAt == null) {
       await d.ackUnrespondedEvents(item.id, nowMs);
       await d.setEventGrade(latest.id, grade: grade, source: 'action');
     } else {
       await d.insertEvent(
           itemId: item.id, firedAt: item.lastFiredAt ?? nowMs,
-          respondedAt: nowMs, grade: grade, source: 'action');
+          respondedAt: nowMs, grade: grade, source: 'action',
+          step: shown.step);
     }
     final list = await d.listById(item.listId);
     await rearm();

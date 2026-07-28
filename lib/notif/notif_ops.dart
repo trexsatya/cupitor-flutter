@@ -139,13 +139,16 @@ Future<void> seedItemLadder(NotifDao d, NotifItemRow item,
 }
 
 /// Reset an item to the start of its ladder (manager UI: reset-to-step-1).
-/// A done or suspended item comes back active.
+/// A done or suspended item comes back active. last_fired_at is cleared so
+/// a pre-reset fire event can never be mistaken for the fresh ladder's
+/// latest fire (handleAction pins events to fires via that timestamp).
 Future<void> resetItemToStart(NotifDao d, NotifItemRow item,
     NotifScheduleRow? schedule, tz.TZDateTime now, WakingWindow w) async {
   await d.updateItem(item.id, {
     'step': 0,
     'status': 'active',
     'next_due_at': initialNextDueMs(schedule, now, w),
+    'last_fired_at': null,
     'last_grade': null,
   });
 }

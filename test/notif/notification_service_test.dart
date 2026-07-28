@@ -307,11 +307,14 @@ void main() {
       expect(graded!.$2, 1); // (externals, grade) for the cupitorNotifGraded push
     });
 
-    test('good and easy advance from the post-fire step', () async {
-      final (_, item) = await firedItem(); // step 1 after auto-advance
+    test('good and easy advance from the step SHOWN at fire time', () async {
+      // The sweep auto-advanced the item to step 1, but the notification the
+      // user responds to was shown at step 0 — grading from the mutated row
+      // would skip rung 2 entirely (missed reviews).
+      final (_, item) = await firedItem(); // shown at 0, auto-advanced to 1
       await service.handleAction(
           'easy', jsonEncode({'v': 1, 'item_id': item.id}));
-      expect((await dao.itemById(item.id))!.step, 3); // 1 + 2
+      expect((await dao.itemById(item.id))!.step, 2); // 0 + 2, not 1 + 2
     });
 
     test('unknown action / bad payload / missing item are silent no-ops',
@@ -403,7 +406,8 @@ void main() {
           nowMs() + 3600000); // earliest wins
     });
 
-    test('good on a done item is a silent no-op', () async {
+    test('a grade on an auto-graduated fire is applied, never dropped',
+        () async {
       final l = await seriesList();
       // Single-rung custom ladder graduates on first fire.
       final s = await dao.createCustomSchedule(
@@ -411,7 +415,30 @@ void main() {
       await dao.updateList(l.id, {'schedule_id': s.id});
       final item = await dao.insertItem(
           listId: l.id, title: 'x', position: 0, nextDueAt: nowMs() - 1000);
+      await service.sweep(); // shown at step 0, auto-graduates to done
+      // The user responds to that notification: the grade must be recorded
+      // from the shown step, not silently discarded because the row says
+      // 'done' — dropping it loses the review.
+      expect(await service.handleAction(
+          'good', jsonEncode({'v': 1, 'item_id': item.id})), isNotNull);
+      final after = (await dao.itemById(item.id))!;
+      expect(after.lastGrade, 3);
+      final ev = (await dao.lastEventForItem(item.id))!;
+      expect(ev.grade, 3);
+      expect(ev.respondedAt, nowMs());
+    });
+
+    test('good on a long-done item with no pending fire is a silent no-op',
+        () async {
+      final l = await seriesList();
+      final s = await dao.createCustomSchedule(
+          name: 'One', kind: 'series', config: {'offsets_waking_hours': [1]});
+      await dao.updateList(l.id, {'schedule_id': s.id});
+      final item = await dao.insertItem(
+          listId: l.id, title: 'x', position: 0, nextDueAt: nowMs() - 1000);
       await service.sweep(); // graduates: done
+      // Fire acknowledged: a later stray 'good' has nothing to grade.
+      await service.recordOpened(jsonEncode({'v': 1, 'item_id': item.id}));
       final evCountBefore = (await dao.lastEventForItem(item.id))!.id;
       expect(await service.handleAction(
           'good', jsonEncode({'v': 1, 'item_id': item.id})), isNull);
