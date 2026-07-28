@@ -32,6 +32,12 @@ abstract class NotifChannel {
   /// notifications outside this feature, so plugin-level cancelAll is safe.
   Future<void> cancelAllScheduled();
 
+  /// Ids of notifications currently displayed in the shade — empty where
+  /// the platform can't enumerate them. Lets the sweep tell "the pre-armed
+  /// alarm already delivered this fire" from "this fire was missed", so it
+  /// records the former without re-posting (re-posting re-alerts).
+  Future<Set<int>> activeNotificationIds();
+
   /// Offline action buttons available on this platform?
   bool get supportsActions;
 }

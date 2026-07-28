@@ -494,4 +494,21 @@ class NotifDao {
     await db.update('notif_events', {'responded_at': respondedAtMs},
         where: 'id = ?', whereArgs: [eventId]);
   }
+
+  /// Stamp responded_at on EVERY still-unacknowledged event of [itemId].
+  /// An item occupies one shade slot (stable notif id), so any response to
+  /// it — grade, body tap, feed ack — acknowledges all of its outstanding
+  /// fires; stamping only the latest left older rows permanently unread in
+  /// the feed. Returns the number of rows stamped.
+  Future<int> ackUnrespondedEvents(int itemId, int respondedAtMs) =>
+      db.update('notif_events', {'responded_at': respondedAtMs},
+          where: 'item_id = ? AND responded_at IS NULL', whereArgs: [itemId]);
+
+  /// Attach a grade to an existing fire event — the action-button path
+  /// grades the sweep-recorded row instead of inserting a duplicate.
+  Future<void> setEventGrade(int eventId,
+      {required int grade, required String source}) async {
+    await db.update('notif_events', {'grade': grade, 'source': source},
+        where: 'id = ?', whereArgs: [eventId]);
+  }
 }

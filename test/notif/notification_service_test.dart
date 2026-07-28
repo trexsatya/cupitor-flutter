@@ -180,6 +180,24 @@ void main() {
       expect(ev.source, isNull); // a real posted fire
     });
 
+    test('a fire already displayed by its alarm is recorded, not re-posted',
+        () async {
+      final l = await seriesList();
+      final item = await dao.insertItem(
+          listId: l.id, title: 'due', position: 0,
+          nextDueAt: nowMs() - 3600000);
+      // The pre-armed alarm delivered this one; it's still in the shade.
+      channel.activeIds.add(NotificationService.itemNotifId(item.id));
+      await service.sweep();
+
+      expect(channel.shown, isEmpty); // no duplicate alert, no summary
+      final after = (await dao.itemById(item.id))!;
+      expect(after.step, 1); // fire still processed
+      final ev = (await dao.lastEventForItem(item.id))!;
+      expect(ev.respondedAt, isNull);
+      expect(ev.source, isNull); // it WAS shown — not a silent auto-advance
+    });
+
     test('overdue beyond grace: silent auto-advance, source auto', () async {
       final l = await seriesList();
       final item = await dao.insertItem(
@@ -318,6 +336,33 @@ void main() {
       await service.recordOpened(jsonEncode({'v': 1, 'item_id': item.id}));
       final ev = (await dao.lastEventForItem(item.id))!;
       expect(ev.respondedAt, nowMs());
+    });
+
+    test('grading a sweep-recorded fire stamps that event, no duplicate row',
+        () async {
+      final (_, item) = await firedItem(); // sweep inserted the fire event
+      await service.handleAction(
+          'easy', jsonEncode({'v': 1, 'item_id': item.id}));
+      final events = await db.query('notif_events',
+          where: 'item_id = ?', whereArgs: [item.id]);
+      expect(events, hasLength(1)); // stamped in place, not duplicated
+      final ev = (await dao.lastEventForItem(item.id))!;
+      expect(ev.respondedAt, nowMs());
+      expect(ev.grade, 5);
+      expect(ev.source, 'action');
+    });
+
+    test('a response acknowledges every outstanding fire of the item',
+        () async {
+      final (_, item) = await firedItem();
+      // An older orphaned fire (e.g. recorded while the user was away).
+      await dao.insertEvent(
+          itemId: item.id, firedAt: nowMs() - 86400000, source: 'auto');
+      await service.recordOpened(jsonEncode({'v': 1, 'item_id': item.id}));
+      final unread = await db.query('notif_events',
+          where: 'item_id = ? AND responded_at IS NULL',
+          whereArgs: [item.id]);
+      expect(unread, isEmpty);
     });
   });
 

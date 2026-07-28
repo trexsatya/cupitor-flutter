@@ -110,8 +110,7 @@ void main() {
     expect(lastFeed(), hasLength(3)); // fell back to the default 50
   });
 
-  test('ackItem stamps the LATEST fire; idempotent; feed reflects it',
-      () async {
+  test('ackItem stamps EVERY outstanding fire; idempotent', () async {
     await seed();
     await bridge.handle(jsonEncode({
       'op': 'ackItem', 'request_id': 'r2',
@@ -120,15 +119,31 @@ void main() {
     expect(lastAck()['ok'], true);
 
     final feed = await dao.recentEvents(1, 50);
-    expect(feed.first.respondedAt,
-        now.millisecondsSinceEpoch); // fired_at 3000 stamped
-    expect(feed.last.respondedAt, isNull); // the OLDER fire stays untouched
+    // Both of a's fires (1000 AND 3000) are read now — an older orphan must
+    // not stay permanently unread once the item is acknowledged.
+    expect(feed.where((e) => e.respondedAt == null), isEmpty);
+    expect(feed.firstWhere((e) => e.firedAt == 2000).respondedAt,
+        2500); // b's already-graded row untouched
 
-    // Second ack: latest already responded → ok, unchanged.
+    // Second ack: nothing left to stamp → ok, unchanged.
     await bridge.handle(jsonEncode({
       'op': 'ackItem', 'external_key': 'fr', 'item_external_id': 'a',
     }));
     expect(lastAck()['ok'], true);
+  });
+
+  test('webpage grade acknowledges the item\'s outstanding fires', () async {
+    await seed();
+    await bridge.handle(jsonEncode({
+      'op': 'grade', 'external_key': 'fr', 'item_external_id': 'a',
+      'grade': 3,
+    }));
+    expect(lastAck()['ok'], true);
+    final feed = await dao.recentEvents(1, 50);
+    // a's two unread fires are stamped; the grade landed as its own event.
+    expect(feed.where((e) => e.respondedAt == null), isEmpty);
+    expect(feed.where((e) => e.itemExternalId == 'a' && e.grade == 3),
+        hasLength(1));
   });
 
   test('ackItem error codes', () async {

@@ -56,7 +56,7 @@ On dialog load the app warm-pushes `cupitorNotifSchedules` and
 | `deleteList` | `external_key` | ack, then push |
 | `grade` | `external_key`, `item_external_id`, `grade` (literal int 1\|3\|5) | ack, then `cupitorNotifGraded` + push |
 | `getNotifications` | `limit?` (int 1–200, default 50) | `cupitorNotifFeed` event, then ack |
-| `ackItem` | `external_key`, `item_external_id` | ack (marks the item's latest fire as seen, no grading; idempotent) |
+| `ackItem` | `external_key`, `item_external_id` | ack (marks ALL of the item's unread fires as seen, no grading; idempotent) |
 
 An entry in `items[]`:
 
@@ -233,7 +233,9 @@ been missed or dismissed, so surface it in the page.
 ```
 
 Acknowledging: a `grade` op, a notification tap, or an explicit `ackItem`
-(mark-read without grading) all stamp `responded_at`. The feed is pushed
+(mark-read without grading) all stamp `responded_at` — on EVERY entry of
+that item that is still unread, not just the latest, so one response can
+never leave an older entry permanently unread. The feed is pushed
 unprompted on dialog load and after every sweep, so new fires appear while
 the page is open without polling. Entries from app-authored lists have
 `external_key: null` — display-only (they can't be addressed by `ackItem`).

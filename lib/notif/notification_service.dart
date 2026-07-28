@@ -224,6 +224,10 @@ class NotificationService {
     // One summary showNow per list that actually posted a fire this sweep
     // (spec: group summary rows so collapsed Android notifications behave).
     final summarized = <int>{};
+    // Fires the pre-armed alarms already delivered are still in the shade
+    // under their stable ids: record those without re-posting — show()ing
+    // the same id again re-alerts, which reads as a duplicate notification.
+    final showing = await channel.activeNotificationIds();
 
     // Overdue series items.
     for (final item in await d.dueItems(nowMs)) {
@@ -234,8 +238,9 @@ class NotificationService {
               tz.TZDateTime.fromMillisecondsSinceEpoch(t.location, due),
               t, w) <=
           graceWakingHours;
-      final fireNow = withinGrace && posted < cap;
-      if (fireNow) {
+      final delivered = showing.contains(itemNotifId(item.id));
+      final fireNow = withinGrace && (delivered || posted < cap);
+      if (fireNow && !delivered) {
         posted++;
         await channel.showNow(await _itemFire(d, item, nowMs,
             withActions: await _isSeriesList(d, item.listId)));
@@ -278,7 +283,7 @@ class NotificationService {
           schedule.kind == 'series' &&
           list.introScheduleId != null) {
         posted = await _sweepIntroFire(
-            d, list, schedule, t, nowMs, w, cap, posted, summarized);
+            d, list, schedule, t, nowMs, w, cap, posted, summarized, showing);
         continue;
       }
       if (schedule == null || schedule.kind != 'recurring') {
@@ -302,14 +307,16 @@ class NotificationService {
           final sel = takeForFire<NotifItemRow>(
               items, list.cursor, take, (i) => i.status == 'active');
           for (final item in sel.items) {
-            posted++;
-            await channel.showNow(
-                await _itemFire(d, item, nowMs, withActions: false));
+            if (!showing.contains(itemNotifId(item.id))) {
+              posted++;
+              await channel.showNow(
+                  await _itemFire(d, item, nowMs, withActions: false));
+              if (summarized.add(list.id)) {
+                await channel.showNow(_summaryFire(list, nowMs));
+              }
+            }
             await d.updateItem(item.id, {'last_fired_at': nowMs});
             await d.insertEvent(itemId: item.id, firedAt: nowMs);
-            if (summarized.add(list.id)) {
-              await channel.showNow(_summaryFire(list, nowMs));
-            }
           }
           newCursor = sel.newCursor;
           firedAny = sel.items.isNotEmpty;
@@ -341,7 +348,8 @@ class NotificationService {
       WakingWindow w,
       int cap,
       int posted,
-      Set<int> summarized) async {
+      Set<int> summarized,
+      Set<int> showing) async {
     final intro = await d.scheduleById(list.introScheduleId!);
     if (intro == null || intro.kind != 'recurring') {
       await d.updateList(list.id, {'next_fire_at': null});
@@ -362,15 +370,17 @@ class NotificationService {
       if (capacity > 0) {
         final take = cfg.perFire < capacity ? cfg.perFire : capacity;
         for (final item in (await d.unintroducedItems(list.id)).take(take)) {
-          posted++;
-          await channel.showNow(
-              await _itemFire(d, item, nowMs, withActions: true));
+          if (!showing.contains(itemNotifId(item.id))) {
+            posted++;
+            await channel.showNow(
+                await _itemFire(d, item, nowMs, withActions: true));
+            if (summarized.add(list.id)) {
+              await channel.showNow(_summaryFire(list, nowMs));
+            }
+          }
           await seedItemLadder(d, item, offsets, t, w);
           await d.updateItem(item.id, {'last_fired_at': nowMs});
           await d.insertEvent(itemId: item.id, firedAt: nowMs);
-          if (summarized.add(list.id)) {
-            await channel.showNow(_summaryFire(list, nowMs));
-          }
           firedAny = true;
         }
       }
@@ -436,16 +446,27 @@ class NotificationService {
       'last_grade': grade,
     });
     final nowMs = t.millisecondsSinceEpoch;
-    await d.insertEvent(
-        itemId: item.id, firedAt: item.lastFiredAt ?? nowMs,
-        respondedAt: nowMs, grade: grade, source: 'action');
+    // The sweep usually recorded this fire already (it runs on every timer
+    // tick/resume): grade THAT row instead of inserting a second one the
+    // feed would show as a permanently-unread duplicate — and stamp any
+    // older orphans while at it (a grade acknowledges the whole item).
+    final latest = await d.lastEventForItem(item.id);
+    if (latest != null && latest.respondedAt == null) {
+      await d.ackUnrespondedEvents(item.id, nowMs);
+      await d.setEventGrade(latest.id, grade: grade, source: 'action');
+    } else {
+      await d.insertEvent(
+          itemId: item.id, firedAt: item.lastFiredAt ?? nowMs,
+          respondedAt: nowMs, grade: grade, source: 'action');
+    }
     final list = await d.listById(item.listId);
     await rearm();
     return ((list?.externalKey, item.externalId), grade);
   }
 
-  /// Body tap: stamp responded_at on the item's latest event so the sweep's
-  /// already-handled check sees it. Navigation is the caller's job.
+  /// Body tap: stamp responded_at on every outstanding event of the item so
+  /// the sweep's already-handled check sees it and no fire stays orphaned
+  /// unread in the feed. Navigation is the caller's job.
   Future<void> recordOpened(String payloadJson) async {
     final d = await dao();
     if (d == null) return;
@@ -453,10 +474,7 @@ class NotificationService {
       final p = jsonDecode(payloadJson) as Map<String, dynamic>;
       final itemId = p['item_id'];
       if (itemId is! int) return;
-      final last = await d.lastEventForItem(itemId);
-      if (last != null && last.respondedAt == null) {
-        await d.markEventResponded(last.id, now().millisecondsSinceEpoch);
-      }
+      await d.ackUnrespondedEvents(itemId, now().millisecondsSinceEpoch);
     } catch (_) {/* never crash on a tap */}
   }
 }

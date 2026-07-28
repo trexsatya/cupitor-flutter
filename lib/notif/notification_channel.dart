@@ -255,21 +255,26 @@ class FlutterNotifChannel implements NotifChannel {
     } catch (_) {
       return; // platform can't enumerate → it can't have scheduled either
     }
-    var active = const <int>{};
-    try {
-      active = {
-        for (final n in await _plugin.getActiveNotifications())
-          if (n.id != null) n.id!,
-      };
-    } catch (_) {
-      // getActiveNotifications unsupported here (e.g. Linux, old OS):
-      // fall through and cancel every pending id.
-    }
+    // Empty when unsupported (e.g. Linux, old OS): fall through and cancel
+    // every pending id.
+    final active = await activeNotificationIds();
     for (final p in pending) {
       if (active.contains(p.id)) continue;
       try {
         await _plugin.cancel(p.id);
       } catch (_) {/* one failed cancel must not stop the rest */}
+    }
+  }
+
+  @override
+  Future<Set<int>> activeNotificationIds() async {
+    try {
+      return {
+        for (final n in await _plugin.getActiveNotifications())
+          if (n.id != null) n.id!,
+      };
+    } catch (_) {
+      return const {}; // platform can't enumerate the shade
     }
   }
 
@@ -300,6 +305,8 @@ class NoopNotifChannel implements NotifChannel {
   Future<void> showNow(PendingFire fire) async {}
   @override
   Future<void> cancelAllScheduled() async {}
+  @override
+  Future<Set<int>> activeNotificationIds() async => const {};
   @override
   bool get supportsActions => false;
 }

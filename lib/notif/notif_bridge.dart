@@ -431,9 +431,10 @@ class NotifBridge {
     _ack(reqId, op, true);
   }
 
-  /// Mark an item's latest fire as seen WITHOUT grading (the feed's
-  /// "mark read"). Idempotent: already-acknowledged or never-fired items
-  /// ack ok and change nothing.
+  /// Mark ALL of an item's outstanding fires as seen WITHOUT grading (the
+  /// feed's "mark read") — stamping only the latest would orphan any older
+  /// unread row forever. Idempotent: already-acknowledged or never-fired
+  /// items ack ok and change nothing.
   Future<void> _ackItem(String? reqId, Map<String, dynamic> m) async {
     const op = 'ackItem';
     final d = await _daoOrAck(reqId, op);
@@ -450,10 +451,7 @@ class NotifBridge {
       _ack(reqId, op, false, error: 'unknown_item');
       return;
     }
-    final last = await d.lastEventForItem(item.id);
-    if (last != null && last.respondedAt == null) {
-      await d.markEventResponded(last.id, now().millisecondsSinceEpoch);
-    }
+    await d.ackUnrespondedEvents(item.id, now().millisecondsSinceEpoch);
     _ack(reqId, op, true);
   }
 
@@ -511,6 +509,9 @@ class NotifBridge {
       'last_grade': grade,
     });
     final nowMs = t.millisecondsSinceEpoch;
+    // Grading means the user has seen the item — acknowledge any fire rows
+    // still unread so they don't linger in the feed.
+    await d.ackUnrespondedEvents(item.id, nowMs);
     // A webpage grade is review-without-fire; fired_at = responded_at keeps
     // the event usable for dedupe and the sweep (spec: notif_events).
     await d.insertEvent(

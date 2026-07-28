@@ -6,6 +6,7 @@ import 'package:cupitor/notif/pending_fire.dart';
 class FakeNotifChannel implements NotifChannel {
   final List<PendingFire> scheduled = [];
   final List<PendingFire> shown = [];
+  final Set<int> activeIds = {};
   int cancelAllCalls = 0;
   String permission = 'granted';
   bool exactAllowed = true;
@@ -28,6 +29,8 @@ class FakeNotifChannel implements NotifChannel {
     cancelAllCalls++;
     scheduled.clear();
   }
+  @override
+  Future<Set<int>> activeNotificationIds() async => activeIds;
   @override
   bool get supportsActions => true;
 }
