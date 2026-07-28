@@ -103,6 +103,10 @@ class NotifBridge {
           await _syncItems(reqId, m);
         case 'getLists':
           await _getLists(reqId);
+        case 'getNotifications':
+          await _getNotifications(reqId, m);
+        case 'ackItem':
+          await _ackItem(reqId, m);
         case 'grade':
           await _grade(reqId, m);
         case 'setSchedule':
@@ -391,6 +395,65 @@ class NotifBridge {
     final d = await _daoOrAck(reqId, op);
     if (d == null) return;
     await _pushLists(d);
+    _ack(reqId, op, true);
+  }
+
+  /// The notification feed (spec: webapp bell-style inbox, one flat
+  /// newest-first stream — grouping is the page's business via
+  /// external_key). An entry with responded_at == null is unacknowledged.
+  Future<void> _getNotifications(String? reqId, Map<String, dynamic> m) async {
+    const op = 'getNotifications';
+    final d = await _daoOrAck(reqId, op);
+    if (d == null) return;
+    final rawLimit = m['limit'];
+    final limit =
+        rawLimit is int && rawLimit > 0 && rawLimit <= 200 ? rawLimit : 50;
+    final entries = await d.recentEvents(activeProfileId(), limit);
+    emit('cupitorNotifFeed', {
+      'version': 1,
+      'notifications': [
+        for (final e in entries)
+          {
+            'external_key': e.listExternalKey,
+            'list_name': e.listName,
+            'item_external_id': e.itemExternalId,
+            'title': e.title,
+            'body': e.body,
+            'step': e.step,
+            'item_status': e.itemStatus,
+            'fired_at': e.firedAt,
+            'responded_at': e.respondedAt,
+            'grade': e.grade,
+            'source': e.source,
+          }
+      ],
+    });
+    _ack(reqId, op, true);
+  }
+
+  /// Mark an item's latest fire as seen WITHOUT grading (the feed's
+  /// "mark read"). Idempotent: already-acknowledged or never-fired items
+  /// ack ok and change nothing.
+  Future<void> _ackItem(String? reqId, Map<String, dynamic> m) async {
+    const op = 'ackItem';
+    final d = await _daoOrAck(reqId, op);
+    if (d == null) return;
+    final itemExt = m['item_external_id'] as String?;
+    if (itemExt == null || itemExt.isEmpty) {
+      _ack(reqId, op, false, error: 'bad_payload');
+      return;
+    }
+    final list = await _listOrAck(d, reqId, op, m['external_key']);
+    if (list == null) return;
+    final item = await d.itemByExternalId(list.id, itemExt);
+    if (item == null) {
+      _ack(reqId, op, false, error: 'unknown_item');
+      return;
+    }
+    final last = await d.lastEventForItem(item.id);
+    if (last != null && last.respondedAt == null) {
+      await d.markEventResponded(last.id, now().millisecondsSinceEpoch);
+    }
     _ack(reqId, op, true);
   }
 

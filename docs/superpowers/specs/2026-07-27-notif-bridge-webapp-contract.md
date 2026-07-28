@@ -55,6 +55,8 @@ On dialog load the app warm-pushes `cupitorNotifSchedules` and
 | `setStatus` | `external_key`, `status` (`'active'` \| `'paused'`) | ack, then push |
 | `deleteList` | `external_key` | ack, then push |
 | `grade` | `external_key`, `item_external_id`, `grade` (literal int 1\|3\|5) | ack, then `cupitorNotifGraded` + push |
+| `getNotifications` | `limit?` (int 1–200, default 50) | `cupitorNotifFeed` event, then ack |
+| `ackItem` | `external_key`, `item_external_id` | ack (marks the item's latest fire as seen, no grading; idempotent) |
 
 An entry in `items[]`:
 
@@ -145,6 +147,7 @@ next fire to now.
 | `cupitorNotifAck` | `{request_id, op, ok, error?, data?}` | once per message you send |
 | `cupitorNotifGraded` | `{external_key, item_external_id, grade, source}` | any grade: `source` ∈ `'webpage'` \| `'action'` (notification button) \| `'auto'` |
 | `cupitorNotificationOpened` | `{external_key, item_external_id, payload}` | user tapped a notification body; dialog1 is opened at the item's `open_url` first |
+| `cupitorNotifFeed` | `{version: 1, notifications: [...]}` | `getNotifications`, dialog warm-push, and refreshed after every sweep while the page is open |
 
 Deep-link resolution on tap: the item's own `open_url` wins, else the
 **list-level `open_url`** (set it once on `createList`, or via `syncItems` —
@@ -205,6 +208,35 @@ authored in the app's UI, not over the bridge.
 - Lists created in the app's own UI have `source: 'app'` and
   `external_key: null` — show or ignore them as you like; you can't address
   them by key.
+
+### Notification feed (`cupitorNotifFeed`)
+
+A flat, newest-first stream of fire events — build a YouTube-style bell
+inbox from it (group by `external_key`/`list_name` client-side if you like;
+this also sidesteps OS notification grouping entirely). An entry with
+`responded_at: null` is **unacknowledged** — the OS notification may have
+been missed or dismissed, so surface it in the page.
+
+```jsonc
+{ "version": 1, "notifications": [
+  { "external_key": "deck-fr-1", "list_name": "French B2",
+    "item_external_id": "card-4711", "title": "le dénouement",
+    "body": "the outcome", "step": 2, "item_status": "active",
+    "fired_at": 1785157465135,
+    "responded_at": null,          // null ⇒ unacknowledged
+    "grade": null,                 // 1|3|5 when the response was a grade
+    "source": null }               // null = posted fire | 'auto' (silent
+                                   // catch-up advance — never shown by the
+                                   // OS, i.e. a MISSED review) | 'action'
+                                   // (notification button) | 'webpage'
+] }
+```
+
+Acknowledging: a `grade` op, a notification tap, or an explicit `ackItem`
+(mark-read without grading) all stamp `responded_at`. The feed is pushed
+unprompted on dialog load and after every sweep, so new fires appear while
+the page is open without polling. Entries from app-authored lists have
+`external_key: null` — display-only (they can't be addressed by `ackItem`).
 
 ## Error codes
 

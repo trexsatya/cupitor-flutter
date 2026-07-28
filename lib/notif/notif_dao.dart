@@ -122,6 +122,31 @@ class NotifItemRow {
       );
 }
 
+/// One entry of the notification feed (spec: webapp bell-style inbox) — a
+/// fire event joined with enough item/list context to render a row.
+class NotifFeedEntry {
+  final int eventId;
+  final int itemId;
+  final int firedAt;
+  final int? respondedAt;
+  final int? grade;
+  final String? source; // null = posted fire | 'auto' | 'action' | 'webpage'
+  final String? listExternalKey;
+  final String listName;
+  final String? itemExternalId;
+  final String title;
+  final String? body;
+  final int step;
+  final String itemStatus;
+  const NotifFeedEntry({
+    required this.eventId, required this.itemId, required this.firedAt,
+    required this.respondedAt, required this.grade, required this.source,
+    required this.listExternalKey, required this.listName,
+    required this.itemExternalId, required this.title, required this.body,
+    required this.step, required this.itemStatus,
+  });
+}
+
 class NotifEventRow {
   final int id;
   final int itemId;
@@ -424,6 +449,39 @@ class NotifDao {
         'item_id': itemId, 'fired_at': firedAt,
         'responded_at': respondedAt, 'grade': grade, 'source': source,
       });
+
+  /// Most-recent fire events for [profileId]'s items, newest first — the
+  /// webapp's notification feed. Items/lists deleted since cascade away
+  /// automatically.
+  Future<List<NotifFeedEntry>> recentEvents(int profileId, int limit) async =>
+      (await db.rawQuery('''
+        SELECT e.id AS eid, e.item_id, e.fired_at, e.responded_at, e.grade,
+               e.source, l.external_key AS lek, l.name AS lname,
+               i.external_id AS ieid, i.title, i.body, i.step,
+               i.status AS istatus
+        FROM notif_events e
+        JOIN notif_items i ON i.id = e.item_id
+        JOIN notif_lists l ON l.id = i.list_id
+        WHERE l.profile_id = ?
+        ORDER BY e.fired_at DESC, e.id DESC
+        LIMIT ?
+      ''', [profileId, limit]))
+          .map((m) => NotifFeedEntry(
+                eventId: m['eid'] as int,
+                itemId: m['item_id'] as int,
+                firedAt: m['fired_at'] as int,
+                respondedAt: (m['responded_at'] as num?)?.toInt(),
+                grade: (m['grade'] as num?)?.toInt(),
+                source: m['source'] as String?,
+                listExternalKey: m['lek'] as String?,
+                listName: m['lname'] as String,
+                itemExternalId: m['ieid'] as String?,
+                title: m['title'] as String,
+                body: m['body'] as String?,
+                step: (m['step'] as num?)?.toInt() ?? 0,
+                itemStatus: m['istatus'] as String,
+              ))
+          .toList(growable: false);
 
   Future<NotifEventRow?> lastEventForItem(int itemId) async {
     final r = await db.query('notif_events',

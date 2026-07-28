@@ -268,7 +268,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // timer periodically sweeps while the app is open (spec §Platform
   // specifics). Started conditionally in initState.
   late final NotifSweepTimer _notifTimer =
-      NotifSweepTimer(sweep: notifService.sweep);
+      NotifSweepTimer(sweep: _sweepThenPush);
   // Web Speech Synthesis bridge for dialog1. The Android WebView does not
   // implement window.speechSynthesis, so the dictionary page's TTS calls go
   // through a JS-side polyfill that posts here. We speak one utterance at a
@@ -402,7 +402,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       WakelockPlus.enable();
-      notifService.sweep(); // resume catch-up + rearm (spec: sweep callers)
+      _sweepThenPush(); // resume catch-up + rearm (spec: sweep callers)
     } else if (state == AppLifecycleState.paused) {
       WakelockPlus.disable();
       // Flush WebView cookies to disk so logins survive a force-kill that
@@ -7909,6 +7909,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   Future<void> _pushNotifStateToDialog() async {
     await _notifBridge.handle('{"op":"getSchedules"}');
     await _notifBridge.handle('{"op":"getLists"}');
+    await _notifBridge.handle('{"op":"getNotifications"}');
+  }
+
+  /// Sweep, then refresh the webpage's notification feed — fires the sweep
+  /// just recorded should appear in the in-page inbox without a reload.
+  Future<void> _sweepThenPush() async {
+    await notifService.sweep();
+    await _pushNotifStateToDialog();
   }
 
   /// Notification delivery init — runs on EVERY platform (unlike the tagging
