@@ -238,7 +238,40 @@ class FlutterNotifChannel implements NotifChannel {
   }
 
   @override
-  Future<void> cancelAllScheduled() => _plugin.cancelAll();
+  Future<void> cancelAllScheduled() async {
+    // NOT _plugin.cancelAll(): that also dismisses notifications already
+    // SHOWING in the shade — and rearm() (whose first step is this call)
+    // runs on every sweep/resume/mutation, so fires vanished seconds after
+    // appearing whenever the app was alive. Cancel pending requests one by
+    // one instead, and leave any id that is currently displayed alone:
+    // cancel(id) dismisses the displayed instance too (stable per-item ids).
+    // A stale pending that shares an id with a displayed fire is either
+    // replaced by the re-arm that follows (zonedSchedule on the same id
+    // replaces) or, worst case, fires once spuriously — acceptable next to
+    // eating every visible notification.
+    List<PendingNotificationRequest> pending;
+    try {
+      pending = await _plugin.pendingNotificationRequests();
+    } catch (_) {
+      return; // platform can't enumerate → it can't have scheduled either
+    }
+    var active = const <int>{};
+    try {
+      active = {
+        for (final n in await _plugin.getActiveNotifications())
+          if (n.id != null) n.id!,
+      };
+    } catch (_) {
+      // getActiveNotifications unsupported here (e.g. Linux, old OS):
+      // fall through and cancel every pending id.
+    }
+    for (final p in pending) {
+      if (active.contains(p.id)) continue;
+      try {
+        await _plugin.cancel(p.id);
+      } catch (_) {/* one failed cancel must not stop the rest */}
+    }
+  }
 
   /// True where this plugin actually delivers (spec: Windows/web are the
   /// timer-only shim, handled by NoopNotifChannel).

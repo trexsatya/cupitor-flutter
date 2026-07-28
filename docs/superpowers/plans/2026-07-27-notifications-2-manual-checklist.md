@@ -23,6 +23,9 @@ these are claimed as verified yet — this is the hand-off list.
       item advanced with an `auto` event; no notification burst beyond the
       per-fire cap (default 5).
 - [ ] Grouping: 3 items due together → grouped under one list group in the shade.
+- [ ] With the APP OPEN, let a fire arrive and wait 5+ min (a sweep tick):
+      the notification STAYS in the shade (regression: rearm's cancelAll
+      used to dismiss displayed fires).
 - [ ] WorkManager safety net: `adb shell dumpsys jobscheduler | grep cupitor`
       shows the periodic job; after force-stopping the app, fires still resume
       within ~30 min of the next due time.
