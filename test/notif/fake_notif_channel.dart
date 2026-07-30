@@ -7,6 +7,7 @@ class FakeNotifChannel implements NotifChannel {
   final List<PendingFire> scheduled = [];
   final List<PendingFire> shown = [];
   final Set<int> activeIds = {};
+  final List<int> dismissed = [];
   int cancelAllCalls = 0;
   String permission = 'granted';
   bool exactAllowed = true;
@@ -31,6 +32,11 @@ class FakeNotifChannel implements NotifChannel {
   }
   @override
   Future<Set<int>> activeNotificationIds() async => activeIds;
+  @override
+  Future<bool> dismiss(int notifId) async {
+    dismissed.add(notifId);
+    return activeIds.remove(notifId);
+  }
   @override
   bool get supportsActions => true;
 }

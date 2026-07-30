@@ -369,6 +369,83 @@ void main() {
     });
   });
 
+  group('tap-processed fires', () {
+    // Tapping a notification DISMISSES it, so an alarm-delivered fire that
+    // was never swept leaves no trace: no event row, nothing in the shade.
+    // The sweep used to read that as "missed fire within grace" and post it
+    // again — a duplicate right after the user clicked it.
+    test('tap then sweep: series fire is recorded as seen, not re-posted',
+        () async {
+      final l = await seriesList();
+      final item = await dao.insertItem(
+          listId: l.id, title: 'due', position: 0,
+          nextDueAt: nowMs() - 3600000); // alarm-delivered, unswept
+      await service.recordOpened(jsonEncode({'v': 1, 'item_id': item.id}));
+      await service.sweep();
+
+      expect(channel.shown, isEmpty); // no duplicate
+      final after = (await dao.itemById(item.id))!;
+      expect(after.step, 1); // fire still processed
+      final ev = (await dao.lastEventForItem(item.id))!;
+      expect(ev.respondedAt, nowMs()); // the tap WAS the response
+      expect(ev.source, isNull);
+    });
+
+    test('tap then sweep: intro fire seeds the tapped item, next stays queued',
+        () async {
+      final eb = await dao.scheduleByKey('ebbinghaus');
+      final daily = await dao.scheduleByKey('daily_0900');
+      final l = await dao.createList(
+          profileId: 1, name: 'I', source: 'app',
+          scheduleId: eb!.id, introScheduleId: daily!.id,
+          nextFireAt: nowMs() - 3600000);
+      final q = await dao.insertItem(listId: l.id, title: 'Q', position: 0);
+      final r = await dao.insertItem(listId: l.id, title: 'R', position: 1);
+      await service.recordOpened(jsonEncode({'v': 1, 'item_id': q.id}));
+      await service.sweep();
+
+      expect(channel.shown, isEmpty);
+      expect((await dao.itemById(q.id))!.nextDueAt, isNotNull); // introduced
+      expect((await dao.lastEventForItem(q.id))!.respondedAt, nowMs());
+      expect((await dao.itemById(r.id))!.nextDueAt, isNull); // still queued
+      expect((await dao.listById(l.id))!.nextFireAt, greaterThan(nowMs()));
+    });
+
+    test('tap then sweep: rotation fire advances the cursor, no re-post',
+        () async {
+      final daily = await dao.scheduleByKey('daily_0900');
+      final l = await dao.createList(
+          profileId: 1, name: 'R', source: 'app',
+          scheduleId: daily!.id, nextFireAt: nowMs() - 3600000);
+      final r0 = await dao.insertItem(listId: l.id, title: 'r0', position: 0);
+      await dao.insertItem(listId: l.id, title: 'r1', position: 1);
+      await service.recordOpened(jsonEncode({'v': 1, 'item_id': r0.id}));
+      await service.sweep();
+
+      expect(channel.shown, isEmpty);
+      expect((await dao.listById(l.id))!.cursor, 1); // fire consumed
+      expect((await dao.lastEventForItem(r0.id))!.respondedAt, nowMs());
+    });
+
+    test('sweep wins the race: the re-posted copy is dismissed and re-armed',
+        () async {
+      final l = await seriesList();
+      final item = await dao.insertItem(
+          listId: l.id, title: 'due', position: 0,
+          nextDueAt: nowMs() - 3600000);
+      await service.sweep(); // resume sweep ran first: re-posts the fire
+      expect(channel.shown.where((f) => !f.isSummary), hasLength(1));
+      channel.activeIds
+          .add(NotificationService.itemNotifId(item.id)); // now displayed
+      channel.scheduled.clear();
+
+      await service.recordOpened(jsonEncode({'v': 1, 'item_id': item.id}));
+      expect((await dao.lastEventForItem(item.id))!.respondedAt, nowMs());
+      expect(channel.activeIds, isEmpty); // stale copy taken down
+      expect(channel.scheduled, isNotEmpty); // re-armed after the dismiss
+    });
+  });
+
   group('review fixes', () {
     test('recurring rotation is not consumed when the global cap is exhausted',
         () async {

@@ -38,6 +38,13 @@ abstract class NotifChannel {
   /// records the former without re-posting (re-posting re-alerts).
   Future<Set<int>> activeNotificationIds();
 
+  /// Take [notifId] down from the shade IF it is currently displayed;
+  /// returns whether it was. Used when a resume sweep re-posts a fire the
+  /// user had just tapped (the tap dismissed it before the sweep could see
+  /// it). Implementations may also drop a pending alarm sharing the id —
+  /// callers must rearm() after a true return.
+  Future<bool> dismiss(int notifId);
+
   /// Offline action buttons available on this platform?
   bool get supportsActions;
 }

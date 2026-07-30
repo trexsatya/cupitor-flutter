@@ -278,6 +278,18 @@ class FlutterNotifChannel implements NotifChannel {
     }
   }
 
+  @override
+  Future<bool> dismiss(int notifId) async {
+    try {
+      if (!(await activeNotificationIds()).contains(notifId)) return false;
+      // cancel() also drops a same-id pending alarm — the caller rearms.
+      await _plugin.cancel(notifId);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// True where this plugin actually delivers (spec: Windows/web are the
   /// timer-only shim, handled by NoopNotifChannel).
   static bool get platformSupported =>
@@ -307,6 +319,8 @@ class NoopNotifChannel implements NotifChannel {
   Future<void> cancelAllScheduled() async {}
   @override
   Future<Set<int>> activeNotificationIds() async => const {};
+  @override
+  Future<bool> dismiss(int notifId) async => false;
   @override
   bool get supportsActions => false;
 }

@@ -7933,6 +7933,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (nc is FlutterNotifChannel) {
       final launch = await nc.launchPayload();
       if (launch != null) {
+        // Record the tap BEFORE the launch sweep below: the sweep must see
+        // this fire as delivered-and-seen, not as a missed fire to re-post.
+        // The post-frame callback (which needs the widget tree) repeats
+        // recordOpened harmlessly — it is idempotent — and navigates.
+        await notifService.recordOpened(launch);
         WidgetsBinding.instance.addPostFrameCallback(
             (_) => _onNotificationOpened(launch));
       }

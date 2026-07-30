@@ -50,6 +50,15 @@ class NotificationService {
   /// older → silent auto-advance (spec §The sweep).
   static const double graceWakingHours = 2;
 
+  /// Items whose notification the user TAPPED before the sweep processed
+  /// the fire. The tap dismisses the shade entry, so by sweep time an
+  /// alarm-delivered fire looks exactly like a missed one — and got posted
+  /// again, a duplicate right after the click. The sweep treats these as
+  /// delivered-and-seen: it records the fire (responded) without posting.
+  /// Foreground-only state is enough: body taps always run in the UI
+  /// isolate, and so does the resume/startup sweep that consumes them.
+  final Set<int> _openedItemIds = {};
+
   // ── rearm ────────────────────────────────────────────────────────────
 
   /// Cancel-everything-then-arm-the-window. Triggers (wired in main.dart /
@@ -238,7 +247,8 @@ class NotificationService {
               tz.TZDateTime.fromMillisecondsSinceEpoch(t.location, due),
               t, w) <=
           graceWakingHours;
-      final delivered = showing.contains(itemNotifId(item.id));
+      final opened = _openedItemIds.remove(item.id);
+      final delivered = opened || showing.contains(itemNotifId(item.id));
       final fireNow = withinGrace && (delivered || posted < cap);
       if (fireNow && !delivered) {
         posted++;
@@ -270,9 +280,12 @@ class NotificationService {
             {'next_due_at': null, 'last_fired_at': nowMs});
       }
       // `item` still holds the pre-advance row: `step` is the rung the fire
-      // actually SHOWED, which a late grade must apply from.
+      // actually SHOWED, which a late grade must apply from. An opened fire
+      // was both shown (source null) and seen (responded by the tap).
       await d.insertEvent(
-          itemId: item.id, firedAt: nowMs, source: fireNow ? null : 'auto',
+          itemId: item.id, firedAt: nowMs,
+          respondedAt: opened ? nowMs : null,
+          source: (fireNow || opened) ? null : 'auto',
           step: item.step);
     }
 
@@ -310,7 +323,8 @@ class NotificationService {
           final sel = takeForFire<NotifItemRow>(
               items, list.cursor, take, (i) => i.status == 'active');
           for (final item in sel.items) {
-            if (!showing.contains(itemNotifId(item.id))) {
+            final opened = _openedItemIds.remove(item.id);
+            if (!opened && !showing.contains(itemNotifId(item.id))) {
               posted++;
               await channel.showNow(
                   await _itemFire(d, item, nowMs, withActions: false));
@@ -320,7 +334,8 @@ class NotificationService {
             }
             await d.updateItem(item.id, {'last_fired_at': nowMs});
             await d.insertEvent(
-                itemId: item.id, firedAt: nowMs, step: item.step);
+                itemId: item.id, firedAt: nowMs,
+                respondedAt: opened ? nowMs : null, step: item.step);
           }
           newCursor = sel.newCursor;
           firedAny = sel.items.isNotEmpty;
@@ -333,6 +348,10 @@ class NotificationService {
             nextRecurringFire(cfg, t, w).millisecondsSinceEpoch,
       });
     }
+
+    // Entries not consumed above had no pending fire to process (the tap
+    // hit an already-recorded fire) — drop them rather than leak them.
+    _openedItemIds.clear();
 
     await rearm();
   }
@@ -374,7 +393,8 @@ class NotificationService {
       if (capacity > 0) {
         final take = cfg.perFire < capacity ? cfg.perFire : capacity;
         for (final item in (await d.unintroducedItems(list.id)).take(take)) {
-          if (!showing.contains(itemNotifId(item.id))) {
+          final opened = _openedItemIds.remove(item.id);
+          if (!opened && !showing.contains(itemNotifId(item.id))) {
             posted++;
             await channel.showNow(
                 await _itemFire(d, item, nowMs, withActions: true));
@@ -385,7 +405,9 @@ class NotificationService {
           await seedItemLadder(d, item, offsets, t, w);
           await d.updateItem(item.id, {'last_fired_at': nowMs});
           // Intro fires show the very first rung (seedItemLadder rung 0).
-          await d.insertEvent(itemId: item.id, firedAt: nowMs, step: 0);
+          await d.insertEvent(
+              itemId: item.id, firedAt: nowMs,
+              respondedAt: opened ? nowMs : null, step: 0);
           firedAny = true;
         }
       }
@@ -487,9 +509,11 @@ class NotificationService {
     return ((list?.externalKey, item.externalId), grade);
   }
 
-  /// Body tap: stamp responded_at on every outstanding event of the item so
-  /// the sweep's already-handled check sees it and no fire stays orphaned
-  /// unread in the feed. Navigation is the caller's job.
+  /// Body tap: remember the tap so the next sweep processes this fire as
+  /// SEEN (the tap dismissed the shade entry, so the shade check alone
+  /// cannot tell it was delivered), and stamp responded_at on every
+  /// outstanding event so no fire stays orphaned unread in the feed.
+  /// Navigation is the caller's job.
   Future<void> recordOpened(String payloadJson) async {
     final d = await dao();
     if (d == null) return;
@@ -497,7 +521,15 @@ class NotificationService {
       final p = jsonDecode(payloadJson) as Map<String, dynamic>;
       final itemId = p['item_id'];
       if (itemId is! int) return;
+      _openedItemIds.add(itemId);
       await d.ackUnrespondedEvents(itemId, now().millisecondsSinceEpoch);
+      // If the resume sweep won the race and re-posted this fire before the
+      // tap landed, a copy of the just-tapped notification is back in the
+      // shade: take it down. dismiss() may also drop the pending alarm for
+      // the item's next review (same stable id) — rearm to restore it.
+      if (await channel.dismiss(itemNotifId(itemId))) {
+        await rearm();
+      }
     } catch (_) {/* never crash on a tap */}
   }
 }
