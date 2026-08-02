@@ -32,6 +32,7 @@ import 'package:xml/xml.dart' as xml;
 
 import 'book_transfer.dart';
 import 'db.dart';
+import 'eink_mode.dart';
 import 'jslog.dart';
 import 'memory_manager.dart';
 import 'notif/notification_manager.dart';
@@ -816,11 +817,17 @@ Future<File?> downloadEpubFromUrl(String url, {void Function(double)? onProgress
 /// receives a tapped/selected word plus a short surrounding context — the
 /// host wires this into its existing dictionary-lookup flow (typically
 /// opening dialog1).
+///
+/// [initialHighlight] is the phrase to jump to after the initial chapter
+/// finishes loading. When supplied the reader opens with the find bar
+/// visible, the phrase pre-filled, and the first match scrolled into
+/// view. Used by global-search "open hit" and similar deep-link flows.
 Future<void> openEpubReader(
   BuildContext context, {
   required File file,
   required EpubLibrary library,
   required void Function(String word, String context) onLookup,
+  String? initialHighlight,
 }) async {
   // Parse the EPUB on a microtask so the caller isn't blocked while the
   // library entry is recorded and the screen is pushed.
@@ -842,7 +849,11 @@ Future<void> openEpubReader(
   ));
   if (!context.mounted) return;
   await Navigator.of(context).push(MaterialPageRoute<void>(
-    builder: (_) => EpubReaderScreen(book: book, onLookup: onLookup),
+    builder: (_) => EpubReaderScreen(
+      book: book,
+      onLookup: onLookup,
+      initialHighlight: initialHighlight,
+    ),
     fullscreenDialog: true,
   ));
 }
@@ -850,10 +861,21 @@ Future<void> openEpubReader(
 // ─── The reader screen ───────────────────────────────────────────────────
 
 class EpubReaderScreen extends StatefulWidget {
-  const EpubReaderScreen({super.key, required this.book, required this.onLookup});
+  const EpubReaderScreen({
+    super.key,
+    required this.book,
+    required this.onLookup,
+    this.initialHighlight,
+  });
 
   final EpubBook book;
   final void Function(String word, String context) onLookup;
+
+  /// Phrase to scroll to after the initial chapter loads. When
+  /// non-null the reader opens with the find bar visible and the
+  /// first match centred on screen. Consumed exactly once — subsequent
+  /// chapter loads (navigation, prev/next) do NOT re-apply it.
+  final String? initialHighlight;
 
   @override
   State<EpubReaderScreen> createState() => _EpubReaderScreenState();
@@ -868,6 +890,9 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
   static const Duration _chromeIdleHide = Duration(seconds: 5);
   Timer? _saveDebounce;
   int _findCount = 0;
+  /// One-shot highlight passed in via [EpubReaderScreen.initialHighlight].
+  /// Nulled the first time it's applied so re-loads don't re-fire it.
+  String? _pendingHighlight;
   bool _findBarVisible = false;
   final _findController = TextEditingController();
 
@@ -924,6 +949,10 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
   @override
   void initState() {
     super.initState();
+    _pendingHighlight = widget.initialHighlight?.trim();
+    if (_pendingHighlight != null && _pendingHighlight!.isEmpty) {
+      _pendingHighlight = null;
+    }
     _bootstrap();
     // Hide the chrome shortly after the reader opens so the page starts
     // distraction-free; any scroll or center-tap brings it back.
@@ -953,6 +982,15 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
       // Keep the chrome up while the user is using the find or book-
       // search overlays — those are inside the chrome itself.
       if (_findBarVisible || _bookSearchVisible) {
+        _scheduleChromeHide();
+        return;
+      }
+      // Keep chrome up while any modal is on top of the reader (popup
+      // menu, dialog, bottom sheet). Otherwise the PopupMenuButton (and
+      // its siblings) would unmount mid-interaction — Flutter's menu
+      // future guards `if (!mounted) return;` and would silently drop
+      // the user's selection.
+      if (!(ModalRoute.of(context)?.isCurrent ?? true)) {
         _scheduleChromeHide();
         return;
       }
@@ -1114,6 +1152,20 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
             _loadChapter(_state.chapterIdx + 1);
           }
           break;
+        case 'swipeLeft':
+          // Finger moved left → advance to next chapter (LTR reading).
+          if (_state.chapterIdx < book.chapters.length - 1) {
+            _state.scrollPct = 0.0;
+            _loadChapter(_state.chapterIdx + 1);
+          }
+          break;
+        case 'swipeRight':
+          // Finger moved right → go back to previous chapter.
+          if (_state.chapterIdx > 0) {
+            _state.scrollPct = 1.0;
+            _loadChapter(_state.chapterIdx - 1, restoreScroll: true);
+          }
+          break;
         case 'tapBackground':
           // Tap on empty space (no word resolved) — treat as a request
           // to toggle the chrome. Lets users reveal the toolbars on
@@ -1130,6 +1182,14 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
             _controller?.runJavaScript('window.__cupEpubSetPaginated && window.__cupEpubSetPaginated(true);');
           }
           _installTagHelpersAndRehydrate();
+          // Apply the one-shot deep-link highlight (from global search's
+          // "open hit" flow) right after the chapter is settled. Cleared
+          // immediately so navigating away and back doesn't re-scroll.
+          final hl = _pendingHighlight;
+          if (hl != null && hl.isNotEmpty) {
+            _pendingHighlight = null;
+            _applyInitialHighlight(hl);
+          }
           break;
         case 'highlightTap':
           final id = (env['id'] as String?) ?? '';
@@ -3259,6 +3319,26 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     await _controller?.runJavaScript('window.__cupEpubFindStep && window.__cupEpubFindStep($dir);');
   }
 
+  /// Deep-link highlight: opens the find bar with [q] pre-filled and
+  /// scrolls the first match into view. Called exactly once, right
+  /// after the initial chapter finishes loading.
+  ///
+  /// Global search queries can carry an OR (`a|b`) — the find bar
+  /// takes a single phrase, so we split and use the first, which is
+  /// enough to jump the user to a hit in this chapter (the exact
+  /// snippet that matched is guaranteed to contain at least the first
+  /// phrase for hits selected from a `phrase|…` query).
+  void _applyInitialHighlight(String q) {
+    final firstPhrase = q.split('|').first.trim();
+    if (firstPhrase.isEmpty) return;
+    if (!mounted) return;
+    setState(() {
+      _findBarVisible = true;
+      _findController.text = firstPhrase;
+    });
+    _findInChapter(firstPhrase);
+  }
+
   // ─── Cross-chapter search ──────────────────────────────────────────────
 
   void _runBookSearch(String q) {
@@ -3340,9 +3420,30 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
   blockquote { margin: 1em 0; padding-left: 12px; border-left: 3px solid ${theme.border}; color: ${theme.fgMuted}; }
   pre, code { font-family: ui-monospace, Menlo, monospace; background: ${theme.codeBg}; }
   pre { padding: 8px; overflow-x: auto; }
-  /* Find-in-chapter highlight. */
-  .cup-find-hit { background: rgba(255, 215, 0, .45); border-radius: 2px; }
-  .cup-find-current { background: rgba(255, 140, 0, .8); color: #000; }
+  /* Find-in-chapter highlight. Underline (not just a background tint) so
+     it stays visible on eink and high-contrast themes AND when the hit
+     lands inside a tagged span — saved highlights (.cup-hl*), the
+     current-speaking sentence (.cup-sent-current), or a has-note
+     sentence (which draws its own bottom line via box-shadow).
+     • !important guards against parent-inherited text-decoration.
+     • #d32f2f (crimson) doesn't collide with the yellow/green/pink/blue
+       saved-highlight palette.
+     • Solid style + a background tint on current-step keeps Prev/Next
+       distinct from the other hits. */
+  .cup-find-hit {
+    text-decoration: underline solid #d32f2f !important;
+    text-decoration-thickness: 2px !important;
+    text-underline-offset: 2px;
+    background: rgba(255, 215, 0, .45);
+    border-radius: 2px;
+  }
+  .cup-find-current {
+    text-decoration: underline solid #b71c1c !important;
+    text-decoration-thickness: 3px !important;
+    text-underline-offset: 2px;
+    background: rgba(255, 140, 0, .8);
+    color: #000;
+  }
   /* Tap-flash so users see the word that was looked up. */
   .cup-flash { background: rgba(70, 130, 240, .35); border-radius: 2px; transition: background .6s; }
   /* User-saved highlights. Four palette colors; mid-opacity so theme
@@ -3358,10 +3459,15 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
   /* Paginated mode: turn the body into a horizontally-scrolling column
      stream. Each column is one "page"; scroll-snap makes swipes feel
      natural. We override y-overflow so internal scrolling within the
-     chapter is taken over by the page system instead. */
+     chapter is taken over by the page system instead.
+     `column-gap` + `column-rule` render a visible book-style gutter
+     between adjacent pages so the user can see one page end and the
+     next begin during a swipe. The rule colour is semi-transparent
+     neutral grey so it reads on any theme background. */
   body.cup-paginated {
     column-width: 100vw;
-    column-gap: 0;
+    column-gap: 40px;
+    column-rule: 1px solid rgba(128, 128, 128, 0.28);
     column-fill: auto;
     height: 100vh;
     width: 100vw;
@@ -3434,7 +3540,15 @@ $chapterHtml
   });
 
   // ── Scroll progress (throttled) ──
+  // `programmaticScrollUntil` gates the boundary check so a
+  // `__cupEpubRestoreScroll(1.0)` (used when the host navigates BACK
+  // to a chapter and wants to land where the user last was) doesn't
+  // immediately fire `navEnd` and bounce the reader forward again. We
+  // require a genuine user gesture — touchstart/wheel/keydown clears
+  // the gate — before treating "at the bottom" as an intent to move
+  // to the next chapter.
   var lastSent = 0;
+  var programmaticScrollUntil = 0;
   window.addEventListener('scroll', function() {
     var now = Date.now();
     if (now - lastSent < 400) return;
@@ -3442,14 +3556,26 @@ $chapterHtml
     var h = document.documentElement.scrollHeight - window.innerHeight;
     var pct = h > 0 ? (window.scrollY / h) : 0;
     post({ type: 'scroll', pct: pct });
-    // Bottom of the chapter → host can advance.
+    // Bottom of the chapter → host can advance. Suppressed briefly
+    // after a programmatic scroll (see `__cupEpubRestoreScroll`).
+    if (now < programmaticScrollUntil) return;
     if (h > 0 && (h - window.scrollY) < 4) post({ type: 'navEnd' });
   }, { passive: true });
+  // Any real user interaction clears the programmatic-scroll gate
+  // early — no need to wait out the full 1.5 s window if the user
+  // has already put a finger down.
+  var _clearProgrammaticGate = function() { programmaticScrollUntil = 0; };
+  window.addEventListener('touchstart', _clearProgrammaticGate, { passive: true });
+  window.addEventListener('wheel', _clearProgrammaticGate, { passive: true });
+  window.addEventListener('keydown', _clearProgrammaticGate, { passive: true });
 
   // ── Restore scroll on chapter load ──
   window.__cupEpubRestoreScroll = function(pct) {
     var h = document.documentElement.scrollHeight - window.innerHeight;
     if (h > 0) window.scrollTo(0, Math.max(0, Math.floor(h * pct)));
+    // Safety cap on the boundary suppression in case no touchstart /
+    // wheel / keydown ever comes (e.g. Mac trackpad edge cases).
+    programmaticScrollUntil = Date.now() + 1500;
   };
 
   // ── Word tap → lookup ──
@@ -3590,6 +3716,44 @@ $chapterHtml
       lastTouchX = ev.touches[0].clientX;
       lastTouchY = ev.touches[0].clientY;
     }
+  }, { passive: true });
+
+  // ── Horizontal swipe → prev/next chapter ──
+  // Skipped in paginated mode (browser scroll-snap handles page turns
+  // natively; end-of-chapter still routes through navStart/navEnd).
+  // Skipped when a text selection exists, capture mode is armed, or
+  // more than one touch is down (pinch/zoom). Threshold: 60 px of
+  // horizontal travel, mostly horizontal (dx >= 1.5 * dy), completed
+  // in under 800 ms — same envelope users get from a natural page-turn
+  // flick without hijacking accidental drags.
+  var swipeStartX = 0, swipeStartY = 0, swipeStartTs = 0, swipeMulti = false;
+  document.addEventListener('touchstart', function(ev) {
+    if (ev.touches && ev.touches.length > 1) { swipeMulti = true; return; }
+    swipeMulti = false;
+    if (ev.touches && ev.touches[0]) {
+      swipeStartX = ev.touches[0].clientX;
+      swipeStartY = ev.touches[0].clientY;
+      swipeStartTs = Date.now();
+    }
+  }, { passive: true });
+  document.addEventListener('touchend', function(ev) {
+    if (swipeMulti) { swipeMulti = false; return; }
+    if (document.body.classList.contains('cup-paginated')) return;
+    if (window.__cupitorCaptureMode) return;
+    if (window.__cupitorPlaylistCaptureMode) return;
+    var sel = window.getSelection();
+    if (sel && sel.toString().trim().length > 0) return;
+    var t = ev.changedTouches && ev.changedTouches[0];
+    if (!t) return;
+    var dx = t.clientX - swipeStartX;
+    var dy = t.clientY - swipeStartY;
+    var dt = Date.now() - swipeStartTs;
+    if (dt > 800) return;
+    var adx = Math.abs(dx), ady = Math.abs(dy);
+    if (adx < 60) return;
+    if (adx < ady * 1.5) return;
+    if (dx < 0) post({ type: 'swipeLeft' });
+    else post({ type: 'swipeRight' });
   }, { passive: true });
   document.addEventListener('click', function(ev) {
     var t = ev.target;
@@ -3982,7 +4146,16 @@ $chapterHtml
       body: SafeArea(
         child: Stack(
           children: [
-            Positioned.fill(child: WebViewWidget(controller: _controller!)),
+            Positioned.fill(
+              child: ValueListenableBuilder<bool>(
+                valueListenable: einkMode,
+                builder: (_, eink, child) => ColorFiltered(
+                  colorFilter: eink ? einkColorFilter : identityColorFilter,
+                  child: child,
+                ),
+                child: WebViewWidget(controller: _controller!),
+              ),
+            ),
             if (_chromeVisible) ...[
               Positioned(top: 0, left: 0, right: 0, child: _buildTopBar(theme)),
               if (_findBarVisible)

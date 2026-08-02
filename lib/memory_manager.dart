@@ -10,6 +10,7 @@ import 'book_transfer.dart';
 import 'db.dart';
 import 'epub_reader.dart' show EpubLibrary, EpubLibraryEntry;
 import 'media_store.dart';
+import 'search_index.dart';
 
 /// Storage overview + per-book breakdown.
 ///
@@ -37,6 +38,10 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
   int _libraryBytes = 0;
   int _voiceBytes = 0;
   int _voiceFileCount = 0;
+  int _indexBytes = 0;
+  int _indexBookCount = 0;
+  int _indexCapacityBytes = 0;
+  bool _indexAvailable = false;
   List<BookMemoryStat> _bookStats = const [];
   Map<String, EpubLibraryEntry> _libraryByKey = const {};
   bool _busy = false;
@@ -62,6 +67,7 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
     final referencedFut = CupitorDb.instance.referencedFileSha1s();
     final statsFut = CupitorDb.instance.perBookMemoryStats();
     final voiceFut = _scanVoiceRecordings();
+    final indexStatsFut = SearchIndex.stats();
 
     final dbBytes = await dbBytesFut;
     final lib = await libFut;
@@ -69,6 +75,7 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
     final referenced = await referencedFut;
     final stats = await statsFut;
     final voice = await voiceFut;
+    final indexStats = await indexStatsFut;
 
     // Sum on-disk bytes for every file in the store. `File.length()`
     // is async; loop serially — most stores are small.
@@ -107,6 +114,10 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
       _libraryBytes = libBytes;
       _voiceBytes = voice.bytes;
       _voiceFileCount = voice.count;
+      _indexBytes = indexStats.usedBytes;
+      _indexBookCount = indexStats.bookCount;
+      _indexCapacityBytes = indexStats.capacityBytes;
+      _indexAvailable = indexStats.available;
       _bookStats = stats;
       _libraryByKey = byKey;
       _loading = false;
@@ -294,7 +305,7 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final total = _dbBytes + _mediaStoreBytes + _libraryBytes + _voiceBytes;
+    final total = _dbBytes + _mediaStoreBytes + _libraryBytes + _voiceBytes + _indexBytes;
     final needsClean = _orphanCount > 0 || _danglingRowCount > 0;
     return Scaffold(
       appBar: AppBar(
@@ -349,6 +360,35 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
                 _storageRow(theme, 'Database', _dbBytes,
                     subtitle: 'sqlite (tags, sentences, playlists…)',
                     icon: Icons.storage_outlined),
+                // Global-search full-text index — on-disk SQLite FTS5,
+                // so it's part of the on-device total. Subtitle carries
+                // the book count + cap so users know how much headroom
+                // is left before LRU eviction kicks in.
+                ValueListenableBuilder<int>(
+                  valueListenable: SearchIndex.statsRevision,
+                  builder: (_, __, ___) {
+                    final subtitle = _indexCapacityBytes == 0
+                        ? 'Index disabled'
+                        : !_indexAvailable
+                            ? 'Unavailable on this device'
+                            : '$_indexBookCount book(s) · '
+                                'cap ${formatBytes(_indexCapacityBytes)}';
+                    return _storageRow(theme, 'Search index', _indexBytes,
+                        subtitle: subtitle,
+                        icon: Icons.travel_explore_outlined,
+                        trailing: _indexBytes == 0
+                            ? null
+                            : TextButton(
+                                onPressed: _busy
+                                    ? null
+                                    : () async {
+                                        await SearchIndex.clear();
+                                        if (mounted) await _reload();
+                                      },
+                                child: const Text('Clear'),
+                              ));
+                  },
+                ),
                 const Divider(),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),

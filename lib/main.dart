@@ -22,9 +22,14 @@ import 'package:timezone/data/latest.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 import 'package:workmanager/workmanager.dart';
 import 'yt_dlp_service.dart';
+import 'eink_mode.dart';
 import 'epub_reader.dart';
 import 'db.dart';
+import 'global_search.dart';
+import 'global_search_screen.dart';
+import 'lookup_exclusions.dart';
 import 'memory_manager.dart';
+import 'search_index.dart';
 import 'notif/notif_bridge.dart';
 import 'notif/notif_channel.dart';
 import 'notif/notification_channel.dart';
@@ -72,6 +77,18 @@ void notifWorkmanagerDispatcher() {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Hydrate the E-ink toggle from SharedPreferences before the first
+  // frame so `einkMode.value` is correct when the shell + any restored
+  // route (EPUB reader) build. Fire-and-forget — the default (`true`)
+  // is a safe starting value if prefs read is still in flight.
+  await initEinkMode();
+  // Load user-defined URL patterns that opt out of word-lookup /
+  // sentence-tagging JS injection. Must land before the first
+  // `onPageFinished` so the guard in `_injectJs` sees the real list.
+  await LookupExclusions.init();
+  // Open the global-search full-text index and honour the user's
+  // configured cap before the first search runs.
+  await SearchIndex.init();
   // Notifications: waking-hour math and (Plan 2) zonedSchedule both need the
   // device zone. Fallback to UTC keeps the feature alive with shifted windows
   // rather than crashing.
@@ -178,24 +195,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String? _currentPdfUrl;
   String? _extractedPdfHtml;
   String _lastStartedUrl = '';
-  bool _isEinkMode = true;
-  // Mirrors _isEinkMode for widgets that live outside the State's rebuild scope
-  // — namely the WebViews inside `showDialog`-built dialog routes, which the
-  // parent's setState() does not reach. Updated alongside _isEinkMode in the
-  // Tools-drawer toggle.
-  final ValueNotifier<bool> _einkModeNotifier = ValueNotifier(true);
-  static const ColorFilter _einkColorFilter = ColorFilter.matrix([
-    0.1913, 0.6437, 0.0650, 0, 0.05,
-    0.1850, 0.6222, 0.0628, 0, 0.04,
-    0.1722, 0.5793, 0.0585, 0, 0.02,
-    0,      0,      0,      1, 0,
-  ]);
-  static const ColorFilter _identityColorFilter = ColorFilter.matrix([
-    1, 0, 0, 0, 0,
-    0, 1, 0, 0, 0,
-    0, 0, 1, 0, 0,
-    0, 0, 0, 1, 0,
-  ]);
+  bool _isEinkMode = einkMode.value;
+  // Notifier + filters now live in `eink_mode.dart` so screens opened
+  // via a fresh route (EPUB reader) read the same value as this shell.
+  // `_isEinkMode` mirrors `einkMode.value` for local setState paths
+  // (Icon in the tools sheet, main WebView) and is updated in the same
+  // onChanged as the notifier so they never desync.
   // In-memory buffer for console output captured from the injected remote
   // snippet. Lives until the app process exits — no persistence.
   final List<String> _snippetLogs = [];
@@ -371,7 +376,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _urlController.dispose();
     _findController.dispose();
     _dialogErrorNotifier.dispose();
-    _einkModeNotifier.dispose();
     _snippetLogVersion.dispose();
     // Clean up all dialog controllers on app dispose
     dialogController = null;
@@ -1479,6 +1483,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   Future<void> _injectJs() async {
+    // Skip injection entirely on user-excluded URLs so word-lookup +
+    // sentence-tagging never wrap or intercept clicks on those pages.
+    // The current URL is the most reliable source of truth (URL bar
+    // reflects it but may lag through redirects — controller wins).
+    final currentUrl = await _controller.currentUrl() ?? _urlController.text;
+    if (LookupExclusions.matches(currentUrl)) return;
     final jsCode = await rootBundle.loadString('assets/js/utils.js');
     await _controller.runJavaScript(jsCode);
     // Sentence-tagging companion script — depends on utils.js wrapping
@@ -2785,6 +2795,29 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (result != null) await _renameBookmark(url, result);
   }
 
+  // Section header + spacer helpers for the Tools drawer. Keeping them
+  // separate methods so the ListView body stays readable — each group
+  // is one visual chunk with a labelled top row.
+  Widget _toolsSectionHeader(String label) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+      child: Text(
+        label.toUpperCase(),
+        style: theme.textTheme.labelSmall?.copyWith(
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0.9,
+          color: theme.colorScheme.primary,
+        ),
+      ),
+    );
+  }
+
+  Widget _toolsSectionDivider() => const Padding(
+        padding: EdgeInsets.only(top: 8),
+        child: Divider(height: 1),
+      );
+
   void _showToolsDrawer() {
     showModalBottomSheet(
       context: context,
@@ -2815,17 +2848,61 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 child: ListView(
                   controller: scrollController,
                   children: [
+                    // ── Appearance ─────────────────────────────────────
+                    _toolsSectionHeader('Appearance'),
                     SwitchListTile(
                       secondary: Icon(_isEinkMode ? Icons.invert_colors_off : Icons.invert_colors),
-                      title: Text('E-ink mode'),
-                      subtitle: Text('High-contrast reading'),
+                      title: const Text('E-ink mode'),
+                      subtitle: const Text('High-contrast reading'),
                       value: _isEinkMode,
                       onChanged: (val) {
                         setState(() => _isEinkMode = val);
-                        _einkModeNotifier.value = val;
+                        einkMode.value = val;
                         setModalState(() {});
                       },
                     ),
+                    ListTile(
+                      leading: const Icon(Icons.format_size),
+                      title: const Text('Page font size'),
+                      subtitle: Text('${(100 * (1.0 + _pageZoomLevel * 0.15)).round()}%'),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.text_decrease),
+                            tooltip: 'Decrease',
+                            onPressed: () async {
+                              await _changePageZoom(-1);
+                              setModalState(() {});
+                            },
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.text_increase),
+                            tooltip: 'Increase',
+                            onPressed: () async {
+                              await _changePageZoom(1);
+                              setModalState(() {});
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (_currentPdfUrl != null) ...[
+                      ListTile(
+                        leading: const Icon(Icons.zoom_out),
+                        title: const Text('PDF zoom out'),
+                        onTap: () => _changePdfZoom(-1),
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.zoom_in),
+                        title: const Text('PDF zoom in'),
+                        onTap: () => _changePdfZoom(1),
+                      ),
+                    ],
+
+                    // ── Reading & content ──────────────────────────────
+                    _toolsSectionDivider(),
+                    _toolsSectionHeader('Reading & content'),
                     if (_tagDbReady)
                       ListTile(
                         leading: const Icon(Icons.label_outline),
@@ -2841,120 +2918,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         },
                       ),
                     ListTile(
-                      leading: Icon(Icons.format_size),
-                      title: Text('Page font size'),
-                      subtitle: Text('${(100 * (1.0 + _pageZoomLevel * 0.15)).round()}%'),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            icon: Icon(Icons.text_decrease),
-                            tooltip: 'Decrease',
-                            onPressed: () async {
-                              await _changePageZoom(-1);
-                              setModalState(() {});
-                            },
-                          ),
-                          IconButton(
-                            icon: Icon(Icons.text_increase),
-                            tooltip: 'Increase',
-                            onPressed: () async {
-                              await _changePageZoom(1);
-                              setModalState(() {});
-                            },
-                          ),
-                        ],
-                      ),
-                    ),
-                    ListTile(
-                      leading: Icon(Icons.language),
-                      title: Text('Language'),
-                      trailing: DropdownButton<String>(
-                        value: _selectedLanguage,
-                        items: _languages
-                            .map((l) => DropdownMenuItem(value: l, child: Text(l)))
-                            .toList(),
-                        onChanged: (val) {
-                          setState(() {
-                            _selectedLanguage = val!;
-                            if (dialogController != null) {
-                              dialogController?.loadRequest(
-                                  Uri.parse(getUrlForLanguage(_selectedLanguage)));
-                            }
-                          });
-                          setModalState(() {});
-                        },
-                        underline: SizedBox(),
-                      ),
-                    ),
-                    ListTile(
-                      leading: Icon(_githubToken != null ? Icons.key : Icons.key_off_outlined),
-                      title: Text('GitHub token'),
-                      subtitle: Text(_githubToken != null ? 'Token set' : 'Not configured'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showTokenDialog();
-                      },
-                    ),
-                    ListTile(
-                      leading: Icon(Icons.bookmarks_outlined),
-                      title: Text('Bookmarks'),
+                      leading: const Icon(Icons.bookmarks_outlined),
+                      title: const Text('Bookmarks'),
                       onTap: () {
                         Navigator.of(ctx).pop();
                         _showBookmarks();
                       },
                     ),
-                    ListTile(
-                      leading: Icon(Icons.code),
-                      title: Text('Inject remote snippet'),
-                      subtitle: Text('Run remote JavaScript on current page'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _injectRemoteSnippet();
-                      },
-                    ),
-                    ListTile(
-                      leading: Icon(Icons.terminal),
-                      title: Text('View snippet logs'),
-                      subtitle: Text('${_snippetLogs.length} entries'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showSnippetLogs();
-                      },
-                    ),
-                    if (_currentPdfUrl != null) ...[
-                      ListTile(
-                        leading: Icon(Icons.text_decrease),
-                        title: Text('Zoom out'),
-                        onTap: () => _changePdfZoom(-1),
-                      ),
-                      ListTile(
-                        leading: Icon(Icons.text_increase),
-                        title: Text('Zoom in'),
-                        onTap: () => _changePdfZoom(1),
-                      ),
-                    ],
-                    ListTile(
-                      leading: Icon(Icons.security_outlined),
-                      title: Text('Ad hosts'),
-                      subtitle: Text('Manage blocked ad hosts'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showAdHosts();
-                      },
-                    ),
-                    ListTile(
-                      leading: Icon(Icons.smart_display_outlined),
-                      title: Text('YouTube playback'),
-                      subtitle: Text(_youtubeFrontend == null
-                          ? 'Native YouTube (with ad blocker)'
-                          : 'Via ${_youtubeFrontend!}'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showYoutubeFrontendPicker();
-                      },
-                    ),
-                    const Divider(height: 1),
                     ListTile(
                       leading: const Icon(Icons.menu_book_outlined),
                       title: const Text('Open EPUB'),
@@ -2973,6 +2943,115 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         _showEpubLibrary();
                       },
                     ),
+                    ListTile(
+                      leading: const Icon(Icons.search),
+                      title: const Text('Global search…'),
+                      subtitle: const Text(
+                        'Across every EPUB · use `|` for OR (e.g. cat|dog)',
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _openGlobalSearch();
+                      },
+                    ),
+
+                    // ── Web behavior ───────────────────────────────────
+                    _toolsSectionDivider(),
+                    _toolsSectionHeader('Web behavior'),
+                    ListTile(
+                      leading: const Icon(Icons.language),
+                      title: const Text('Language'),
+                      trailing: DropdownButton<String>(
+                        value: _selectedLanguage,
+                        items: _languages
+                            .map((l) => DropdownMenuItem(value: l, child: Text(l)))
+                            .toList(),
+                        onChanged: (val) {
+                          setState(() {
+                            _selectedLanguage = val!;
+                            if (dialogController != null) {
+                              dialogController?.loadRequest(
+                                  Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                            }
+                          });
+                          setModalState(() {});
+                        },
+                        underline: const SizedBox(),
+                      ),
+                    ),
+                    ValueListenableBuilder<List<String>>(
+                      valueListenable: LookupExclusions.patterns,
+                      builder: (_, list, __) => ListTile(
+                        leading: const Icon(Icons.block),
+                        title: const Text('Lookup exclusions…'),
+                        subtitle: Text(
+                          list.isEmpty
+                              ? 'No sites excluded'
+                              : '${list.length} pattern${list.length == 1 ? '' : 's'} — '
+                                  'word-lookup / tagging skipped',
+                        ),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          Navigator.of(context).push(MaterialPageRoute<void>(
+                            builder: (_) => const LookupExclusionsScreen(),
+                          ));
+                        },
+                      ),
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.smart_display_outlined),
+                      title: const Text('YouTube playback'),
+                      subtitle: Text(_youtubeFrontend == null
+                          ? 'Native YouTube (with ad blocker)'
+                          : 'Via ${_youtubeFrontend!}'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showYoutubeFrontendPicker();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.security_outlined),
+                      title: const Text('Ad hosts'),
+                      subtitle: const Text('Manage blocked ad hosts'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showAdHosts();
+                      },
+                    ),
+
+                    // ── Advanced ───────────────────────────────────────
+                    _toolsSectionDivider(),
+                    _toolsSectionHeader('Advanced'),
+                    ListTile(
+                      leading: Icon(_githubToken != null ? Icons.key : Icons.key_off_outlined),
+                      title: const Text('GitHub token'),
+                      subtitle: Text(_githubToken != null ? 'Token set' : 'Not configured'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showTokenDialog();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.code),
+                      title: const Text('Inject remote snippet'),
+                      subtitle: const Text('Run remote JavaScript on current page'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _injectRemoteSnippet();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.terminal),
+                      title: const Text('View snippet logs'),
+                      subtitle: Text('${_snippetLogs.length} entries'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showSnippetLogs();
+                      },
+                    ),
+                    const SizedBox(height: 12),
                   ],
                 ),
               ),
@@ -2997,13 +3076,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return _epubLibrary ??= await EpubLibrary.load();
   }
 
-  Future<void> _launchEpubReader(File file) async {
+  Future<void> _launchEpubReader(File file, {String? initialHighlight}) async {
     final lib = await _ensureEpubLibrary();
     if (!mounted) return;
     await openEpubReader(
       context,
       file: file,
       library: lib,
+      initialHighlight: initialHighlight,
       onLookup: (word, _) {
         // Send the looked-up word into the existing lookup flow. The
         // surrounding context is discarded for now — dialog1 only takes
@@ -3897,9 +3977,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       controller.loadRequest(Uri.parse(url));
                     })
                   : ValueListenableBuilder<bool>(
-                      valueListenable: _einkModeNotifier,
+                      valueListenable: einkMode,
                       builder: (_, eink, child) => ColorFiltered(
-                        colorFilter: eink ? _einkColorFilter : _identityColorFilter,
+                        colorFilter: eink ? einkColorFilter : identityColorFilter,
                         child: child,
                       ),
                       child: WebViewWidget(controller: controller),
@@ -7012,9 +7092,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
                     })
                   : ValueListenableBuilder<bool>(
-                      valueListenable: _einkModeNotifier,
+                      valueListenable: einkMode,
                       builder: (_, eink, child) => ColorFiltered(
-                        colorFilter: eink ? _einkColorFilter : _identityColorFilter,
+                        colorFilter: eink ? einkColorFilter : identityColorFilter,
                         child: child,
                       ),
                       child: WebViewWidget(controller: dialogController!),
@@ -8019,6 +8099,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   ///    library, close dialog1, and open the reader at the given
   ///    `chapter_idx`. Reports failure back via the same CustomEvent
   ///    channel so the language app can surface an error.
+  ///  * `globalSearch` — full-text search across every EPUB in the
+  ///    library. `{op:'globalSearch', query:'cat|dog'}`. Result set
+  ///    dispatched as `cupitorGlobalSearchResults` CustomEvent.
   Future<void> _handlePlaylistBridge(String raw) async {
     Map<String, dynamic>? m;
     try {
@@ -8032,10 +8115,139 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (op == 'openEpub') {
       final bookKey = (m['book_key'] as String?) ?? '';
       final chapterIdx = (m['chapter_idx'] as num?)?.toInt() ?? 0;
+      final match = (m['match'] as String?)?.trim();
       if (bookKey.isEmpty) return;
-      await _openEpubByKey(bookKey, chapterIdx);
+      await _openEpubByKey(
+        bookKey,
+        chapterIdx,
+        highlight: (match == null || match.isEmpty) ? null : match,
+      );
       return;
     }
+    if (op == 'globalSearch') {
+      final query = (m['query'] as String?) ?? '';
+      if (query.trim().isEmpty) return;
+      await _handleGlobalSearchOp(query);
+      return;
+    }
+    if (op == 'cancelSearch') {
+      _cancelGlobalSearch();
+      return;
+    }
+  }
+
+  // ── Global search: streaming bridge state ───────────────────────
+  //
+  // At most one search runs at a time. Starting a new `globalSearch`
+  // op silently cancels any prior in-flight one. Hits are batched
+  // per-book (progress boundary) and dispatched as delta events with
+  // `done: false`; a final event with `done: true` closes the stream.
+  StreamSubscription<GlobalSearchEvent>? _globalSearchSub;
+  final List<GlobalSearchHit> _globalSearchBuffer = [];
+  int _globalSearchEmitted = 0;
+  String _globalSearchQuery = '';
+  static const int _kGlobalSearchCap = 200;
+
+  /// Kick off a streaming global-search on behalf of the language app.
+  /// Cancels any prior search. Events dispatched into dialog1:
+  ///   { query, hits: [delta], done: false, hits_capped: bool }  (many)
+  ///   { query, hits: [],      done: true,  hits_capped: bool }  (final)
+  Future<void> _handleGlobalSearchOp(String query) async {
+    _cancelGlobalSearch();
+    _globalSearchQuery = query;
+    _globalSearchEmitted = 0;
+    _globalSearchBuffer.clear();
+    _globalSearchSub = GlobalSearch.search(
+      query,
+      maxTotalHits: _kGlobalSearchCap,
+    ).listen((ev) {
+      if (ev is GlobalSearchHitEvent) {
+        _globalSearchBuffer.add(ev.hit);
+        _globalSearchEmitted++;
+      } else if (ev is GlobalSearchProgressEvent) {
+        // Flush the accumulated hits at every book boundary — cheap
+        // batching that keeps event count proportional to book count
+        // rather than hit count.
+        if (_globalSearchBuffer.isNotEmpty) {
+          _dispatchGlobalSearchBatch(done: false, capped: false);
+        }
+      } else if (ev is GlobalSearchDone) {
+        // Flush any remaining hits, then send the closing event.
+        if (_globalSearchBuffer.isNotEmpty) {
+          _dispatchGlobalSearchBatch(
+            done: false,
+            capped: _globalSearchEmitted >= _kGlobalSearchCap,
+          );
+        }
+        _dispatchGlobalSearchBatch(
+          done: true,
+          capped: _globalSearchEmitted >= _kGlobalSearchCap,
+        );
+        _globalSearchSub = null;
+      }
+    }, onError: (_) {
+      _dispatchGlobalSearchBatch(done: true, capped: false);
+      _globalSearchSub = null;
+    }, onDone: () {
+      // Belt-and-suspenders: if the stream ends without a final
+      // GlobalSearchDone (shouldn't happen, but crash-safe), still
+      // close the client-side stream.
+      if (_globalSearchSub != null) {
+        _dispatchGlobalSearchBatch(done: true, capped: false);
+        _globalSearchSub = null;
+      }
+    });
+  }
+
+  void _cancelGlobalSearch() {
+    final sub = _globalSearchSub;
+    if (sub == null) return;
+    _globalSearchSub = null;
+    sub.cancel();
+    // Tell the client the current query is closing prematurely so it
+    // can drop any stale-result-guard state without waiting for a
+    // timeout. `hits: []` — anything already emitted stays with the
+    // client under its accumulated snapshot.
+    _dispatchGlobalSearchBatch(done: true, capped: false, cancelled: true);
+  }
+
+  void _dispatchGlobalSearchBatch({
+    required bool done,
+    required bool capped,
+    bool cancelled = false,
+  }) {
+    final ctrl = dialogController;
+    // Snapshot + clear the buffer so subsequent hits (post-progress)
+    // start a fresh batch.
+    final delta = List<GlobalSearchHit>.from(_globalSearchBuffer);
+    _globalSearchBuffer.clear();
+    if (ctrl == null) return;
+    final payload = jsonEncode({
+      'query': _globalSearchQuery,
+      'hits': [for (final h in delta) h.toJson()],
+      'done': done,
+      'hits_capped': capped,
+      if (cancelled) 'cancelled': true,
+    });
+    final js = 'window.__cupitorGlobalSearchResults = $payload;'
+        "window.dispatchEvent(new CustomEvent('cupitorGlobalSearchResults', "
+        '{ detail: window.__cupitorGlobalSearchResults }));';
+    ctrl.runJavaScript(js).catchError((_) {/* dialog1 gone */});
+  }
+
+  /// Open the global-search screen from the Tools drawer. Reuses the
+  /// same `_openEpubByKey` flow the language app uses via the JS
+  /// bridge — one code path, one set of "book file moved / missing"
+  /// error messages.
+  Future<void> _openGlobalSearch() async {
+    await Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => GlobalSearchScreen(
+        onOpen: (bookKey, chapterIdx, highlight) async {
+          Navigator.of(context).pop();
+          await _openEpubByKey(bookKey, chapterIdx, highlight: highlight);
+        },
+      ),
+    ));
   }
 
   /// Look up a persisted EPUB library entry by SHA-1 key, then open
@@ -8043,7 +8255,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// reader takes over the screen. If the file has moved / been
   /// deleted since the library entry was recorded, shows a snackbar
   /// and leaves dialog1 open.
-  Future<void> _openEpubByKey(String bookKey, int chapterIdx) async {
+  Future<void> _openEpubByKey(
+    String bookKey,
+    int chapterIdx, {
+    String? highlight,
+  }) async {
     try {
       final lib = await _ensureEpubLibrary();
       final entry = lib.entries.firstWhere(
@@ -8082,7 +8298,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       if (_dialog1Visible) {
         Navigator.of(context, rootNavigator: true).maybePop();
       }
-      await _launchEpubReader(file);
+      await _launchEpubReader(file, initialHighlight: highlight);
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -8540,7 +8756,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           children: [
             // Main content — fills entire screen
             ColorFiltered(
-              colorFilter: _isEinkMode ? _einkColorFilter : _identityColorFilter,
+              colorFilter: _isEinkMode ? einkColorFilter : identityColorFilter,
               child: Stack(
                 children: [
                   WebViewWidget(controller: _controller),
