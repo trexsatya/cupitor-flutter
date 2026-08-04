@@ -446,6 +446,96 @@ void main() {
     });
   });
 
+  group('concurrent sweeps', () {
+    // The 5-min timer tick and the resume handler both call sweep(); after
+    // a notification tap wakes the app they routinely overlap. Interleaved
+    // sweeps both read "due, no event yet" before either writes — the same
+    // fire posted and recorded twice ("sometimes I get it again").
+    test('overlapping sweeps in one isolate process a fire exactly once',
+        () async {
+      final l = await seriesList();
+      final item = await dao.insertItem(
+          listId: l.id, title: 'due', position: 0,
+          nextDueAt: nowMs() - 3600000);
+      await Future.wait([service.sweep(), service.sweep()]);
+
+      expect(channel.shown.where((f) => !f.isSummary), hasLength(1));
+      final events = await db.query('notif_events',
+          where: 'item_id = ?', whereArgs: [item.id]);
+      expect(events, hasLength(1));
+      expect((await dao.itemById(item.id))!.step, 1); // advanced once
+    });
+
+    test('a sweep in ANOTHER isolate (worker) cannot double-process a fire',
+        () async {
+      // Two service instances over one DB model the foreground app and the
+      // Android background worker: no shared in-memory state, only the DB.
+      final otherChannel = FakeNotifChannel();
+      final other = NotificationService(
+        channel: otherChannel,
+        dao: () async => dao,
+        window: () => WakingWindow.defaults,
+        perFireCap: () => 5,
+        now: () => now,
+        maxArmed: 60,
+      );
+      final l = await seriesList();
+      final item = await dao.insertItem(
+          listId: l.id, title: 'due', position: 0,
+          nextDueAt: nowMs() - 3600000);
+      await Future.wait([service.sweep(), other.sweep()]);
+
+      final fires = [...channel.shown, ...otherChannel.shown]
+          .where((f) => !f.isSummary);
+      expect(fires, hasLength(1)); // exactly one of them claimed it
+      final events = await db.query('notif_events',
+          where: 'item_id = ?', whereArgs: [item.id]);
+      expect(events, hasLength(1));
+      expect((await dao.itemById(item.id))!.step, 1);
+    });
+
+    test('overlapping sweeps fire a due rotation list exactly once',
+        () async {
+      final daily = await dao.scheduleByKey('daily_0900');
+      final l = await dao.createList(
+          profileId: 1, name: 'R', source: 'app',
+          scheduleId: daily!.id, nextFireAt: nowMs() - 3600000);
+      final otherChannel = FakeNotifChannel();
+      final other = NotificationService(
+        channel: otherChannel,
+        dao: () async => dao,
+        window: () => WakingWindow.defaults,
+        perFireCap: () => 5,
+        now: () => now,
+        maxArmed: 60,
+      );
+      await dao.insertItem(listId: l.id, title: 'r0', position: 0);
+      await dao.insertItem(listId: l.id, title: 'r1', position: 1);
+      await Future.wait([service.sweep(), other.sweep()]);
+
+      final fires = [...channel.shown, ...otherChannel.shown]
+          .where((f) => !f.isSummary);
+      expect(fires, hasLength(1));
+      expect((await dao.listById(l.id))!.cursor, 1); // consumed once
+    });
+
+    test('a tap arriving while a sweep runs never leaves a duplicate up',
+        () async {
+      final l = await seriesList();
+      final item = await dao.insertItem(
+          listId: l.id, title: 'due', position: 0,
+          nextDueAt: nowMs() - 3600000);
+      // Fire the tap WITHOUT awaiting, then sweep — the serialized chain
+      // must order them, not the caller.
+      final tap = service.recordOpened(
+          jsonEncode({'v': 1, 'item_id': item.id}));
+      await Future.wait([tap, service.sweep()]);
+
+      expect(channel.shown, isEmpty); // recorded as seen, nothing posted
+      expect((await dao.lastEventForItem(item.id))!.respondedAt, nowMs());
+    });
+  });
+
   group('review fixes', () {
     test('recurring rotation is not consumed when the global cap is exhausted',
         () async {

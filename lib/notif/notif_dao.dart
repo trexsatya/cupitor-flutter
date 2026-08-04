@@ -378,6 +378,28 @@ class NotifDao {
     await db.update('notif_items', fields, where: 'id = ?', whereArgs: [id]);
   }
 
+  /// Optimistically claim a due item fire: apply [advance] only if
+  /// next_due_at still holds the value this sweep observed. False means a
+  /// parallel sweep (foreground vs the Android worker isolate) got there
+  /// first — the caller must skip the fire entirely, or the same fire
+  /// would post and record twice.
+  Future<bool> claimDueItem(
+          int id, int observedDueAt, Map<String, Object?> advance) async =>
+      await db.update('notif_items', advance,
+              where: 'id = ? AND next_due_at = ?',
+              whereArgs: [id, observedDueAt]) >
+      0;
+
+  /// Same idea for a list-level fire: move next_fire_at forward only if it
+  /// still holds the observed slot.
+  Future<bool> claimListFire(
+          int id, int observedNextFireAt, int newNextFireAt) async =>
+      await db.update('notif_lists',
+              {'next_fire_at': newNextFireAt, 'updated_at': _now()},
+              where: 'id = ? AND next_fire_at = ?',
+              whereArgs: [id, observedNextFireAt]) >
+      0;
+
   Future<void> deleteItem(int id) async {
     await db.delete('notif_items', where: 'id = ?', whereArgs: [id]);
   }

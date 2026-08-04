@@ -59,12 +59,28 @@ class NotificationService {
   /// isolate, and so does the resume/startup sweep that consumes them.
   final Set<int> _openedItemIds = {};
 
+  /// Every state-mutating entry point runs on this chain. Overlapping
+  /// calls are routine — the 5-min timer tick, the resume handler and a
+  /// tap callback all coincide when a notification tap wakes the app —
+  /// and two interleaved sweeps both read "due, no event yet" before
+  /// either wrote, posting and recording the same fire twice. The DAO's
+  /// optimistic claims cover the background worker isolate, which this
+  /// in-memory chain cannot reach.
+  Future<void> _chain = Future<void>.value();
+  Future<T> _serialized<T>(Future<T> Function() body) {
+    final run = _chain.then((_) => body());
+    _chain = run.then<void>((_) {}, onError: (_) {});
+    return run;
+  }
+
   // ── rearm ────────────────────────────────────────────────────────────
 
   /// Cancel-everything-then-arm-the-window. Triggers (wired in main.dart /
   /// worker): app resume, boot, any fire, any grade, any bridge mutation,
   /// settings change, worker tick.
-  Future<void> rearm() async {
+  Future<void> rearm() => _serialized(_rearmImpl);
+
+  Future<void> _rearmImpl() async {
     final d = await dao();
     if (d == null) return;
     final t = now();
@@ -222,7 +238,9 @@ class NotificationService {
   /// Catch-up: process everything whose fire time has passed, then rearm.
   /// One function, three callers (spec §The sweep): Android worker, app
   /// launch/resume, desktop/web timer.
-  Future<void> sweep() async {
+  Future<void> sweep() => _serialized(_sweepImpl);
+
+  Future<void> _sweepImpl() async {
     final d = await dao();
     if (d == null) return;
     final t = now();
@@ -250,6 +268,29 @@ class NotificationService {
       final opened = _openedItemIds.remove(item.id);
       final delivered = opened || showing.contains(itemNotifId(item.id));
       final fireNow = withinGrace && (delivered || posted < cap);
+      // Automatic fading: every processed fire advances one step. Items in
+      // recurring lists carry due times only if they have prior series
+      // state; advancing them is harmless and keeps one code path.
+      final offsets = await _offsetsForList(d, item.listId);
+      final Map<String, Object?> advance;
+      if (offsets != null) {
+        final o = advanceSeries(
+            step: item.step, done: item.status == 'done',
+            offsetsWakingHours: offsets, now: t, grade: null, window: w);
+        advance = {
+          'step': o.step,
+          'status': o.done ? 'done' : 'active',
+          'next_due_at': o.nextDue?.millisecondsSinceEpoch,
+          'last_fired_at': nowMs,
+        };
+      } else {
+        advance = {'next_due_at': null, 'last_fired_at': nowMs};
+      }
+      // Claim before posting: the advance applies only while the item
+      // still shows the observed due time. A parallel sweep (the Android
+      // worker isolate) that got here first makes the claim fail — it owns
+      // this fire, ours must neither post nor record it.
+      if (!await d.claimDueItem(item.id, due, advance)) continue;
       if (fireNow && !delivered) {
         posted++;
         await channel.showNow(await _itemFire(d, item, nowMs,
@@ -260,24 +301,6 @@ class NotificationService {
             await channel.showNow(_summaryFire(list, nowMs));
           }
         }
-      }
-      // Automatic fading: every processed fire advances one step. Items in
-      // recurring lists carry due times only if they have prior series
-      // state; advancing them is harmless and keeps one code path.
-      final offsets = await _offsetsForList(d, item.listId);
-      if (offsets != null) {
-        final o = advanceSeries(
-            step: item.step, done: item.status == 'done',
-            offsetsWakingHours: offsets, now: t, grade: null, window: w);
-        await d.updateItem(item.id, {
-          'step': o.step,
-          'status': o.done ? 'done' : 'active',
-          'next_due_at': o.nextDue?.millisecondsSinceEpoch,
-          'last_fired_at': nowMs,
-        });
-      } else {
-        await d.updateItem(item.id,
-            {'next_due_at': null, 'last_fired_at': nowMs});
       }
       // `item` still holds the pre-advance row: `step` is the rung the fire
       // actually SHOWED, which a late grade must apply from. An opened fire
@@ -308,6 +331,12 @@ class NotificationService {
       }
       final cfg = parseRecurring(
           jsonDecode(schedule.config) as Map<String, dynamic>);
+      // Claim the fire (moving next_fire_at to the following slot) before
+      // processing — same parallel-sweep rationale as the due-items claim.
+      if (!await d.claimListFire(list.id, list.nextFireAt!,
+          nextRecurringFire(cfg, t, w).millisecondsSinceEpoch)) {
+        continue;
+      }
       final withinGrace = wakingHoursBetween(
               tz.TZDateTime.fromMillisecondsSinceEpoch(
                   t.location, list.nextFireAt!),
@@ -341,11 +370,10 @@ class NotificationService {
           firedAny = sel.items.isNotEmpty;
         }
       }
+      // next_fire_at was already moved forward by the claim above.
       await d.updateList(list.id, {
         'cursor': newCursor,
         'last_fired_at': firedAny ? nowMs : list.lastFiredAt,
-        'next_fire_at':
-            nextRecurringFire(cfg, t, w).millisecondsSinceEpoch,
       });
     }
 
@@ -353,7 +381,7 @@ class NotificationService {
     // hit an already-recorded fire) — drop them rather than leak them.
     _openedItemIds.clear();
 
-    await rearm();
+    await _rearmImpl();
   }
 
   /// Process one due intro fire (v8): within the grace window, post up to
@@ -380,6 +408,12 @@ class NotificationService {
     }
     final cfg =
         parseRecurring(jsonDecode(intro.config) as Map<String, dynamic>);
+    final nextFire = nextRecurringFire(cfg, t, w).millisecondsSinceEpoch;
+    // Claim the fire before processing — same parallel-sweep rationale as
+    // the due-items claim. The queue-drained case below may null it again.
+    if (!await d.claimListFire(list.id, list.nextFireAt!, nextFire)) {
+      return posted;
+    }
     final offsets =
         seriesOffsets(jsonDecode(schedule.config) as Map<String, dynamic>);
     final withinGrace = wakingHoursBetween(
@@ -415,9 +449,7 @@ class NotificationService {
     final remaining = await d.unintroducedItems(list.id);
     await d.updateList(list.id, {
       'last_fired_at': firedAny ? nowMs : list.lastFiredAt,
-      'next_fire_at': remaining.isEmpty
-          ? null
-          : nextRecurringFire(cfg, t, w).millisecondsSinceEpoch,
+      'next_fire_at': remaining.isEmpty ? null : nextFire,
     });
     return posted;
   }
@@ -443,6 +475,10 @@ class NotificationService {
   /// (foreground only — the background isolate has no webview), or null on
   /// any invalid input — a notification action must never crash the app.
   Future<((String?, String?), int)?> handleAction(
+          String actionId, String payloadJson) =>
+      _serialized(() => _handleActionImpl(actionId, payloadJson));
+
+  Future<((String?, String?), int)?> _handleActionImpl(
       String actionId, String payloadJson) async {
     final grade = actionGrades[actionId];
     if (grade == null) return null;
@@ -505,7 +541,7 @@ class NotificationService {
           step: shown.step);
     }
     final list = await d.listById(item.listId);
-    await rearm();
+    await _rearmImpl();
     return ((list?.externalKey, item.externalId), grade);
   }
 
@@ -514,7 +550,10 @@ class NotificationService {
   /// cannot tell it was delivered), and stamp responded_at on every
   /// outstanding event so no fire stays orphaned unread in the feed.
   /// Navigation is the caller's job.
-  Future<void> recordOpened(String payloadJson) async {
+  Future<void> recordOpened(String payloadJson) =>
+      _serialized(() => _recordOpenedImpl(payloadJson));
+
+  Future<void> _recordOpenedImpl(String payloadJson) async {
     final d = await dao();
     if (d == null) return;
     try {
@@ -528,7 +567,7 @@ class NotificationService {
       // shade: take it down. dismiss() may also drop the pending alarm for
       // the item's next review (same stable id) — rearm to restore it.
       if (await channel.dismiss(itemNotifId(itemId))) {
-        await rearm();
+        await _rearmImpl();
       }
     } catch (_) {/* never crash on a tap */}
   }
