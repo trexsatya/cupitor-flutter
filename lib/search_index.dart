@@ -32,10 +32,19 @@ class SearchIndex {
   SearchIndex._();
 
   static const String _kPrefKey = 'searchIndexCapacityBytes';
+  static const String _kPrefPartial = 'searchIndexPartialMatch';
   static const String _fileName = 'search_index.db';
 
   /// Default index size — generous because it's on disk, not RAM.
   static const int defaultCapacityBytes = 128 * 1024 * 1024;
+
+  /// When true, single-word queries match anywhere in a word (substring)
+  /// — e.g. `x` matches `box`, `matrix`, `xylophone`. When false (the
+  /// default), queries match by whole word or leading prefix — `x`
+  /// matches `x`, `xylophone`, but not `box`. Off by default because
+  /// substring bypasses the FTS5 index and scans every indexed chapter
+  /// for the book; it's noticeably slower on large libraries.
+  static final ValueNotifier<bool> partialMatchEnabled = ValueNotifier<bool>(false);
 
   /// Presets surfaced in the settings UI. `0` == index disabled →
   /// searches fall back to linear XHTML strip on every run.
@@ -70,7 +79,16 @@ class SearchIndex {
       final prefs = await SharedPreferences.getInstance();
       final stored = prefs.getInt(_kPrefKey);
       if (stored != null && stored >= 0) capacityBytes.value = stored;
+      final partial = prefs.getBool(_kPrefPartial);
+      if (partial != null) partialMatchEnabled.value = partial;
     } catch (_) { /* best effort */ }
+    partialMatchEnabled.addListener(() async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool(_kPrefPartial, partialMatchEnabled.value);
+      } catch (_) { /* best effort */ }
+      statsRevision.value++;
+    });
     try {
       _db = await _openDb();
       _available = true;
@@ -227,6 +245,38 @@ class SearchIndex {
     }
     if (rows.isEmpty) return const [];
     // Touch the book so it moves to the end of the LRU order.
+    await db.update(
+      'search_index_books',
+      {'last_touched_at': DateTime.now().millisecondsSinceEpoch},
+      where: 'book_key = ?',
+      whereArgs: [bookKey],
+    );
+    return [
+      for (final r in rows)
+        IndexMatch(
+          bookKey: bookKey,
+          text: (r['text'] as String?) ?? '',
+          chapterIdx: (r['chapter_idx'] as int?) ?? 0,
+          chapterTitle: (r['chapter_title'] as String?) ?? '',
+        ),
+    ];
+  }
+
+  /// Retrieve every indexed chapter for [bookKey] without applying any
+  /// FTS5 filter. Used by the partial-match path: substring matching
+  /// bypasses the FTS5 tokenizer, but we still want to skip re-parsing
+  /// the EPUB from disk. Bumps `last_touched_at` on any hit.
+  static Future<List<IndexMatch>> chaptersForBook(String bookKey) async {
+    final db = _db;
+    if (db == null) return const [];
+    final rows = await db.query(
+      'search_index_docs',
+      columns: const ['text', 'chapter_idx', 'chapter_title'],
+      where: 'book_key = ?',
+      whereArgs: [bookKey],
+      orderBy: 'chapter_idx',
+    );
+    if (rows.isEmpty) return const [];
     await db.update(
       'search_index_books',
       {'last_touched_at': DateTime.now().millisecondsSinceEpoch},

@@ -15,6 +15,12 @@ import 'package:http/http.dart' as http;
 import 'package:pdfrx/pdfrx.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
+// Not re-exported by speech_to_text.dart; shares the prefix so error types
+// read the same as the rest of the plugin's API.
+import 'package:speech_to_text/speech_recognition_error.dart' as stt;
+import 'speech_hub.dart';
+import 'caption_capture.dart';
+import 'speech_session.dart';
 import 'package:google_mlkit_translation/google_mlkit_translation.dart' as mlkit;
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
@@ -29,6 +35,8 @@ import 'global_search.dart';
 import 'global_search_screen.dart';
 import 'lookup_exclusions.dart';
 import 'memory_manager.dart';
+import 'page_zoom.dart';
+import 'scroll_diagnostics.dart';
 import 'search_index.dart';
 import 'notif/notif_bridge.dart';
 import 'notif/notif_channel.dart';
@@ -145,6 +153,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   List<String> _bookmarks = [];
   Map<String, String> _bookmarkNames = {};
   int _pageZoomLevel = 0; // each step ≈ 15% on top of 1.0, clamped to [-4, 10]
+  // Scroll probe (lib/scroll_diagnostics.dart). Persisted so it survives the
+  // app restart that a wedged WebView often prompts, and re-injected on every
+  // page load while armed — you turn it on when a page won't scroll, drag on
+  // the stuck area, then read Tools ▸ View snippet logs.
+  bool _scrollDiagEnabled = false;
   // Minimize state for dialog webviews — when true, the dialog was dismissed via
   // the Minimize button and can be restored from the main screen. The controllers
   // stay alive so the page state (scroll, form input) survives.
@@ -216,7 +229,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   bool _showFindBar = false;
   bool _urlBarFocused = false;
   String _pdfSelectedText = '';
-  final stt.SpeechToText _speech = stt.SpeechToText();
+  // The one process-wide recognizer. Reached through SpeechHub so the
+  // singleton assumption is expressed in code rather than in a comment.
+  stt.SpeechToText get _speech => SpeechHub.speech;
   bool _isListening = false;
   // Mirror of _isListening for widgets in showDialog routes (which the outer
   // setState() doesn't reach).
@@ -227,6 +242,32 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   bool _continuousVoiceActive = false;
   final StringBuffer _continuousTranscript = StringBuffer();
   String _continuousPartial = '';
+  // Transcript of the in-flight one-shot listen. Used to be a local captured
+  // by _toggleVoiceInput's onStatus closure; it has to outlive that closure
+  // now that status routing lives in _onSpeechStatus.
+  String _voiceLastWords = '';
+  // Our stake in the shared recognizer's callbacks. See SpeechHub for why
+  // registering closures via initialize() cannot work.
+  late final SpeechHubListener _speechHubListener = SpeechHubListener(
+    onSpeechStatus: _onSpeechStatus,
+    onSpeechError: _onSpeechError,
+    onSpeechLost: _onSpeechLost,
+  );
+  // Dictation driven by the webapp over the `SpeechBridge` channel
+  // (docs/speech-bridge-spec.md). The session owns the rid routing; these
+  // timers are the host-side safety nets described in §5.2.
+  final SpeechSession _sttSession = SpeechSession();
+  Timer? _sttWatchdog;
+  Timer? _sttDoneDebounce;
+  DateTime? _sttListenStartedAt;
+  DateTime? _sttQuietSince;
+  // The native MediaRecorder holds the mic exclusively while it runs, and
+  // MainActivity exposes no way to ask. Mirror its state here so a dictation
+  // request can refuse rather than silently record nothing.
+  bool _nativeRecordingActive = false;
+  // A long-press capture was cut short by the app being backgrounded; show
+  // what was heard once the user is actually looking at the screen again.
+  bool _pendingVoiceResumeDialog = false;
   final TextEditingController _findController = TextEditingController();
   int? _pendingScrollToPage;
   int? _pendingPdfPage;
@@ -361,6 +402,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _appBarTimer?.cancel();
     ProfileService.active.removeListener(_onProfileChanged);
     WidgetsBinding.instance.removeObserver(this);
+    SpeechHub.release(_speechHubListener);
     _notifTimer.stop();
     WakelockPlus.disable();
     _adBlockChannel.setMethodCallHandler(null); // stop receiving callbacks
@@ -390,6 +432,21 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _floatingChipsEntry?.remove();
     _floatingChipsEntry = null;
     _minimizedVersion.dispose();
+    // The page really is going away here, so drop the session without a
+    // reply — unlike the dialog-close path above. Also releases the mic,
+    // which this dispose() never did.
+    _sttStopTimers();
+    _sttSession.teardown();
+    // Stops the long-press restart loop: it has a pending 200 ms
+    // Future.delayed that checks only this flag, and would otherwise reopen
+    // the mic on a disposed State.
+    _continuousVoiceActive = false;
+    _speech.cancel().catchError((_) {});
+    // Actually stop the recorder rather than just forgetting about it — a
+    // MediaRecorder outliving the app holds the mic against every other app
+    // on the device. Unconditional: the flag tracks our intent, and if a
+    // stop already failed it would be lying.
+    _stopNativeRecordingIfAny();
     _isListeningNotifier.dispose();
     _dialog1FullscreenNotifier.dispose();
     _dialog1Tts?.stop();
@@ -406,9 +463,32 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       WakelockPlus.enable();
+      if (_pendingVoiceResumeDialog) {
+        _pendingVoiceResumeDialog = false;
+        _flushContinuousTranscript();
+      }
       _sweepThenPush(); // resume catch-up + rearm (spec: sweep callers)
     } else if (state == AppLifecycleState.paused) {
       WakelockPlus.disable();
+      // Don't leave the mic open behind a backgrounded app — the OEM revokes
+      // it anyway, and as an error rather than a clean stop, which for the
+      // long-press loop means restarting the recognizer over and over in the
+      // background. Stopping the capture properly also surfaces whatever was
+      // dictated instead of discarding it.
+      _sttCancelForMicHandoff();
+      // Quietly — _stopContinuousVoiceCapture surfaces the transcript in a
+      // dialog, and a screen lock counts as `paused`, so that would queue a
+      // dialog the user finds waiting for them later. Stop the engine, keep
+      // the transcript, and show it on resume instead.
+      if (_continuousVoiceActive || _isListening) {
+        _continuousVoiceActive = false;
+        _pendingVoiceResumeDialog = _continuousTranscript.isNotEmpty ||
+            _continuousPartial.trim().isNotEmpty;
+        _speech.cancel().catchError((_) {});
+        SpeechHub.release(_speechHubListener);
+        if (mounted && _isListening) setState(() => _isListening = false);
+        _isListeningNotifier.value = false;
+      }
       // Flush WebView cookies to disk so logins survive a force-kill that
       // happens before the system's next periodic flush.
       _flushCookies();
@@ -448,6 +528,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // waiting for onPageFinished). Critical for the Netflix manifest case —
     // autoplay fires before onPageFinished otherwise.
     _warmRemoteSnippetCache();
+    _warmAndInstallFrameScript();
     // Notification delivery must init on EVERY platform (Windows/web/Linux
     // included), unlike the sentence-tagging DB probe below which is
     // Android||iOS only — see _initNotifDelivery's doc comment.
@@ -503,6 +584,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       }
       _githubToken = prefs.getString('githubToken');
       _pageZoomLevel = prefs.getInt('pageZoom') ?? 0;
+      _scrollDiagEnabled = prefs.getBool('scrollDiag') ?? false;
       final yf = prefs.getString('youtubeFrontend');
       _youtubeFrontend = (yf != null && yf.isNotEmpty) ? yf : null;
       _filmotChannelBlacklist = (prefs.getStringList('filmotChannelBlacklist') ?? []).toSet();
@@ -531,6 +613,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(_userAgent)
         ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) => _openDialogWithWebview(msg.message.toString().replaceAll('"', '')))
+        // Caption lines the user ticked in snippet.js's subtitle sidebar,
+        // on their way to the language webapp as manual playlist item(s).
+        // Contract: docs/superpowers/specs/2026-09-06-caption-capture-design.md
+        ..addJavaScriptChannel('CaptionCollector', onMessageReceived: _handleCaptionCollector)
         ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
         ..addJavaScriptChannel('AdHostDetector', onMessageReceived: (msg) => _onJsAdHostDetected(msg.message))
@@ -544,15 +630,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('AppBarToggleChannel', onMessageReceived: (_) {
           if (_autoHideAppBar) _toggleAppBar();
         })
-        ..addJavaScriptChannel('SnippetLogChannel', onMessageReceived: (msg) {
-          final raw = msg.message;
-          final pipe = raw.indexOf('|');
-          if (pipe < 0) {
-            _appendSnippetLog('log', raw);
-          } else {
-            _appendSnippetLog(raw.substring(0, pipe), raw.substring(pipe + 1));
-          }
-        })
+        ..addJavaScriptChannel('SnippetLogChannel',
+            onMessageReceived: _onSnippetLogMessage)
         ..addJavaScriptChannel('TranslateRequest', onMessageReceived: _handleTranslateRequest)
         // Sentence-tagging bridges. SentenceTagHandler carries 'capture'
         // (initial word-tap) and 'extend' (Prev/Next response) payloads.
@@ -711,6 +790,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // Restore scroll position for this URL
               _restoreScrollPosition(url);
               _injectRemoteSnippet();
+              _injectScrollDiag(_controller, 'main');
             },
           ),
         )
@@ -912,34 +992,54 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     ''');
   }
 
+  // Scaling is done with CSS `zoom`, not `transform: scale()` — see
+  // lib/page_zoom.dart for why the transform broke scrolling in in-page modals.
   void _injectPageZoom() {
-    // Only apply scaling when the user actually set a non-default level.
-    // Using transform: scale() instead of CSS zoom to avoid layout breakage.
-    // CSS zoom creates a new containing block and breaks many modern layouts,
-    // while transform: scale() preserves the original layout structure.
-    if (_pageZoomLevel == 0) {
-      _controller.runJavaScript('''
-        document.documentElement.style.removeProperty('transform');
-        document.documentElement.style.removeProperty('transform-origin');
-        document.body.style.removeProperty('width');
-        document.body.style.removeProperty('overflow-x');
-      ''');
-      return;
+    _controller.runJavaScript(pageZoomJs(_pageZoomLevel));
+  }
+
+  /// Push the scroll probe's armed state into one WebView. Installing is
+  /// idempotent, so this doubles as the re-inject on page load.
+  void _injectScrollDiag(WebViewController? ctrl, String tag) {
+    if (ctrl == null) return;
+    try {
+      ctrl.runJavaScript(
+        scrollDiagnosticsJs(enabled: _scrollDiagEnabled, tag: tag),
+      ).catchError((_) { /* page not ready — next page-finished re-injects */ });
+    } catch (_) { /* controller torn down mid-call */ }
+  }
+
+  /// Arm / disarm the probe in every live WebView at once. Called from the
+  /// Tools drawer, typically *while* a page is stuck — so it injects into the
+  /// already-loaded document rather than waiting for a navigation.
+  Future<void> _setScrollDiagnostics(bool on) async {
+    setState(() => _scrollDiagEnabled = on);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('scrollDiag', on);
+    _injectScrollDiag(_controller, 'main');
+    _injectScrollDiag(dialogController, 'dialog1');
+    for (final entry in _dialog2Controllers.entries) {
+      _injectScrollDiag(entry.value, 'dialog2:${entry.key}');
     }
-    final scale = (1.0 + _pageZoomLevel * 0.15).clamp(0.5, 2.5);
-    _controller.runJavaScript('''
-      // Use transform: scale() which preserves layout flow
-      document.documentElement.style.transform = 'scale($scale)';
-      document.documentElement.style.transformOrigin = 'top left';
-      // Adjust body width to prevent horizontal scrollbar issues
-      if ($scale < 1.0) {
-        document.body.style.width = '${(100 / scale).toStringAsFixed(1)}%';
-        document.body.style.overflowX = 'hidden';
-      } else {
-        document.body.style.removeProperty('width');
-        document.body.style.removeProperty('overflow-x');
-      }
-    ''');
+    // Arming is the moment the user is looking at the stuck page, so capture
+    // the static picture right away — the gesture verdict comes on their
+    // next drag, but the CSS/layout state is already interesting.
+    if (on) _snapshotScrollDiag();
+  }
+
+  /// One-shot dump of the current scroll-related layout state in every live
+  /// WebView, without needing a gesture.
+  void _snapshotScrollDiag() {
+    for (final ctrl in <WebViewController?>[
+      _controller,
+      dialogController,
+      ..._dialog2Controllers.values,
+    ]) {
+      if (ctrl == null) continue;
+      try {
+        ctrl.runJavaScript(scrollDiagSnapshotJs).catchError((_) {});
+      } catch (_) {}
+    }
   }
 
   Future<void> _changePageZoom(int delta) async {
@@ -2168,6 +2268,57 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     try { _controller.runJavaScript(_wrapSnippetWithLogShim(cached)); } catch (_) {}
   }
 
+  /// Where the frame agent lives. Remote like `snippet.js`, so a reader that
+  /// changes its markup can be handled without an app release.
+  static const String _frameBootUrl =
+      'https://raw.githubusercontent.com/trexsatya/trexsatya.github.io/refs/heads/gh-pages/db/js/frame-boot.js';
+
+  /// Fetches the frame agent and registers it as a document-start script.
+  ///
+  /// Unlike `snippet.js`, which the host evaluates per navigation and which
+  /// therefore only ever reaches the main frame, this is registered once on
+  /// the WebView itself and then runs in EVERY frame of every page — including
+  /// cross-origin ones no page script can touch. That is what makes an e-book
+  /// reader served from a different subdomain reachable at all.
+  Future<void> _warmAndInstallFrameScript() async {
+    if (!Platform.isAndroid) return;
+    // Logged rather than kept in state: nothing on screen reports it, so a
+    // failed install is only ever diagnosed from the log.
+    debugPrint('[frame-agent] ${await _installFrameScript()}');
+  }
+
+  Future<String> _installFrameScript() async {
+    String script;
+    try {
+      final r = await http
+          .get(Uri.parse(_frameBootUrl))
+          .timeout(const Duration(seconds: 8));
+      if (r.statusCode != 200 || r.body.trim().isEmpty) {
+        return 'fetch failed: HTTP ${r.statusCode}';
+      }
+      script = r.body;
+    } catch (e) {
+      return 'fetch failed: $e';
+    }
+    // Flutter builds the platform view lazily, so early attempts can land
+    // before any WebView exists to attach to.
+    for (var attempt = 0; attempt < 12; attempt++) {
+      try {
+        final res = await _permsChannel.invokeMethod<String>(
+          'installFrameScript',
+          {'script': script},
+        );
+        if (res == null || !res.startsWith('no-webview')) {
+          return res ?? 'no reply';
+        }
+      } catch (e) {
+        return 'install failed: $e';
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+    }
+    return 'no WebView found after 12 attempts';
+  }
+
   /// Fire-and-forget cache warm so the first navigation after launch can
   /// still inject early. Runs in parallel with everything else in initState.
   void _warmRemoteSnippetCache() {
@@ -2199,6 +2350,19 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   $snippet
 })();
 ''';
+
+  /// `SnippetLogChannel` payloads are `level|message`. Shared by every
+  /// WebView that registers the channel so their output interleaves in one
+  /// log — the scroll probe relies on this to report from dialog1.
+  void _onSnippetLogMessage(JavaScriptMessage msg) {
+    final raw = msg.message;
+    final pipe = raw.indexOf('|');
+    if (pipe < 0) {
+      _appendSnippetLog('log', raw);
+    } else {
+      _appendSnippetLog(raw.substring(0, pipe), raw.substring(pipe + 1));
+    }
+  }
 
   void _appendSnippetLog(String level, String msg) {
     final ts = DateTime.now().toIso8601String().substring(11, 19);
@@ -2292,6 +2456,28 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // left at its default `true` — they treat the missing gesture as an
       // autoplay-blocked signal and don't even attempt playback.
       platform.setMediaPlaybackRequiresUserGesture(false);
+      // Honour the page's <meta name="viewport">. webview_flutter_android
+      // constructs every controller with useWideViewPort=false +
+      // loadWithOverviewMode=true, which means the WebView IGNORES the meta
+      // tag (including `width=device-width, initial-scale=1`) and instead
+      // zooms the whole page out to fit whatever the content's widest box is.
+      //
+      // That zoom-out is not cosmetic: it desynchronises the layout viewport
+      // from the visual one. `window.innerWidth/innerHeight` then report the
+      // zoomed-out size while fixed-position elements are still laid out
+      // against the smaller layout viewport, so a page that sizes a floating
+      // panel from innerWidth/innerHeight grows it past the layout viewport.
+      // Touch scrolling inside such a panel then latches onto the root
+      // scroller instead — and if the page has locked body scroll (the usual
+      // modal idiom) nothing moves at all. Mobile browsers honour the meta
+      // and stay at scale 1, which is why the same page scrolls fine there.
+      //
+      // Every page we generate ourselves already declares
+      // `width=device-width, initial-scale=1`, so this only starts obeying
+      // markup that was always meant to apply. Overview mode stays on: with
+      // the meta honoured it only kicks in for pages that genuinely ask for
+      // a viewport wider than the screen, which is the browser behaviour.
+      platform.setUseWideViewPort(true);
       // Grant requested resource permissions. `protectedMediaId` is needed
       // for Widevine DRM (Spotify Web Player); `microphone` is needed for
       // the manual-entry audio recorder. For mic specifically we ALSO have
@@ -2356,7 +2542,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // ($_selectedLanguage → en)" in the YouTube subtitle dialog).
     const tgt = 'English';
     final prompt =
-        'Give me translation of "$word" from $src to $tgt with some usage examples/patterns and nuances including everyday, literary/oldfashioned versions.';
+        'Give me translation of "$word" from $src to $tgt with some usage examples/patterns and nuances including everyday, literary, oldfashioned versions in both languages.';
     if (!Platform.isAndroid) {
       // iOS/macOS share-sheet would need a different channel — for now,
       // just put the prompt on the clipboard and tell the user.
@@ -3043,6 +3229,46 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       },
                     ),
                     ListTile(
+                      leading: Icon(_tagCaptureArmed
+                          ? Icons.playlist_add_check
+                          : Icons.playlist_add),
+                      title: const Text('Collect sentences'),
+                      subtitle: const Text(
+                          'Tap sentences on the page, then Send to a playlist'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _armSentenceCollecting();
+                      },
+                    ),
+                    // Turn on while a page/modal refuses to scroll, then drag
+                    // on the stuck area and read the snippet logs. Listeners
+                    // are all passive, so arming it can't change behaviour.
+                    SwitchListTile(
+                      secondary: Icon(_scrollDiagEnabled
+                          ? Icons.swipe_vertical
+                          : Icons.swipe_vertical_outlined),
+                      title: const Text('Scroll diagnostics'),
+                      subtitle: Text(_scrollDiagEnabled
+                          ? 'Armed — drag on the stuck area, then view snippet logs'
+                          : 'Log why a page or modal will not scroll'),
+                      value: _scrollDiagEnabled,
+                      onChanged: (val) async {
+                        await _setScrollDiagnostics(val);
+                        setModalState(() {});
+                      },
+                    ),
+                    if (_scrollDiagEnabled)
+                      ListTile(
+                        leading: const Icon(Icons.camera_alt_outlined),
+                        title: const Text('Scroll snapshot now'),
+                        subtitle: const Text(
+                            'Dump overflow / transform / covering elements'),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _snapshotScrollDiag();
+                        },
+                      ),
+                    ListTile(
                       leading: const Icon(Icons.terminal),
                       title: const Text('View snippet logs'),
                       subtitle: Text('${_snippetLogs.length} entries'),
@@ -3672,6 +3898,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       ..addJavaScriptChannel('FilmotBridge', onMessageReceived: (msg) => _handleFilmotMessage(dialogIdForBridge, msg.message))
       ..addJavaScriptChannel('WiktCollect', onMessageReceived: (msg) => _handleWiktCollectMessage(msg.message))
       ..addJavaScriptChannel('LinkLongPress', onMessageReceived: (msg) => _handleLinkLongPress(msg.message))
+      // Shared log sink — without it the scroll probe's output from this
+      // WebView would be thrown away by its own try/catch.
+      ..addJavaScriptChannel('SnippetLogChannel',
+          onMessageReceived: _onSnippetLogMessage)
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (request) {
           if (!request.isMainFrame) return NavigationDecision.navigate;
@@ -3696,6 +3926,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           dialog2Controller.runJavaScript(_linkLongPressJs);
           // Auto-unmute any YouTube/HTML5 media that autoplayed muted.
           dialog2Controller.runJavaScript(_autoUnmuteYouTubeJs);
+          _injectScrollDiag(dialog2Controller, 'dialog2:$dialogIdForBridge');
           if (_isFilmotUrl(finishedUrl)) {
             _injectFilmotHelper(dialog2Controller);
           }
@@ -6760,6 +6991,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('TtsBridge', onMessageReceived: _handleTtsBridge)
         ..addJavaScriptChannel('MediaState', onMessageReceived: _handleMediaStateBridge)
         ..addJavaScriptChannel('AudioBridge', onMessageReceived: _handleAudioBridge)
+        // Dictation for the manual-card editor's Source/Target fields. The
+        // webapp feature-detects this channel and hides its 🎤 buttons when
+        // it's absent, so registering it is what turns the feature on.
+        // Protocol: docs/speech-bridge-spec.md.
+        ..addJavaScriptChannel('SpeechBridge', onMessageReceived: _handleSpeechBridge)
         // The study page (trexsatya.github.io/language.html) loads in THIS
         // (dialog) controller, so its 🌐 translate button needs the channel
         // here too. The main _controller registers TranslateRequest as well,
@@ -6778,10 +7014,25 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // Ops + events: spec §Bridge. Acks via cupitorNotifAck.
         ..addJavaScriptChannel('NotifBridge',
             onMessageReceived: (msg) => _notifBridge.handle(msg.message))
+        // Same log sink as the main WebView, so the scroll probe (and any
+        // other page-side diagnostic) can report from inside dialog1.
+        ..addJavaScriptChannel('SnippetLogChannel',
+            onMessageReceived: _onSnippetLogMessage)
         ..setNavigationDelegate(
           NavigationDelegate(
             onPageStarted: (url) {
               _dialogErrorNotifier.value = null;
+              // The page being replaced takes its JS state with it, so no
+              // recordStop/recordCancel is ever coming for a clip it had in
+              // progress — and a dictation's pending promise dies with it.
+              // Reload, retry and the language switch all land here.
+              // Reply rather than tearing down silently: onPageStarted also
+              // fires for redirect hops, where the page survives and would
+              // otherwise be left waiting on a promise nothing can settle.
+              // 'cancelled' is silent on that side, and a reply to a page
+              // that really is gone costs nothing.
+              _sttCancelForMicHandoff();
+              _stopNativeRecordingIfAny();
               _injectYouTubeAdBlocker(dialogController);
             },
             onWebResourceError: (error) {
@@ -6829,10 +7080,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 _pendingCapturedSubtitle = null;
                 dialogController?.runJavaScript(_jsCodeForCapturedSubtitle(pending));
               }
+              final pendingCaption = _pendingCaptionCapture;
+              if (pendingCaption != null) {
+                _pendingCaptionCapture = null;
+                dialogController?.runJavaScript(_jsCodeForCaptionCapture(pendingCaption));
+              }
               // Warm the language app with the current playlist state
               // so it can render manual cards without an explicit fetch.
               _pushPlaylistsToDialog();
               _pushNotifStateToDialog();
+              _injectScrollDiag(dialogController, 'dialog1');
               // Notification tap that triggered this load: deliver the
               // opened-event to the page now that its JS context exists.
               final pendingOpened = _pendingNotifOpenedEvent;
@@ -6938,6 +7195,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // This prevents unnecessary reloads when reopening the dialog.
       _dialog1Visible = false;
       _dialog1FullscreenNotifier.value = false;
+      // Release the mic, and ANSWER the page rather than tearing down
+      // silently: the controller deliberately outlives the dialog (and this
+      // also runs on minimize), so the webapp is still alive holding a
+      // pending promise. Drop it and its 🎤 button pulses forever and blocks
+      // the other one. 'cancelled' is silent on that side.
+      _sttCancelForMicHandoff();
+      // Deliberately NOT clearing _nativeRecordingActive here. The page
+      // outlives this handler (it also runs on minimize) and still owns its
+      // recording; clearing the flag without stopping the recorder would let
+      // the next dictation talk to a mic that is already taken.
       // Notify the page running inside dialog1 that the dialog just
       // closed — useful for the language page to pause TTS, stop a
       // running clip, or persist state before the user comes back.
@@ -7106,12 +7373,102 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     );
   }
 
-  String _speechLocale() {
-    switch (_selectedLanguage) {
-      case 'sv': return 'sv-SE';
-      case 'es': return 'es-ES';
-      default: return 'en-US';
+  String _speechLocale() => speechBcp47(_selectedLanguage) ?? 'en-US';
+
+  Future<bool> _ensureSpeechInit() => SpeechHub.ensureInitialized();
+
+  /// Routes an engine status to whichever feature currently holds the mic.
+  void _onSpeechStatus(String status) {
+    // 'done' ONLY, for every consumer. 'notListening' is emitted at
+    // end-of-speech and reaches us *before* the engine's final result:
+    // acting on it truncates a transcript to its last partial, and — for the
+    // restart loop — schedules a fresh listen() that resets the plugin's
+    // final-result timer and destroys the utterance outright. 'done' is
+    // always delivered eventually: the plugin gates it behind the final
+    // result, promotes it when the final arrives late, and emits it
+    // unconditionally when nothing was heard at all.
+    if (status != 'done') return;
+    if (_sttSession.isBusy) {
+      _sttApply(_sttSession.engineDone());
+      return;
     }
+    if (_continuousVoiceActive) {
+      if (mounted) _restartContinuousListen();
+      return;
+    }
+    _onVoiceInputStatusDone();
+  }
+
+  /// Routes an engine error the same way. Note the predicate is `isBusy`, not
+  /// "listening": an error raised while we are still opening the mic belongs
+  /// to the dictation session too, and must not fall through to the one-shot
+  /// handler and pop a native dialog over the WebView.
+  void _onSpeechError(stt.SpeechRecognitionError error) {
+    if (_sttSession.isBusy) {
+      final outcome = mapSpeechError(error.errorMsg);
+      _sttApply(outcome.silent
+          ? _sttSession.engineDoneConfirmed()
+          : _sttSession.engineError(outcome.error!));
+      return;
+    }
+    if (_continuousVoiceActive) {
+      debugPrint('Continuous speech error: ${error.errorMsg}');
+      if (mounted) _restartContinuousListen();
+      return;
+    }
+    _onVoiceInputError(error);
+  }
+
+  /// Another feature took the microphone — the tag-capture sheet's mask mic,
+  /// typically. No further events are coming, so settle whatever was open and
+  /// put the UI back rather than leaving a lit mic icon wired to nothing.
+  void _onSpeechLost() {
+    if (_sttSession.isBusy) {
+      _sttApply(_sttSession.cancel());
+      return;
+    }
+    if (_continuousVoiceActive) {
+      // Quietly: the transcript belongs to a capture the user did not end,
+      // and _stopContinuousVoiceCapture would pop a dialog over whatever
+      // just claimed the mic.
+      _continuousVoiceActive = false;
+    }
+    if (mounted && _isListening) setState(() => _isListening = false);
+    _isListeningNotifier.value = false;
+  }
+
+  /// The one-shot listen ended. Was `_toggleVoiceInput`'s onStatus closure.
+  void _onVoiceInputStatusDone() {
+    if (!mounted || !_isListening) return;
+    setState(() => _isListening = false);
+    _isListeningNotifier.value = false;
+    // Resume normal timer behavior when voice input stops
+    if (_showAppBar && _autoHideAppBar) {
+      _showAppBarWithTimer();
+    }
+    if (_voiceLastWords.isNotEmpty) {
+      _openDialogWithWebview(_voiceLastWords);
+      _voiceLastWords = '';
+    }
+  }
+
+  /// The one-shot listen failed. Was `_toggleVoiceInput`'s onError closure.
+  void _onVoiceInputError(stt.SpeechRecognitionError error) {
+    debugPrint('Speech error: $error');
+    // Don't leave a failed attempt's words behind for a later 'done' to
+    // dispatch.
+    _voiceLastWords = '';
+    // Guard on _isListening so a stray error arriving after some *other*
+    // feature's session cannot pop the fallback dialog out of nowhere.
+    if (!mounted || !_isListening) return;
+    setState(() => _isListening = false);
+    _isListeningNotifier.value = false;
+    // Resume normal timer behavior on error
+    if (_showAppBar && _autoHideAppBar) {
+      _showAppBarWithTimer();
+    }
+    // Fallback to text input if speech fails
+    _showVoiceInputFallback();
   }
 
   Future<void> _toggleVoiceInput() async {
@@ -7125,52 +7482,28 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       }
       return;
     }
+    // Dialog1's own mic button sits next to the webapp's, so a dictation may
+    // be in flight. End it properly instead of stealing the recognizer out
+    // from under it — otherwise its rid settles with the pre-hijack text and
+    // this listen's words go to the wrong place.
+    await _sttCancelForMicHandoff();
     // Show app bar when starting voice input
     _showAppBarWithTimer();
     try {
-      String lastWords = '';
-      final available = await _speech.initialize(
-        onStatus: (status) {
-          if (status == 'done' || status == 'notListening') {
-            if (mounted && _isListening) {
-              setState(() => _isListening = false);
-            _isListeningNotifier.value = false;
-              // Resume normal timer behavior when voice input stops
-              if (_showAppBar && _autoHideAppBar) {
-                _showAppBarWithTimer();
-              }
-              if (lastWords.isNotEmpty) {
-                _openDialogWithWebview(lastWords);
-                lastWords = '';
-              }
-            }
-          }
-        },
-        onError: (error) {
-          debugPrint('Speech error: $error');
-          if (mounted) {
-            setState(() => _isListening = false);
-            _isListeningNotifier.value = false;
-            // Resume normal timer behavior on error
-            if (_showAppBar && _autoHideAppBar) {
-              _showAppBarWithTimer();
-            }
-            // Fallback to text input if speech fails
-            _showVoiceInputFallback();
-          }
-        },
-      );
+      _voiceLastWords = '';
+      final available = await _ensureSpeechInit();
       if (!available) {
         _showVoiceInputFallback();
         return;
       }
       setState(() => _isListening = true);
       _isListeningNotifier.value = true;
+      SpeechHub.acquire(_speechHubListener);
       await _speech.listen(
         localeId: _speechLocale(),
         onResult: (result) {
-          lastWords = result.recognizedWords;
-          if (result.finalResult && lastWords.isNotEmpty) {
+          _voiceLastWords = result.recognizedWords;
+          if (result.finalResult && _voiceLastWords.isNotEmpty) {
             _speech.stop();
             setState(() => _isListening = false);
             _isListeningNotifier.value = false;
@@ -7179,8 +7512,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _showAppBarWithTimer();
             }
             if (mounted) {
-              _openDialogWithWebview(lastWords);
-              lastWords = '';  // prevent double dispatch from onStatus
+              _openDialogWithWebview(_voiceLastWords);
+              _voiceLastWords = '';  // prevent double dispatch from onStatus
             }
           }
         },
@@ -7205,6 +7538,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// stop (or 5 minutes elapse as a safety net).
   Future<void> _startContinuousVoiceCapture() async {
     if (_continuousVoiceActive) return;
+    // End a webapp dictation cleanly before taking the recognizer — while one
+    // is in flight it owns the status routing, so the restart loop below
+    // would never fire.
+    await _sttCancelForMicHandoff();
     // If a normal (one-shot) listen is in progress, cancel it first.
     if (_isListening) {
       try { await _speech.stop(); } catch (_) {}
@@ -7226,25 +7563,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   Future<bool> _initContinuousListen() async {
     try {
-      final ok = await _speech.initialize(
-        onStatus: (status) {
-          // The speech_to_text plugin ends each utterance on its own; in
-          // continuous mode we just restart listening as long as the user
-          // still wants us listening.
-          if (status == 'done' || status == 'notListening') {
-            if (_continuousVoiceActive && mounted) {
-              _restartContinuousListen();
-            }
-          }
-        },
-        onError: (e) {
-          debugPrint('Continuous speech error: $e');
-          if (_continuousVoiceActive && mounted) {
-            _restartContinuousListen();
-          }
-        },
-      );
+      // The plugin ends each utterance on its own; in continuous mode we just
+      // restart listening as long as the user still wants us listening. That
+      // restart now happens in _onSpeechStatus / _onSpeechError, which are
+      // installed once by _ensureSpeechInit.
+      final ok = await _ensureSpeechInit();
       if (!ok) return false;
+      SpeechHub.acquire(_speechHubListener);
       await _speech.listen(
         localeId: _speechLocale(),
         partialResults: true,
@@ -7277,6 +7602,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     Future.delayed(const Duration(milliseconds: 200), () async {
       if (!_continuousVoiceActive) return;
       try {
+        SpeechHub.acquire(_speechHubListener);
         await _speech.listen(
           localeId: _speechLocale(),
           partialResults: true,
@@ -7305,8 +7631,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (!_continuousVoiceActive) return;
     _continuousVoiceActive = false;
     try { await _speech.stop(); } catch (_) {}
+    SpeechHub.release(_speechHubListener);
     if (mounted) setState(() => _isListening = false);
-    _isListeningNotifier.value = false;
+    if (mounted) _isListeningNotifier.value = false;
+    _flushContinuousTranscript();
+  }
+
+  /// Drains the accumulated long-press transcript and shows it. Split out so
+  /// the resume path can surface a capture that was interrupted by the app
+  /// being backgrounded.
+  void _flushContinuousTranscript() {
     // Append any trailing partial that hadn't promoted to a final result yet.
     if (_continuousPartial.trim().isNotEmpty) {
       if (_continuousTranscript.isNotEmpty) _continuousTranscript.write(' ');
@@ -7560,6 +7894,250 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     } catch (_) {}
   }
 
+  // ---------------------------------------------------------------------
+  // SpeechBridge — dictation for the webapp's manual-card editor.
+  // Protocol: docs/speech-bridge-spec.md. The rid routing lives in
+  // SpeechSession (lib/speech_session.dart); everything here is I/O.
+  // ---------------------------------------------------------------------
+
+  /// How long a `start` may sit unconfirmed before we call it a busy mic.
+  /// `listen()` returns normally when the platform refuses the recognizer —
+  /// no throw, no timers, no callback ever — so a deadline is the only way
+  /// to notice.
+  static const _kSttStartDeadline = Duration(seconds: 2);
+
+  /// How long the engine may read as stopped before we settle without a
+  /// `done`. Must exceed the plugin's own 2 s final-result timer, otherwise
+  /// this fires in the gap between end-of-speech and the final result and
+  /// truncates the transcript on every normal auto-stop.
+  static const _kSttQuietSettle = Duration(seconds: 4);
+
+  static const _kSttListenFor = Duration(seconds: 30);
+
+  /// Grace for a trailing error after an empty `done`. The plugin delivers
+  /// `doneNoResult` as `done` ungated, and it arrives *before* the real error.
+  static const _kSttDoneDebounce = Duration(milliseconds: 400);
+
+  void _speechReply(String rid, {String? result, String? error, String? partial}) {
+    final ctrl = dialogController;
+    if (ctrl == null) return;
+    final payload = jsonEncode({
+      'rid': rid,
+      if (result != null) 'result': result,
+      if (error != null) 'error': error,
+      if (partial != null) 'partial': partial,
+    });
+    try {
+      ctrl
+          .runJavaScript('window.__cupSpeech && window.__cupSpeech($payload);')
+          .catchError((_) {/* dialog1 not loaded yet */});
+    } catch (_) {}
+  }
+
+  Future<void> _handleSpeechBridge(JavaScriptMessage msg) async {
+    Map<String, dynamic> req;
+    try { req = jsonDecode(msg.message) as Map<String, dynamic>; }
+    catch (_) { return; }
+    final op = (req['op'] as String?) ?? '';
+    final rid = (req['rid'] as String?) ?? '';
+    switch (op) {
+      case 'start':
+        await _sttApply(_sttSession.start(rid, req['locale'] as String?));
+      case 'stop':
+        // Note: stop/cancel act on the in-flight listen and settle the START
+        // rid. Their own rid has no pending entry on the page.
+        await _sttApply(_sttSession.stop());
+      case 'cancel':
+        await _sttApply(_sttSession.cancel());
+    }
+  }
+
+  /// Performs whatever the session decided.
+  Future<void> _sttApply(SpeechAction action) async {
+    switch (action) {
+      case SpeechNoOp():
+        return;
+      case SpeechListen(:final rid, :final locale):
+        await _sttBeginListen(rid, locale);
+      case SpeechDefer():
+        // Never re-arm: the watchdog can ask to defer every 250 ms, which is
+        // faster than the debounce fires. Re-arming would reset it forever
+        // and the rid would never settle.
+        if (_sttDoneDebounce?.isActive ?? false) return;
+        _sttDoneDebounce = Timer(_kSttDoneDebounce, () {
+          _sttApply(_sttSession.engineDoneConfirmed());
+        });
+      case SpeechReply(:final rid, :final result, :final error, :final partial):
+        if (action.settlesSession) {
+          // Let go of the mic on every settling path, not just the ones the
+          // engine drove. A watchdog or abort settle can leave the recognizer
+          // running with nobody owning it. Note this is keyed on
+          // settlesSession, not terminal: a BUSY rejection must leave the
+          // in-flight session and its timers completely alone.
+          _sttStopTimers();
+          try { await _speech.cancel(); } catch (_) {}
+        }
+        _speechReply(rid, result: result, error: error, partial: partial);
+    }
+  }
+
+  Future<void> _sttBeginListen(String rid, String? locale) async {
+    // §7 — free the mic. The native recorder wins: refusing is friendlier
+    // than binning a clip the user is still recording.
+    if (_nativeRecordingActive) {
+      await _sttApply(_sttSession.abort(rid, 'mic-busy'));
+      return;
+    }
+    // Releases any lingering session on the shared recognizer, clears the
+    // long-press restart loop so it can't steal the mic back, and waits out
+    // the 500 ms AudioRecord settle the OS needs.
+    await _releaseMicFromSpeechToText();
+
+    if (!await _ensureMicPermission()) {
+      await _sttApply(_sttSession.abort(rid, 'permission-denied'));
+      return;
+    }
+    if (!await _ensureSpeechInit()) {
+      await _sttApply(_sttSession.abort(rid, 'speech-unavailable'));
+      return;
+    }
+    // A stop/cancel may have landed during the awaits above and already
+    // settled this rid. Keep this check adjacent to listen() with no await
+    // between them, so check-and-listen is atomic on the event loop.
+    if (_sttSession.startRid != rid) return;
+    // From here on the engine's events are ours, not the outgoing session's.
+    _sttSession.listenIssued(rid);
+    SpeechHub.acquire(_speechHubListener);
+    try {
+      await _speech.listen(
+        localeId: speechBcp47(locale),
+        listenFor: _kSttListenFor,
+        pauseFor: const Duration(seconds: 3),
+        listenOptions: stt.SpeechListenOptions(partialResults: true),
+        onResult: (r) => _sttApply(
+          _sttSession.result(r.recognizedWords, isFinal: r.finalResult),
+        ),
+      );
+    } catch (e) {
+      debugPrint('SpeechBridge listen failed: $e');
+      // Not abort(): listen() assigns its result listener before it awaits,
+      // so a partial may already have moved us out of `starting`, and abort
+      // would no-op there and strand the rid with no watchdog to rescue it.
+      if (_sttSession.startRid == rid) {
+        await _sttApply(_sttSession.engineError('speech-unavailable'));
+      }
+      return;
+    }
+    // A stop/cancel that landed *during* listen() can't be undone by the
+    // guard above — the recognizer is already coming up owned by nobody.
+    if (_sttSession.startRid != rid) {
+      try { await _speech.cancel(); } catch (_) {}
+      return;
+    }
+    // Deliberately not marking the session live here: the platform can refuse
+    // silently, so we wait for evidence (isListening, or a result).
+    _sttStartWatchdog(rid);
+  }
+
+  void _sttStartWatchdog(String rid) {
+    _sttWatchdog?.cancel();
+    _sttListenStartedAt = DateTime.now();
+    _sttQuietSince = null;
+    _sttWatchdog = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      if (!_sttSession.isBusy || _sttSession.startRid != rid) {
+        _sttWatchdog?.cancel();
+        _sttWatchdog = null;
+        return;
+      }
+      final now = DateTime.now();
+      final since = now.difference(_sttListenStartedAt ?? now);
+
+      if (_sttSession.phase == SpeechPhase.starting) {
+        if (_speech.isListening) {
+          _sttSession.listening(rid);
+        } else if (since > _kSttStartDeadline) {
+          // The platform took the call and did nothing — something else holds
+          // the recognizer.
+          _sttApply(_sttSession.abort(rid, 'mic-busy'));
+        }
+        return;
+      }
+
+      if (_speech.isListening) {
+        _sttQuietSince = null;
+      } else {
+        _sttQuietSince ??= now;
+        if (now.difference(_sttQuietSince!) > _kSttQuietSettle) {
+          // We missed 'done' — most likely another screen won the
+          // initialize() race and owns the status callback.
+          _sttApply(_sttSession.engineDone());
+          return;
+        }
+      }
+      if (since > _kSttListenFor + const Duration(seconds: 5)) {
+        _sttApply(_sttSession.engineDone());
+      }
+    });
+  }
+
+  void _sttStopTimers() {
+    _sttWatchdog?.cancel();
+    _sttWatchdog = null;
+    _sttDoneDebounce?.cancel();
+    _sttDoneDebounce = null;
+  }
+
+  /// Stops the native recorder if we believe one is running, discarding the
+  /// partial clip. For teardown paths only — the page that owns the clip is
+  /// already gone, so nobody is left to call `recordStop`. Unconditional on
+  /// the native side, which no-ops when no recorder is open.
+  void _stopNativeRecordingIfAny() {
+    _nativeRecordingActive = false;
+    _permsChannel.invokeMethod<void>('cancelNativeRecording').catchError((_) {});
+  }
+
+  /// Ends a dictation session because something else is claiming the mic.
+  ///
+  /// `_releaseMicFromSpeechToText()` cancels the recognizer, and a cancel
+  /// produces no Dart callback at all once partials have been seen — so
+  /// without this the page would wait on the watchdog. Answer it now instead;
+  /// 'cancelled' is silent in the webapp and restores the field.
+  /// One-tap entry point for collecting sentences off a web page.
+  ///
+  /// The underlying mechanism is the same capture mode the tag chip arms, but
+  /// reaching it meant Tag Settings → show the chip → tap the chip, behind a
+  /// switch labelled for tagging. That made a working feature undiscoverable,
+  /// which is exactly how it was reported. This shows the chip — so the armed
+  /// state stays visible and can be turned off again — and arms the page in
+  /// one action, keeping a single source of truth for the mode.
+  void _armSentenceCollecting() {
+    setState(() {
+      _tagCaptureToggleVisible = true;
+      _tagCaptureArmed = true;
+    });
+    _controller.runJavaScript(
+      'window.__cupitorSetCaptureMode && window.__cupitorSetCaptureMode(true);',
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Tap sentences to collect them, then Send in the page'),
+        duration: Duration(seconds: 4),
+      ),
+    );
+  }
+
+  Future<void> _sttCancelForMicHandoff() async {
+    if (!_sttSession.isBusy) return;
+    await _sttApply(_sttSession.cancel());
+    // Give the recognizer the same beat every other cancel→listen path in
+    // this file allows. Without it the caller's own listen() can be refused
+    // and — since a refusal arms nothing and never calls back — leave that
+    // feature wedged with its mic icon lit. Only paid when a dictation was
+    // actually running.
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+  }
+
   Future<void> _handleAudioBridge(JavaScriptMessage msg) async {
     Map<String, dynamic> req;
     try { req = jsonDecode(msg.message) as Map<String, dynamic>; }
@@ -7617,6 +8195,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // continuous capture left active) getUserMedia rejects with
         // `NotReadableError: Could not start audio source` until STT lets
         // go. Stopping it here is the right time — JS is about to record.
+        await _sttCancelForMicHandoff();
         await _releaseMicFromSpeechToText();
         final ok = await _ensureMicPermission();
         _audioReply('ensureMicPerm', rid, ok ? 'granted' : 'denied', null);
@@ -7632,6 +8211,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // extension the recorder actually wrote.
         final id = _safeFileId((req['id'] as String?) ?? '');
         if (id.isEmpty) { _audioReply('recordStart', rid, null, 'bad-id'); return; }
+        await _sttCancelForMicHandoff();
         await _releaseMicFromSpeechToText();
         final permOk = await _ensureMicPermission();
         if (!permOk) { _audioReply('recordStart', rid, null, 'permission-denied'); return; }
@@ -7642,6 +8222,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             'startNativeRecording', {'pathStem': pathStem},
           );
           if (actualPath != null && actualPath.isNotEmpty) {
+            _nativeRecordingActive = true;
             _audioReply('recordStart', rid, _fileUrlForPath(actualPath), null);
           } else {
             _audioReply('recordStart', rid, null, 'start-failed');
@@ -7650,6 +8231,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           _audioReply('recordStart', rid, null, '${e.code}: ${e.message ?? ''}');
         }
       } else if (op == 'recordStop') {
+        _nativeRecordingActive = false;
         try {
           final path = await _permsChannel.invokeMethod<String>('stopNativeRecording');
           if (path == null) {
@@ -7661,6 +8243,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           _audioReply('recordStop', rid, null, '${e.code}: ${e.message ?? ''}');
         }
       } else if (op == 'recordCancel') {
+        _nativeRecordingActive = false;
         try {
           await _permsChannel.invokeMethod<void>('cancelNativeRecording');
           _audioReply('recordCancel', rid, 'ok', null);
@@ -8127,7 +8710,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (op == 'globalSearch') {
       final query = (m['query'] as String?) ?? '';
       if (query.trim().isEmpty) return;
-      await _handleGlobalSearchOp(query);
+      // `partial` on the op is an optional per-query override. When
+      // omitted, the device-level Index Settings toggle is used.
+      final raw = m['partial'];
+      final partialOverride = raw is bool ? raw : null;
+      await _handleGlobalSearchOp(query, partialOverride: partialOverride);
       return;
     }
     if (op == 'cancelSearch') {
@@ -8146,21 +8733,42 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   final List<GlobalSearchHit> _globalSearchBuffer = [];
   int _globalSearchEmitted = 0;
   String _globalSearchQuery = '';
+  bool _globalSearchPartial = false;
+  // Monotonic token used to disambiguate stream events from stale
+  // subscriptions during the async cancellation window. Each new
+  // search bumps this; the listen callback captures it in a local
+  // closure and no-ops when the token has moved on.
+  int _globalSearchToken = 0;
   static const int _kGlobalSearchCap = 200;
 
   /// Kick off a streaming global-search on behalf of the language app.
   /// Cancels any prior search. Events dispatched into dialog1:
-  ///   { query, hits: [delta], done: false, hits_capped: bool }  (many)
-  ///   { query, hits: [],      done: true,  hits_capped: bool }  (final)
-  Future<void> _handleGlobalSearchOp(String query) async {
+  ///   { query, partial, hits: [delta], done: false, hits_capped: bool }
+  ///   { query, partial, hits: [],      done: true,  hits_capped: bool }
+  ///
+  /// [partialOverride] mirrors the op's optional `partial` field —
+  /// null falls through to the device-level Index Settings toggle.
+  Future<void> _handleGlobalSearchOp(String query, {bool? partialOverride}) async {
     _cancelGlobalSearch();
     _globalSearchQuery = query;
     _globalSearchEmitted = 0;
     _globalSearchBuffer.clear();
+    // Resolve the effective mode once so every batch this run dispatches
+    // labels itself consistently (even if the user toggles the device
+    // setting mid-search).
+    _globalSearchPartial = partialOverride ?? SearchIndex.partialMatchEnabled.value;
+    // Bump the identity token BEFORE listening. The closure below
+    // captures this local value; any callback from a superseded
+    // subscription (still draining in the async cancellation window)
+    // will see `token != _globalSearchToken` and no-op — its hit can't
+    // leak into the new query's buffer.
+    final token = ++_globalSearchToken;
     _globalSearchSub = GlobalSearch.search(
       query,
       maxTotalHits: _kGlobalSearchCap,
+      partialOverride: partialOverride,
     ).listen((ev) {
+      if (token != _globalSearchToken) return;
       if (ev is GlobalSearchHitEvent) {
         _globalSearchBuffer.add(ev.hit);
         _globalSearchEmitted++;
@@ -8186,9 +8794,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         _globalSearchSub = null;
       }
     }, onError: (_) {
+      if (token != _globalSearchToken) return;
       _dispatchGlobalSearchBatch(done: true, capped: false);
       _globalSearchSub = null;
     }, onDone: () {
+      if (token != _globalSearchToken) return;
       // Belt-and-suspenders: if the stream ends without a final
       // GlobalSearchDone (shouldn't happen, but crash-safe), still
       // close the client-side stream.
@@ -8203,6 +8813,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final sub = _globalSearchSub;
     if (sub == null) return;
     _globalSearchSub = null;
+    // Bump the identity token FIRST so any in-flight callback from the
+    // subscription being cancelled bails out before it can mutate the
+    // shared buffer or dispatch under the wrong query/mode.
+    _globalSearchToken++;
     sub.cancel();
     // Tell the client the current query is closing prematurely so it
     // can drop any stale-result-guard state without waiting for a
@@ -8224,6 +8838,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (ctrl == null) return;
     final payload = jsonEncode({
       'query': _globalSearchQuery,
+      'partial': _globalSearchPartial,
       'hits': [for (final h in delta) h.toJson()],
       'done': done,
       'hits_capped': capped,
@@ -8440,6 +9055,19 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
   }
 
+  /// `runJavaScriptReturningResult` hands back a JSON-encoded string on
+  /// Android. Decoding it rather than stripping quotes matters now that the
+  /// value can be a whole sentence: a naive replace eats every quote mark in
+  /// the text and leaves `\n` and `\u00e5` as literals.
+  String _decodeJsString(Object? raw) {
+    final s = raw?.toString() ?? '';
+    try {
+      final decoded = jsonDecode(s);
+      if (decoded is String) return decoded.trim();
+    } catch (_) {}
+    return s.replaceAll('"', '').trim();
+  }
+
   String jsCodeToFilterData(String text) {
     final escaped = text.replaceAll("'", "\\'");
     // Token is intentionally NOT passed here — GitHub API calls are proxied
@@ -8482,6 +9110,47 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // No dialog1 controller yet — let _openDialogWithWebview spin one up,
     // then dispatch from onPageFinished once the listener is alive.
     _pendingCapturedSubtitle = payload;
+    _openDialogWithWebview('');
+  }
+
+  // ---------------------------------------------------------------------
+  // Caption capture — selected subtitle lines from snippet.js's sidebar.
+  // Contract: docs/superpowers/specs/2026-09-06-caption-capture-design.md
+  // ---------------------------------------------------------------------
+
+  /// Its own slot rather than sharing `_pendingCapturedSubtitle`: the two
+  /// events are independent and either could be waiting on dialog1.
+  Map<String, dynamic>? _pendingCaptionCapture;
+
+  void _handleCaptionCollector(JavaScriptMessage msg) {
+    Object? raw;
+    try {
+      raw = jsonDecode(msg.message);
+    } catch (_) {
+      return; // non-JSON is dropped silently, as with the other channels
+    }
+    final detail = buildCaptionCaptureDetail(raw, fallbackLang: _selectedLanguage);
+    // Nothing usable in the payload — say nothing rather than opening dialog1
+    // on an empty capture.
+    if (detail == null) return;
+    _sendCaptionCaptureToDialog1(detail);
+  }
+
+  /// Deliberately a different event from `capturedSubtitle`, which drives the
+  /// YouTube and filmot subtitle-study flows. A separate event keeps those
+  /// untouched and lets the webapp half ship independently — with no listener
+  /// registered this is simply inert.
+  String _jsCodeForCaptionCapture(Map<String, dynamic> detail) =>
+      "window.dispatchEvent(new CustomEvent('cupitorCaptionCapture', "
+      "{ detail: ${jsonEncode(detail)} }));";
+
+  void _sendCaptionCaptureToDialog1(Map<String, dynamic> detail) {
+    if (dialogController != null) {
+      dialogController!.runJavaScript(_jsCodeForCaptionCapture(detail));
+      _showDialog1();
+      return;
+    }
+    _pendingCaptionCapture = detail;
     _openDialogWithWebview('');
   }
 
@@ -8701,17 +9370,33 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               text = _pdfSelectedText;
             } else {
               const js = '''
-                (function getSelFromWindow(w) {
+                (function () {
+                  function fromWindow(w) {
+                    try {
+                      var s = w.getSelection().toString().trim();
+                      if (s) return s;
+                      for (var i = 0; i < w.frames.length; i++) {
+                        var found = fromWindow(w.frames[i]);
+                        if (found) return found;
+                      }
+                    } catch (e) {}
+                    return '';
+                  }
+                  var s = fromWindow(window);
+                  if (s) return s;
+                  // A cross-origin reader's selection cannot be read from
+                  // here at all — getSelection() on its window throws, which
+                  // the catch above swallows, and an embedded e-book reader is
+                  // exactly that case. snippet.js keeps the last selection the
+                  // frame agent reported to it, and this is the only route by
+                  // which that text reaches the host.
                   try {
-                    const s = w.getSelection().toString().trim();
-                    if (s) return s;
-                    for (let i = 0; i < w.frames.length; i++) {
-                      const found = getSelFromWindow(w.frames[i]);
-                      if (found) return found;
+                    if (window.__cupSelection) {
+                      return String(window.__cupSelection() || '');
                     }
-                  } catch(e) {}
+                  } catch (e) {}
                   return '';
-                })(window);
+                })();
               ''';
               // Timeout the JS call: if the main WebView's renderer is wedged
               // (e.g. after a heavy page in a dialog jammed the shared renderer
@@ -8723,7 +9408,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 final result = await _controller
                     .runJavaScriptReturningResult(js)
                     .timeout(const Duration(seconds: 2));
-                text = result.toString().replaceAll('"', '');
+                text = _decodeJsString(result);
               } catch (_) {}
             }
             _openDialogWithWebview(text);

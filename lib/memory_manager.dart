@@ -10,6 +10,7 @@ import 'book_transfer.dart';
 import 'db.dart';
 import 'epub_reader.dart' show EpubLibrary, EpubLibraryEntry;
 import 'media_store.dart';
+import 'recording_selection.dart';
 import 'search_index.dart';
 
 /// Storage overview + per-book breakdown.
@@ -546,6 +547,13 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
   bool _busy = false;
   List<_VoiceRecordingRow> _rows = const [];
 
+  // Selected clips, keyed by file path — row objects are rebuilt on reload, so
+  // identity would not survive one. Selection mode is derived from this being
+  // non-empty rather than tracked separately, so deselecting the last clip
+  // leaves selection mode with no second flag to fall out of step.
+  Set<String> _selectedPaths = <String>{};
+  bool get _selecting => _selectedPaths.isNotEmpty;
+
   final AudioPlayer _player = AudioPlayer();
   String? _playingPath;
   Duration _playingPosition = Duration.zero;
@@ -643,6 +651,10 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
     if (!mounted) return;
     setState(() {
       _rows = rows;
+      // Drop anything that is no longer on disk, so a deleted clip can't
+      // linger as a phantom selection.
+      _selectedPaths =
+          pruneSelection(_selectedPaths, rows.map((r) => r.file.path).toList());
       _loading = false;
     });
   }
@@ -682,32 +694,54 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
     await _reload();
   }
 
-  Future<void> _deleteAll() async {
-    if (_busy || _rows.isEmpty) return;
-    final totalBytes = _rows.fold<int>(0, (n, r) => n + r.sizeBytes);
+  /// Enters selection mode on [row], or toggles it when already selecting.
+  void _toggleSelected(_VoiceRecordingRow row) {
+    setState(() {
+      _selectedPaths = toggleSelection(_selectedPaths, row.file.path);
+    });
+  }
+
+  void _toggleSelectAll() {
+    setState(() {
+      _selectedPaths = selectAllOrNone(
+        _selectedPaths,
+        _rows.map((r) => r.file.path).toList(),
+      );
+    });
+  }
+
+  void _exitSelection() => setState(() => _selectedPaths = <String>{});
+
+  Future<void> _deleteSelected() async {
+    if (_busy || _selectedPaths.isEmpty) return;
+    final doomed =
+        _rows.where((r) => _selectedPaths.contains(r.file.path)).toList();
+    if (doomed.isEmpty) return;
+    final totalBytes = doomed.fold<int>(0, (n, r) => n + r.sizeBytes);
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Delete every recording?'),
-        content: Text(
-          'Remove all ${_rows.length} clip(s) (${formatBytes(totalBytes)}). '
-          'Manual cards that reference any of these will lose their audio.',
-        ),
+        title: Text(doomed.length == 1
+            ? 'Delete recording?'
+            : 'Delete ${doomed.length} recordings?'),
+        content: Text(deleteConfirmBody(doomed.length, formatBytes(totalBytes))),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete all')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete')),
         ],
       ),
     );
     if (ok != true) return;
     setState(() => _busy = true);
-    if (_playingPath != null) {
+    // Stop playback before unlinking the file underneath the player.
+    if (_playingPath != null && _selectedPaths.contains(_playingPath)) {
       await _player.stop();
       _playingPath = null;
     }
     var removed = 0;
     var failed = 0;
-    for (final r in _rows) {
+    for (final r in doomed) {
+      // One bad file must not abandon the rest of the batch.
       try {
         await r.file.delete();
         removed++;
@@ -717,13 +751,14 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
     }
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(
-          failed == 0
-              ? 'Removed $removed recording(s)'
-              : 'Removed $removed — $failed failed',
-        )),
+        SnackBar(
+          content: Text(DeleteTally(removed: removed, failed: failed).message),
+        ),
       );
-      setState(() => _busy = false);
+      setState(() {
+        _busy = false;
+        _selectedPaths = <String>{};
+      });
     }
     await _reload();
   }
@@ -731,22 +766,49 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Voice recordings'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.delete_sweep_outlined),
-            tooltip: 'Delete all',
-            onPressed: (_busy || _rows.isEmpty) ? null : _deleteAll,
-          ),
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            tooltip: 'Reload',
-            onPressed: _busy ? null : _reload,
-          ),
-        ],
-      ),
+    final allSelected =
+        _rows.isNotEmpty && _selectedPaths.length >= _rows.length;
+    return PopScope(
+      // While selecting, back closes selection rather than the screen.
+      canPop: !_selecting,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _exitSelection();
+      },
+      child: Scaffold(
+      appBar: _selecting
+          ? AppBar(
+              leading: IconButton(
+                icon: const Icon(Icons.close),
+                tooltip: 'Cancel selection',
+                onPressed: _busy ? null : _exitSelection,
+              ),
+              title: Text('${_selectedPaths.length} selected'),
+              actions: [
+                IconButton(
+                  icon: Icon(allSelected
+                      ? Icons.deselect_outlined
+                      : Icons.select_all_outlined),
+                  tooltip: allSelected ? 'Select none' : 'Select all',
+                  onPressed: _busy ? null : _toggleSelectAll,
+                ),
+                IconButton(
+                  icon: Icon(Icons.delete_outline,
+                      color: theme.colorScheme.error),
+                  tooltip: 'Delete selected',
+                  onPressed: _busy ? null : _deleteSelected,
+                ),
+              ],
+            )
+          : AppBar(
+              title: const Text('Voice recordings'),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.refresh),
+                  tooltip: 'Reload',
+                  onPressed: _busy ? null : _reload,
+                ),
+              ],
+            ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : _rows.isEmpty
@@ -762,19 +824,36 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
                   itemBuilder: (ctx, i) {
                     final r = _rows[i];
                     final isPlaying = _playingPath == r.file.path;
+                    final isSelected = _selectedPaths.contains(r.file.path);
                     final total = _playingDuration.inMilliseconds;
                     final progress = (isPlaying && total > 0)
                         ? (_playingPosition.inMilliseconds / total).clamp(0.0, 1.0)
                         : null;
+                    // Play stays reachable while selecting — file names are
+                    // opaque ids and this screen can't say which card owns a
+                    // clip, so hearing it is the only way to identify it.
+                    final playButton = IconButton(
+                      icon: Icon(isPlaying
+                          ? Icons.stop_circle_outlined
+                          : Icons.play_circle_outline),
+                      color: isPlaying ? theme.colorScheme.primary : null,
+                      tooltip: isPlaying ? 'Stop' : 'Play',
+                      onPressed: _busy ? null : () => _togglePlay(r),
+                    );
                     return ListTile(
-                      leading: IconButton(
-                        icon: Icon(isPlaying
-                            ? Icons.stop_circle_outlined
-                            : Icons.play_circle_outline),
-                        color: isPlaying ? theme.colorScheme.primary : null,
-                        tooltip: isPlaying ? 'Stop' : 'Play',
-                        onPressed: _busy ? null : () => _togglePlay(r),
-                      ),
+                      selected: isSelected,
+                      onLongPress: _busy ? null : () => _toggleSelected(r),
+                      onTap: _selecting && !_busy
+                          ? () => _toggleSelected(r)
+                          : null,
+                      leading: _selecting
+                          ? Checkbox(
+                              value: isSelected,
+                              onChanged: _busy
+                                  ? null
+                                  : (_) => _toggleSelected(r),
+                            )
+                          : playButton,
                       title: Text(
                         r.name,
                         maxLines: 1,
@@ -801,14 +880,20 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
                           ],
                         ],
                       ),
-                      trailing: IconButton(
-                        icon: Icon(Icons.delete_outline, color: theme.colorScheme.error),
-                        tooltip: 'Delete',
-                        onPressed: _busy ? null : () => _deleteOne(r),
-                      ),
+                      // Per-row delete is redundant while selecting, so the
+                      // slot carries playback instead.
+                      trailing: _selecting
+                          ? playButton
+                          : IconButton(
+                              icon: Icon(Icons.delete_outline,
+                                  color: theme.colorScheme.error),
+                              tooltip: 'Delete',
+                              onPressed: _busy ? null : () => _deleteOne(r),
+                            ),
                     );
                   },
                 ),
+      ),
     );
   }
 

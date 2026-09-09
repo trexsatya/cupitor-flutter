@@ -357,7 +357,24 @@ class _IndexSettingsSheetState extends State<_IndexSettingsSheet> {
                 ),
               ],
             ],
-            const SizedBox(height: 16),
+            const SizedBox(height: 12),
+            ValueListenableBuilder<bool>(
+              valueListenable: SearchIndex.partialMatchEnabled,
+              builder: (_, on, __) => SwitchListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                value: on,
+                onChanged: (v) => SearchIndex.partialMatchEnabled.value = v,
+                title: const Text('Partial (substring) matching'),
+                subtitle: Text(
+                  on
+                      ? '`x` matches box, matrix, xylophone. `x y` → both x and y appear anywhere. Slower — bypasses the FTS5 tokenizer.'
+                      : 'Off: `x` matches x, xylophone (prefix). Exact whole-word hits are prioritised in snippets.',
+                  style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
             Text('Capacity',
                 style: theme.textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w600)),
             const SizedBox(height: 4),

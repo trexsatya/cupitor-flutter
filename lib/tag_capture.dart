@@ -5,6 +5,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:speech_to_text/speech_recognition_error.dart';
+import 'speech_hub.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'db.dart';
 import 'media_store.dart';
@@ -257,7 +259,14 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
   // Voice-input plumbing for the mask field. Listening is gated on the
   // mic button — initialize happens lazily on first tap so the sheet
   // doesn't request permissions you may never need.
-  final stt.SpeechToText _speech = stt.SpeechToText();
+  // The one process-wide recognizer. See SpeechHub.
+  stt.SpeechToText get _speech => SpeechHub.speech;
+  // Our claim on its callbacks, held only while this sheet owns the mic.
+  late final SpeechHubListener _speechHubListener = SpeechHubListener(
+    onSpeechStatus: _onSpeechStatus,
+    onSpeechError: _onSpeechError,
+    onSpeechLost: _onSpeechLost,
+  );
   bool _speechInitialized = false;
   bool _isListening = false;
   // True while the user wants the mic open. The speech_to_text plugin
@@ -752,14 +761,18 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
     _maskCtrl.dispose();
     _textScrollCtrl.dispose();
     _maskScrollCtrl.dispose();
+    SpeechHub.release(_speechHubListener);
     _micWatchdog?.cancel();
     // Release the mic so a later voice-input flow (or another app) can
     // grab it. cancel() over stop() — stop fires onResult one last time
     // and we're about to be destroyed.
     _continuousListen = false;
-    if (_isListening) {
-      _speech.cancel().catchError((_) {});
-    }
+    // Unconditional: the toggle-off path uses stop(), which arms the plugin's
+    // 2 s timer to promote the last partial. Closing the sheet inside that
+    // window would otherwise let the promoted result run our onResult and
+    // write to an already-disposed controller. cancel() kills that timer and
+    // is a no-op when nothing is running.
+    _speech.cancel().catchError((_) {});
     super.dispose();
   }
 
@@ -802,33 +815,11 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
     // listen() doesn't collide ("speech already started" / no-op).
     try { await _speech.stop(); } catch (_) {}
     try { await _speech.cancel(); } catch (_) {}
-    if (!_speechInitialized) {
-      try {
-        _speechInitialized = await _speech.initialize(
-          onStatus: (status) {
-            // Continuous loop: the plugin ends each utterance after a
-            // pause. While the user still wants the mic open, kick off
-            // a new listen() session.
-            if ((status == 'done' || status == 'notListening') &&
-                _continuousListen && mounted) {
-              _restartMaskListen();
-            }
-          },
-          onError: (_) {
-            // Don't tear down — just relaunch if the user still wants
-            // continuous capture. Common errors are transient (e.g.
-            // "no-speech-detected" timeouts).
-            if (_continuousListen && mounted) {
-              _restartMaskListen();
-            } else if (mounted) {
-              setState(() => _isListening = false);
-            }
-          },
-        );
-      } catch (_) {
-        _speechInitialized = false;
-      }
-    }
+    // Init and callbacks go through SpeechHub, not initialize() directly:
+    // the plugin only ever honours the first registration in the process, so
+    // whichever screen the user opened first would otherwise own the
+    // callbacks and this loop would never be told an utterance ended.
+    _speechInitialized = await SpeechHub.ensureInitialized();
     if (!_speechInitialized) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -846,6 +837,37 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
     _startMicWatchdog();
   }
 
+  /// Continuous loop: the plugin ends each utterance after a pause. While the
+  /// user still wants the mic open, kick off a new listen() session.
+  ///
+  /// 'done' only — 'notListening' arrives before the engine's final result,
+  /// so restarting on it resets the plugin's final-result timer and destroys
+  /// the utterance the user just spoke. The plugin always delivers 'done'
+  /// eventually, including when nothing was heard.
+  void _onSpeechStatus(String status) {
+    if (status != 'done') return;
+    if (_continuousListen && mounted) _restartMaskListen();
+  }
+
+  /// Don't tear down — just relaunch if the user still wants continuous
+  /// capture. Common errors are transient (e.g. "no-speech-detected").
+  void _onSpeechError(SpeechRecognitionError error) {
+    if (_continuousListen && mounted) {
+      _restartMaskListen();
+    } else if (mounted && _isListening) {
+      setState(() => _isListening = false);
+    }
+  }
+
+  /// Another feature took the mic. Stop the loop and reset the button rather
+  /// than sitting lit with no events coming.
+  void _onSpeechLost() {
+    _continuousListen = false;
+    _micWatchdog?.cancel();
+    _micWatchdog = null;
+    if (mounted && _isListening) setState(() => _isListening = false);
+  }
+
   void _startMicWatchdog() {
     _micWatchdog?.cancel();
     // Every 4 seconds, check the plugin's view of reality. If we think
@@ -861,6 +883,7 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
 
   Future<void> _startMaskListen() async {
     try {
+      SpeechHub.acquire(_speechHubListener);
       await _speech.listen(
         localeId: _speechLocale,
         partialResults: true,

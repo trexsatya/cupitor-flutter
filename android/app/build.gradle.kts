@@ -7,7 +7,11 @@ plugins {
 
 android {
     namespace = "org.satya.cupitor"
-    compileSdk = flutter.compileSdkVersion
+    // Pinned ahead of Flutter's default (3.32 ships 35). Google Play now
+    // requires new releases to target API 36, so both values are set here
+    // rather than inherited. Revisit when the Flutter SDK catches up and
+    // these can go back to flutter.compileSdkVersion / targetSdkVersion.
+    compileSdk = 36
     ndkVersion = "27.0.12077973"
 
     compileOptions {
@@ -31,7 +35,7 @@ android {
         // that only build for Android 7.0+). Flutter's default would be lower
         // but every device we target is well above this.
         minSdk = maxOf(flutter.minSdkVersion, 24)
-        targetSdk = flutter.targetSdkVersion
+        targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
@@ -96,6 +100,11 @@ dependencies {
     // owns audio (often the YT iframe's own internal session), and we have no
     // hook to add custom behavior like "repeat previous video".
     implementation("androidx.media:media:1.7.0")
+    // androidx.webkit — WebViewCompat.addDocumentStartJavaScript injects a
+    // script at document start into EVERY frame, including cross-origin ones
+    // that page JavaScript cannot touch at all. That is the only way to reach
+    // an e-book reader served from a different subdomain than its host page.
+    implementation("androidx.webkit:webkit:1.12.1")
     // Required by flutter_local_notifications 18 (core library desugaring,
     // see compileOptions above).
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")

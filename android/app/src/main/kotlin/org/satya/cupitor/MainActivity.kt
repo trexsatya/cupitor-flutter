@@ -37,6 +37,7 @@ class MainActivity : FlutterActivity() {
         private const val YTDLP_CHANNEL = "cupitor/ytdlp"
         private const val MEDIA_KEYS_CHANNEL = "cupitor/mediakeys"
         private const val PERMS_CHANNEL = "cupitor/perms"
+
         // Arbitrary request code for ActivityCompat.requestPermissions —
         // matched against onRequestPermissionsResult so we route the answer
         // back to the correct pending MethodChannel.Result.
@@ -297,6 +298,9 @@ class MainActivity : FlutterActivity() {
                     }
                     startNativeRecording(pathStem, result)
                 }
+                "installFrameScript" -> installFrameScript(
+                    call.argument<String>("script") ?: "", result
+                )
                 "stopNativeRecording" -> stopNativeRecording(result)
                 "cancelNativeRecording" -> cancelNativeRecording(result)
                 "isNativeRecording" -> result.success(nativeRecorder != null)
@@ -378,6 +382,72 @@ class MainActivity : FlutterActivity() {
         nativeRecorder = rec
         nativeRecorderPath = path
         result.success(path)
+    }
+
+    // ---- Document-start script, all frames ---------------------------------
+    //
+    // runJavaScript evaluates in the main frame only, and a cross-origin
+    // iframe cannot be touched from its parent document — so content inside an
+    // embedded reader served from another subdomain is unreachable from any
+    // page script. WebViewCompat.addDocumentStartJavaScript works below that
+    // boundary: it runs the script in every frame, at document start, before
+    // the frame's own scripts.
+    //
+    // Handlers are kept so a re-install replaces rather than stacks.
+    private val frameScriptHandlers = mutableListOf<androidx.webkit.ScriptHandler>()
+
+    private fun installFrameScript(script: String, result: MethodChannel.Result) {
+        if (script.isBlank()) { result.success("skipped: empty script"); return }
+        if (!androidx.webkit.WebViewFeature.isFeatureSupported(
+                androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            // Ships with the WebView, not the OS, so an old system WebView on a
+            // new Android is possible.
+            result.success("unsupported: this WebView has no DOCUMENT_START_SCRIPT")
+            return
+        }
+        val views = mutableListOf<android.webkit.WebView>()
+        try {
+            collectWebViews(window.decorView, views)
+        } catch (e: Exception) {
+            result.success("failed to scan views: " + (e.message ?: ""))
+            return
+        }
+        if (views.isEmpty()) {
+            // Flutter builds the platform view lazily; the caller retries.
+            result.success("no-webview")
+            return
+        }
+        for (h in frameScriptHandlers) {
+            try { h.remove() } catch (_: Exception) {}
+        }
+        frameScriptHandlers.clear()
+        var installed = 0
+        var failed = ""
+        for (v in views) {
+            try {
+                // "*" because an embedded reader can live on any host, and the
+                // script itself decides whether a given frame is interesting.
+                frameScriptHandlers.add(
+                    androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
+                        v, script, setOf("*")
+                    )
+                )
+                installed++
+            } catch (e: Exception) {
+                failed = e.message ?: e.toString()
+            }
+        }
+        result.success(
+            if (installed > 0) "installed into $installed webview(s)"
+            else "failed: $failed"
+        )
+    }
+
+    private fun collectWebViews(view: android.view.View, out: MutableList<android.webkit.WebView>) {
+        if (view is android.webkit.WebView) { out.add(view); return }
+        if (view is android.view.ViewGroup) {
+            for (i in 0 until view.childCount) collectWebViews(view.getChildAt(i), out)
+        }
     }
 
     private fun stopNativeRecording(result: MethodChannel.Result) {

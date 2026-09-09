@@ -73,11 +73,15 @@ Full-text search across every EPUB in the user's library. Hits are dispatched in
 PlaylistBridge.postMessage(JSON.stringify({
   op: 'globalSearch',
   query: 'cat|dog',      // see §5 for the query grammar
+  partial: false,        // optional — per-query override. Omit to use
+                         // the device Index Settings toggle. See §5.
 }));
 // Sometime later, many times:
 window.addEventListener('cupitorGlobalSearchResults', (ev) => {
-  const { query, hits, done, hits_capped, cancelled } = ev.detail;
-  // hits is a DELTA — append to your local accumulator
+  const { query, partial, hits, done, hits_capped, cancelled } = ev.detail;
+  // `partial` reflects the mode the hits were computed under —
+  // stable across the whole stream for this query.
+  // hits is a DELTA — append to your local accumulator.
 });
 ```
 Starting a new `globalSearch` implicitly cancels any prior one — the client typically ignores stale results by keying on `ev.detail.query`.
@@ -172,7 +176,7 @@ Send an authenticated GitHub API request through the host (avoids CORS for gh://
 
 ## 4. Dart → JS Events
 
-The host pushes state changes as `CustomEvent`s on `window`. Every event also stashes its detail on a `window.__cupitor…` global so listeners that attach late can still read the last value.
+The host pushes state changes as `CustomEvent`s on `window`. State-carrying events also stash their detail on a `window.__cupitor…` global so listeners that attach late can still read the last value; one-shot delivery events do not, as the "Global mirror" column below records.
 
 | Event | Global mirror | Fires when |
 |---|---|---|
@@ -182,6 +186,7 @@ The host pushes state changes as `CustomEvent`s on `window`. Every event also st
 | `cupitorMediaKey` | — | Headset/media key pressed (`{ detail: { key: 'play' \| 'pause' \| 'next' \| 'prev' } }`) |
 | `cupitorNotifAck` | payload-dependent | Response to a `NotifBridge` op |
 | `capturedSubtitle` | — | Host has a subtitle chunk to inject into your current view |
+| `cupitorCaptionCapture` | — | User sent selected caption lines from a video in the main WebView — see [caption-capture-integration-spec.md](caption-capture-integration-spec.md) |
 
 Idempotency: a `cupitor*` event may fire multiple times with the same content — always render off `event.detail`, never off transient state.
 
@@ -208,6 +213,8 @@ Deliberately small. No regex, no wildcards, no field:value syntax.
 - **Single-word phrases shorter than 3 chars are dropped** (`a`, `of`, `is`). Multi-word phrases are exempt — `is of` is honored.
 - Case and diacritics are folded by the tokenizer (`unicode61 remove_diacritics 2`).
 
+**Partial-match toggle** (§5.6). When ON, single-word `x` matches anywhere inside a word (`box`, `matrix`, `xylophone`); multi-word `x y` becomes AND-of-tokens where each token matches as substring (order and adjacency are ignored). When OFF (default), `x` matches whole word `x` and any word starting with `x`. **In both modes, exact whole-word hits are prioritised over prefix/partial hits in the snippet order** — so a chapter containing both `x` and `xylophone` shows the `x` snippets first.
+
 Examples:
 ```
 cat|dog
@@ -226,6 +233,9 @@ Results **stream**: the host dispatches one event per book-scan boundary while a
 // window.addEventListener('cupitorGlobalSearchResults', ev => …)
 type GlobalSearchPayload = {
   query: string;                 // the query that produced these hits
+  partial: boolean;              // effective mode for this search: true = ..x..
+                                 // included, false = whole/prefix only. Constant
+                                 // across every event of a single search.
   hits: GlobalSearchHit[];       // DELTA — hits found since the previous event
   done: boolean;                 // false while streaming, true on the closing event
   hits_capped: boolean;          // true if the 200-total-hit cap was reached
@@ -249,6 +259,15 @@ type GlobalSearchSnippet = {
   after: string;                 // ~48 chars of context on the right
 };
 ```
+
+**⚠ Rendering rule — do NOT re-tokenize the query when highlighting.**  
+The host has already resolved which span in this chapter matches; that span is `snippet.match`, sitting between `snippet.before` and `snippet.after`. Render the snippet as three concatenated segments and highlight only the middle one:
+
+```jsx
+<>…{snippet.before}<mark>{snippet.match}</mark>{snippet.after}…</>
+```
+
+Do NOT split the query on whitespace or `|` and highlight each token in `before` / `after` — an OR query like `foo|multi word phrase` will surface hits whose match is `foo`, whose context happens to contain the word `multi` or `phrase`. Highlighting those words in the context makes it look like results were returned for a partial substring of the multi-word phrase, when they weren't. If you want that behaviour, turn on partial matching explicitly (see §5.6) — don't fake it in the renderer.
 
 **Delta ordering guarantees**:
 - Delta events carrying the same `query` arrive in scan order.
@@ -324,9 +343,16 @@ The full-text index is user-configurable via the Global Search screen (app-bar �
 | Setting | Effect |
 |---|---|
 | Cap size (0 / 32 / 128 / 512 MB / 2 GB) | Soft cap on the on-disk index. Books evict LRU when the cap is reached. `0` disables the index entirely — every search falls back to a linear parse of every book. |
+| Partial (substring) matching | OFF (default): FTS5 word / prefix match. ON: substring-anywhere match on each token; multi-word phrases become AND-of-tokens (see grammar). Slower — bypasses the FTS5 tokenizer and scans every indexed chapter of a book for the query. Exact whole-word hits still sort before partial hits within a chapter's snippets. |
 | Clear index | Drop every row, keep the cap unchanged. |
 
-Persisted in SharedPreferences under `searchIndexCapacityBytes`. Default: 128 MB. The webapp does not currently control this — it's a device-local setting the user manages through the Cupitor app UI. If the language webapp needs to surface its state, that's a future addition.
+Persisted in SharedPreferences under `searchIndexCapacityBytes` and `searchIndexPartialMatch`. Defaults: 128 MB cap, partial OFF.
+
+**Webapp control**: the cap is device-local (app UI only). The partial-match flag has two paths:
+- **Device default** — user toggles in the Index Settings sheet; persists across sessions.
+- **Per-query override** — pass `partial: true|false` on the `globalSearch` op to force a mode for that one search without touching the device setting. Omit to use the device default.
+
+Every result event echoes back `partial: boolean` (the resolved mode) so the client can display a hint like "showing partial matches" without having to remember what it asked for.
 
 Performance note: cold first-search on a fresh install pays the parse cost — expect a few seconds for a library of 30 books. Every subsequent search hits the index directly and returns near-instantly. Streaming ordering doesn't change: books that finish first still emit their hits first, indexed or not.
 
@@ -532,11 +558,16 @@ watch(searchDone, (d) => {
 | 2026-08-02 | Initial spec — playlists, EPUB open, audio bridge, notif bridge, media state. Added: `globalSearch` op + `cupitorGlobalSearchResults` event. |
 | 2026-08-02 | `globalSearch` now streams: per-book delta events with `done: false`, final `done: true`. Added: `cancelSearch` op, `cancelled` flag on the closing event, `match` param on `openEpub` (highlight-on-open — reader lands with find bar prefilled and first match scrolled into view). |
 | 2026-08-02 | Added on-disk full-text index (SQLite FTS5) as the search backend. Query semantics shifted from case-insensitive substring to word / prefix match with case + diacritic folding (`cat` matches "cat"/"cats"/"cathedral"). Single-word phrases under 3 chars are dropped. Configurable via the app UI (0-2 GB cap with LRU eviction). Falls back to linear scan when the index is disabled or unavailable. |
+| 2026-08-03 | Added a "Partial (substring) matching" toggle in Index Settings. When ON, `x` matches anywhere inside a word (`box`, `matrix`); multi-word `x y` becomes AND-of-tokens. Off by default. Exact whole-word hits always sort before prefix/partial hits in a chapter's snippets, regardless of mode. Contract: `globalSearch` op accepts optional `partial: boolean` (per-query override); result events echo `partial: boolean` (effective mode, constant per stream). |
+| 2026-08-03 | Snippet-rendering rule made explicit in §5.1: highlight ONLY `snippet.match`, do not re-tokenize the query and highlight in `before`/`after`. Host-side: guarded the bridge listen callback with a monotonic subscription token so hits from a superseded search can't leak into the next query's buffer during the async cancellation window. |
+| 2026-09-06 | Added the `cupitorCaptionCapture` event (§4): selected caption lines from a video in the main WebView, delivered to dialog1 as an ordered, timed block flagged `source: 'caption'`. Full contract in [caption-capture-integration-spec.md](caption-capture-integration-spec.md). The webapp-side listener is not yet written. |
 
 ---
 
 ## 10. Open Questions / Future Work
 
+- **`SpeechBridge` (speech-to-text)**: the language webapp's manual-card editor has 🎤 dictation buttons on its Source and Target fields, feature-detected on `window.SpeechBridge` and hidden while the channel is unregistered. The webapp half is done; the host half is specified in [speech-bridge-spec.md](speech-bridge-spec.md) — a wrapper over the `speech_to_text` plugin the app already depends on.
+- **Caption capture**: the host and `snippet.js` halves are live — the user ticks caption lines in the subtitle sidebar over a playing video and the block arrives on dialog1 as `cupitorCaptionCapture`. The webapp half — listening for it and turning the block into manual playlist item(s) — is outstanding. Contract: [caption-capture-integration-spec.md](caption-capture-integration-spec.md).
 - **Snippet-precise highlight**: `openEpub` today highlights the phrase via the in-chapter find machinery. Threading `snippet.offset` through so the reader lands exactly on the matched occurrence (rather than the first find hit in the chapter) is a possible refinement — only matters when a chapter has many matches and the user tapped a specific snippet.
 - **Streaming pagination**: `hits_capped: true` means we stopped at 200 hits. A "keep going" op that resumes from where the previous scan stopped could let power users page through unbounded result sets. Not needed today.
 - **Webapp-controlled index config**: today the FTI cap / clear / disable UI lives only in the Cupitor app. If the language webapp wants to expose the same controls (e.g. a "Rebuild search index" button on its settings page), an `indexControl` op could be added — mostly a copy of `SearchIndex.setCapacity` / `SearchIndex.clear`.

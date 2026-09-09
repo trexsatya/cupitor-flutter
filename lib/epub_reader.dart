@@ -1038,11 +1038,25 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
       final p = ctrl.platform;
       if (p is AndroidWebViewController) {
         p.setMediaPlaybackRequiresUserGesture(false);
+        // The reader's own HTML declares `width=device-width, initial-scale=1`
+        // but webview_flutter_android defaults to useWideViewPort=false, which
+        // makes the WebView ignore it and zoom the page out to fit its widest
+        // box. See _configureAndroidWebView in main.dart for why that breaks
+        // touch scrolling.
+        p.setUseWideViewPort(true);
       }
     }
     _controller = ctrl;
     setState(() => _ready = true);
-    await _loadChapter(_state.chapterIdx, restoreScroll: true);
+    // When opened via a deep-link highlight (global search / webapp
+    // match link), the highlight-scroll owns final positioning — so
+    // skip restore and force scrollPct=0. This neutralises a race where
+    // a still-open previous reader instance's debounced save could
+    // overwrite the fresh scrollPct=0.0 that main.dart just wrote,
+    // causing the second-click flow to jump past the target match.
+    final hasPending = _pendingHighlight != null && _pendingHighlight!.isNotEmpty;
+    if (hasPending) _state.scrollPct = 0.0;
+    await _loadChapter(_state.chapterIdx, restoreScroll: !hasPending);
   }
 
   // ─── Chapter loading ───────────────────────────────────────────────────
@@ -1189,6 +1203,12 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
           if (hl != null && hl.isNotEmpty) {
             _pendingHighlight = null;
             _applyInitialHighlight(hl);
+          } else if (_findBarVisible && _findController.text.isNotEmpty) {
+            // Chapter changed while the find bar was still open — the
+            // fresh HTML has no wrapped hits, so re-apply the current
+            // query against the new DOM. Otherwise Up/Down step against
+            // an empty findHits[] and become silent no-ops.
+            _findInChapter(_findController.text);
           }
           break;
         case 'highlightTap':
@@ -3722,22 +3742,48 @@ $chapterHtml
   // Skipped in paginated mode (browser scroll-snap handles page turns
   // natively; end-of-chapter still routes through navStart/navEnd).
   // Skipped when a text selection exists, capture mode is armed, or
-  // more than one touch is down (pinch/zoom). Threshold: 60 px of
-  // horizontal travel, mostly horizontal (dx >= 1.5 * dy), completed
-  // in under 800 ms — same envelope users get from a natural page-turn
-  // flick without hijacking accidental drags.
-  var swipeStartX = 0, swipeStartY = 0, swipeStartTs = 0, swipeMulti = false;
+  // more than one touch is down (pinch/zoom).
+  //
+  // Classifier envelope — all four must hold at touchend:
+  //   • Not previously locked to scroll by touchmove.
+  //   • ≥ 60 px horizontal travel.
+  //   • Horizontal-dominant (|dx| ≥ 1.5 · |dy|).
+  //   • Completed in ≤ 500 ms.
+  //   • Average horizontal speed ≥ 0.4 px/ms (~400 px/s).
+  //
+  // The velocity gate + scroll-lock together filter out slow drags that
+  // pass the geometric checks but were never a flick — users reported
+  // holding a scroll a "bit longer" would flip chapters. Fast page-turn
+  // flicks stay under both bounds easily.
+  var swipeStartX = 0, swipeStartY = 0, swipeStartTs = 0;
+  var swipeMulti = false, swipeScrolled = false;
   document.addEventListener('touchstart', function(ev) {
     if (ev.touches && ev.touches.length > 1) { swipeMulti = true; return; }
     swipeMulti = false;
+    swipeScrolled = false;
     if (ev.touches && ev.touches[0]) {
       swipeStartX = ev.touches[0].clientX;
       swipeStartY = ev.touches[0].clientY;
       swipeStartTs = Date.now();
     }
   }, { passive: true });
+  document.addEventListener('touchmove', function(ev) {
+    if (swipeMulti || swipeScrolled) return;
+    var t = ev.touches && ev.touches[0];
+    if (!t) return;
+    var dx = t.clientX - swipeStartX;
+    var dy = t.clientY - swipeStartY;
+    // Vertical-dominant travel of any real magnitude means the user is
+    // scrolling, not swiping. Lock out the classifier for the rest of
+    // this touch so a later horizontal drift can't retro-trigger a page
+    // turn.
+    if (Math.abs(dy) > 24 && Math.abs(dy) > Math.abs(dx)) {
+      swipeScrolled = true;
+    }
+  }, { passive: true });
   document.addEventListener('touchend', function(ev) {
     if (swipeMulti) { swipeMulti = false; return; }
+    if (swipeScrolled) return;
     if (document.body.classList.contains('cup-paginated')) return;
     if (window.__cupitorCaptureMode) return;
     if (window.__cupitorPlaylistCaptureMode) return;
@@ -3748,10 +3794,11 @@ $chapterHtml
     var dx = t.clientX - swipeStartX;
     var dy = t.clientY - swipeStartY;
     var dt = Date.now() - swipeStartTs;
-    if (dt > 800) return;
+    if (dt <= 0 || dt > 500) return;
     var adx = Math.abs(dx), ady = Math.abs(dy);
     if (adx < 60) return;
     if (adx < ady * 1.5) return;
+    if (adx / dt < 0.4) return;
     if (dx < 0) post({ type: 'swipeLeft' });
     else post({ type: 'swipeRight' });
   }, { passive: true });
@@ -4069,6 +4116,13 @@ $chapterHtml
     });
     findHits = []; findIdx = -1;
   }
+  // Suppress the navEnd boundary check briefly whenever the find helpers
+  // do a `scrollIntoView` — a smooth scroll started at the chapter
+  // bottom would otherwise fire navEnd on its first tick and bounce the
+  // reader to the next chapter instead of wrapping/stepping the hit.
+  function _guardFindScroll() {
+    programmaticScrollUntil = Date.now() + 1500;
+  }
   window.__cupEpubFind = function(q) {
     clearFind();
     if (!q) { post({ type: 'findCount', count: 0 }); return; }
@@ -4112,6 +4166,7 @@ $chapterHtml
     if (findHits.length > 0) {
       findIdx = 0;
       findHits[0].classList.add('cup-find-current');
+      _guardFindScroll();
       findHits[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   };
@@ -4121,6 +4176,7 @@ $chapterHtml
     findIdx = (findIdx + dir + findHits.length) % findHits.length;
     var el = findHits[findIdx];
     el.classList.add('cup-find-current');
+    _guardFindScroll();
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
   };
 })();

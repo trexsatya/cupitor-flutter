@@ -136,9 +136,17 @@ class GlobalSearch {
   static const int _maxSnippetsPerChapter = 3;
   static const int _snippetContext = 48;
 
+  /// Stream a global search across the library.
+  ///
+  /// [partialOverride] overrides the device-level
+  /// [SearchIndex.partialMatchEnabled] setting for this one call. Pass
+  /// `null` (the default) to use the user's app-level toggle. Non-null
+  /// values let the webapp bridge force one mode per query without
+  /// mutating global state.
   static Stream<GlobalSearchEvent> search(
     String rawQuery, {
     int maxTotalHits = 200,
+    bool? partialOverride,
   }) async* {
     final q = GlobalSearchQuery.parse(rawQuery);
     if (q.isEmpty) return;
@@ -160,7 +168,11 @@ class GlobalSearch {
     ));
 
     final indexOn = SearchIndex.isAvailable && SearchIndex.capacityBytes.value > 0;
-    final ftsQuery = indexOn ? buildFts5MatchQuery(q.phrases) : '';
+    final partial = partialOverride ?? SearchIndex.partialMatchEnabled.value;
+    // Prefix path uses FTS5 MATCH; partial path bypasses the tokenizer
+    // and does substring filtering on stored chapter text. Both still
+    // go through the index for the on-disk chapter cache.
+    final ftsQuery = (indexOn && !partial) ? buildFts5MatchQuery(q.phrases) : '';
 
     for (final entry in entries) {
       if (hitsEmitted >= maxTotalHits) break;
@@ -168,11 +180,12 @@ class GlobalSearch {
       List<GlobalSearchHit> bookHits = const [];
       var handled = false;
 
-      if (indexOn && ftsQuery.isNotEmpty) {
+      if (indexOn && (partial || ftsQuery.isNotEmpty)) {
         handled = await _searchViaIndex(
           entry: entry,
           query: q,
           ftsQuery: ftsQuery,
+          partial: partial,
           maxTotal: maxTotalHits,
           alreadyEmitted: hitsEmitted,
           into: (hit) {
@@ -184,17 +197,28 @@ class GlobalSearch {
       if (!handled) {
         // Fallback: linear parse + strip + substring match. Used when
         // the index is disabled, unavailable, or when indexing this
-        // book failed (e.g. the file moved on disk).
+        // book failed (e.g. the file moved on disk). Honours the same
+        // partial-toggle contract as the indexed path — chapter filter
+        // and snippet extraction differ by mode.
         final book = await _tryOpen(entry);
         if (book != null) {
+          final tokens = partial ? _expandPartialTokens(q.phrases) : q.phrases;
           for (var i = 0; i < book.chapters.length; i++) {
             if (hitsEmitted + bookHits.length >= maxTotalHits) break;
             final ch = book.chapters[i];
             final text = _extractText(ch.html);
             if (text.isEmpty) continue;
             final lower = text.toLowerCase();
-            if (!q.matchesLower(lower)) continue;
-            final snippets = _collectSnippets(text, lower, q.phrases);
+            final matched = partial
+                ? _partialChapterMatches(lower, q.phrases)
+                : q.matchesLower(lower);
+            if (!matched) continue;
+            final snippets = _collectSnippets(
+              text,
+              lower,
+              tokens,
+              allowSubstring: partial,
+            );
             if (snippets.isEmpty) continue;
             bookHits = [
               ...bookHits,
@@ -236,10 +260,16 @@ class GlobalSearch {
   /// index path handled the book (regardless of hit count). Returns
   /// false if we couldn't index it, so the caller falls back to a
   /// linear scan.
+  ///
+  /// When [partial] is true, the FTS5 tokenizer is bypassed: every
+  /// indexed chapter for the book is scanned via case-insensitive
+  /// substring match. Multi-word phrases become AND-of-tokens (each
+  /// whitespace-separated token must appear somewhere).
   static Future<bool> _searchViaIndex({
     required EpubLibraryEntry entry,
     required GlobalSearchQuery query,
     required String ftsQuery,
+    required bool partial,
     required int maxTotal,
     required int alreadyEmitted,
     required void Function(GlobalSearchHit) into,
@@ -265,6 +295,33 @@ class GlobalSearch {
 
     final remaining = maxTotal - alreadyEmitted;
     if (remaining <= 0) return true;
+
+    if (partial) {
+      // Substring path: pull every chapter for this book from the
+      // index (saves re-parsing the EPUB from disk) and filter in
+      // Dart. Slower than FTS5 but honours ..x.. / x.. / ..x
+      // simultaneously.
+      final all = await SearchIndex.chaptersForBook(bookKey);
+      var kept = 0;
+      for (final m in all) {
+        if (kept >= remaining) break;
+        final lower = m.text.toLowerCase();
+        if (!_partialChapterMatches(lower, query.phrases)) continue;
+        final tokens = _expandPartialTokens(query.phrases);
+        final snippets = _collectSnippets(m.text, lower, tokens, allowSubstring: true);
+        if (snippets.isEmpty) continue;
+        into(GlobalSearchHit(
+          bookKey: m.bookKey,
+          bookTitle: bookTitle,
+          chapterIdx: m.chapterIdx,
+          chapterTitle: m.chapterTitle,
+          snippets: snippets,
+        ));
+        kept++;
+      }
+      return true;
+    }
+
     final matches = await SearchIndex.queryBook(
       fts5Query: ftsQuery,
       bookKey: bookKey,
@@ -272,32 +329,24 @@ class GlobalSearch {
     );
     for (final m in matches) {
       final lower = m.text.toLowerCase();
-      final snippets = _collectSnippets(m.text, lower, query.phrases);
-      if (snippets.isEmpty) {
-        // FTS5 matched at the tokenizer level (e.g. adjacent tokens
-        // with punctuation between them) but our substring extractor
-        // didn't find the phrase. Fall back to a leading excerpt so
-        // the row still renders something meaningful.
-        final head = m.text.length > _snippetContext * 2
-            ? m.text.substring(0, _snippetContext * 2)
-            : m.text;
-        into(GlobalSearchHit(
-          bookKey: m.bookKey,
-          bookTitle: bookTitle,
-          chapterIdx: m.chapterIdx,
-          chapterTitle: m.chapterTitle,
-          snippets: [
-            GlobalSearchSnippet(
-              phrase: query.phrases.first,
-              offset: 0,
-              before: '',
-              match: '',
-              after: head,
-            ),
-          ],
-        ));
-        continue;
-      }
+      // Prefix mode: FTS5 gave us a chapter that contains SOMETHING
+      // matching `"phrase"*`, but the substring scan below would
+      // otherwise light up ..x.. occurrences too (e.g. `x` inside
+      // `matrix` if the chapter also contains `xylophone`). Restrict to
+      // word-start matches so only whole-word / prefix snippets survive
+      // — that's what the toggle-off contract says.
+      final snippets = _collectSnippets(m.text, lower, query.phrases, allowSubstring: false);
+      // If nothing came back, skip the chapter. Previously we emitted a
+      // synthetic "leading excerpt" snippet blindly attributed to
+      // `phrases.first`, which caused an OR query like
+      // `"multi word phrase|other"` to surface hits mislabelled as the
+      // multi-word phrase when the actual FTS5 match was for `other`
+      // (or when the multi-word phrase matched at the tokenizer level
+      // but our substring extractor was thwarted by punctuation between
+      // tokens). Dropping the fallback trades a rare edge-case (a
+      // legit-but-punctuation-split phrase silently missed) for
+      // eliminating a consistent source of misattributed results.
+      if (snippets.isEmpty) continue;
       into(GlobalSearchHit(
         bookKey: m.bookKey,
         bookTitle: bookTitle,
@@ -309,27 +358,97 @@ class GlobalSearch {
     return true;
   }
 
+  /// Partial-mode chapter filter: chapter matches if ANY phrase has
+  /// ALL of its whitespace-separated tokens present as substrings.
+  /// Consistent with the OR-across-phrases / AND-within-phrase model.
+  static bool _partialChapterMatches(String textLower, List<String> phrases) {
+    for (final p in phrases) {
+      final tokens = p.split(_reSpace).where((t) => t.isNotEmpty).toList();
+      if (tokens.isEmpty) continue;
+      var allPresent = true;
+      for (final t in tokens) {
+        if (!textLower.contains(t)) { allPresent = false; break; }
+      }
+      if (allPresent) return true;
+    }
+    return false;
+  }
+
+  /// Flatten multi-word phrases into their individual tokens so the
+  /// snippet extractor can locate each token independently. Duplicates
+  /// removed; original order preserved.
+  static List<String> _expandPartialTokens(List<String> phrases) {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final p in phrases) {
+      for (final t in p.split(_reSpace)) {
+        final s = t.trim();
+        if (s.isEmpty) continue;
+        if (seen.add(s)) out.add(s);
+      }
+    }
+    return out;
+  }
+
+  static final RegExp _reSpace = RegExp(r'\s+');
+
+  /// Extract snippets around every occurrence of every phrase.
+  ///
+  /// [allowSubstring] gates whether matches inside a word are kept:
+  ///   - `false` (prefix mode, toggle OFF): only word-start matches
+  ///     survive. `x` in `matrix` is dropped; `x` in `xylophone` is
+  ///     kept (prefix); `x` alone is kept (whole).
+  ///   - `true` (partial mode, toggle ON): every occurrence is kept,
+  ///     including in-word ones.
+  ///
+  /// In both modes, exact whole-word matches sort BEFORE prefix /
+  /// substring ones so users see the strongest matches first.
   static List<GlobalSearchSnippet> _collectSnippets(
     String text,
     String textLower,
-    List<String> phrases,
-  ) {
+    List<String> phrases, {
+    required bool allowSubstring,
+  }) {
     final positions = <_Match>[];
     for (final p in phrases) {
       var from = 0;
-      while (positions.length < _maxSnippetsPerChapter * phrases.length) {
+      while (positions.length < _maxSnippetsPerChapter * phrases.length * 2) {
         final at = textLower.indexOf(p, from);
         if (at < 0) break;
-        positions.add(_Match(offset: at, phrase: p, length: p.length));
+        final leftBoundary = _isLeftBoundary(text, at);
+        final rightBoundary = _isRightBoundary(text, at + p.length);
+        if (!allowSubstring && !leftBoundary) {
+          // Prefix mode: skip matches that start inside a word.
+          from = at + p.length;
+          continue;
+        }
+        positions.add(_Match(
+          offset: at,
+          phrase: p,
+          length: p.length,
+          isWhole: leftBoundary && rightBoundary,
+        ));
         from = at + p.length;
       }
     }
+    // Original text order for de-duplication of overlapping matches.
     positions.sort((a, b) => a.offset.compareTo(b.offset));
-    final out = <GlobalSearchSnippet>[];
+    final byPos = <_Match>[];
     var minNext = 0;
     for (final m in positions) {
-      if (out.length >= _maxSnippetsPerChapter) break;
       if (m.offset < minNext) continue;
+      byPos.add(m);
+      minNext = m.offset + m.length + _snippetContext;
+    }
+    // Exact-whole-word matches first, then prefix/partial. Stable
+    // within each group so the natural reading order is preserved.
+    byPos.sort((a, b) {
+      if (a.isWhole == b.isWhole) return a.offset.compareTo(b.offset);
+      return a.isWhole ? -1 : 1;
+    });
+    final out = <GlobalSearchSnippet>[];
+    for (final m in byPos) {
+      if (out.length >= _maxSnippetsPerChapter) break;
       final start = (m.offset - _snippetContext).clamp(0, text.length);
       final end = (m.offset + m.length + _snippetContext).clamp(0, text.length);
       out.add(GlobalSearchSnippet(
@@ -339,10 +458,17 @@ class GlobalSearch {
         match: text.substring(m.offset, m.offset + m.length),
         after: text.substring(m.offset + m.length, end),
       ));
-      minNext = m.offset + m.length + _snippetContext;
     }
     return out;
   }
+
+  static bool _isLeftBoundary(String text, int offset) =>
+      offset == 0 || !_reWordChar.hasMatch(text[offset - 1]);
+
+  static bool _isRightBoundary(String text, int end) =>
+      end >= text.length || !_reWordChar.hasMatch(text[end]);
+
+  static final RegExp _reWordChar = RegExp(r'[\p{L}\p{M}\p{N}_]', unicode: true);
 
   static Future<EpubBook?> _tryOpen(EpubLibraryEntry entry) async {
     try {
@@ -384,7 +510,16 @@ class _Match {
   final int offset;
   final String phrase;
   final int length;
-  const _Match({required this.offset, required this.phrase, required this.length});
+  /// True when the match span is bounded by non-word characters (or
+  /// text edges) — i.e. a whole-word hit, not a prefix/substring of a
+  /// longer token. Drives exact-first snippet ordering.
+  final bool isWhole;
+  const _Match({
+    required this.offset,
+    required this.phrase,
+    required this.length,
+    required this.isWhole,
+  });
 }
 
 abstract class GlobalSearchEvent {
