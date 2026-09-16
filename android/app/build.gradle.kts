@@ -1,8 +1,23 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+// Release signing credentials, read from android/key.properties — which is
+// gitignored (android/.gitignore) and must stay that way: it holds the keystore
+// passwords in clear text. When the file is absent (a fresh clone, or CI
+// without secrets) release falls back to the debug keys, so
+// `flutter run --release` still works for anyone without the key. Only a build
+// signed with the real key can be uploaded to Play.
+val keystorePropertiesFile = rootProject.file("key.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
 }
 
 android {
@@ -40,11 +55,29 @@ android {
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        // Declared only when key.properties is present. An all-null signing
+        // config is worse than none: AGP accepts it at configuration time and
+        // then fails deep inside packaging with a far less obvious message.
+        if (keystorePropertiesFile.exists()) {
+            create("release") {
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                storeFile = keystoreProperties.getProperty("storeFile")?.let { file(it) }
+                storePassword = keystoreProperties.getProperty("storePassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            // Real upload key when key.properties exists, debug keys otherwise
+            // — see the note at the top of this file.
+            signingConfig = if (keystorePropertiesFile.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             // R8 OFF for release.
             //
             // youtubedl-android bundles three layers that R8 can't reason
@@ -108,4 +141,8 @@ dependencies {
     // Required by flutter_local_notifications 18 (core library desugaring,
     // see compileOptions above).
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    // JVM unit tests for the Android-free logic in LocalMedia.kt — the guard
+    // deciding which file a web request may have, and the Range parser.
+    // Run with: ./gradlew :app:testDebugUnitTest
+    testImplementation("junit:junit:4.13.2")
 }

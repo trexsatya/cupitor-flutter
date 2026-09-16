@@ -28,6 +28,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.io.RandomAccessFile
 import java.io.File
 
 class MainActivity : FlutterActivity() {
@@ -130,6 +131,10 @@ class MainActivity : FlutterActivity() {
 
     // Channel reference kept so AdBlockWebViewClient can send auto-detected events back to Dart.
     private var adBlockChannel: MethodChannel? = null
+
+    // Kept for the same reason: RenderGuardClient has to reach Dart from a
+    // callback, long after configureFlutterEngine's local scope is gone.
+    private var permsChannel: MethodChannel? = null
 
     // Hosts already surfaced to Dart this page-load — prevents re-notifying for the same host.
     // Accessed from both the intercept thread (background) and main thread, so backed by a
@@ -278,6 +283,7 @@ class MainActivity : FlutterActivity() {
         // recorder appears broken. Dart calls into here to make sure the
         // OS-level grant is in place before granting the WebView request.
         val permsChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PERMS_CHANNEL)
+        this.permsChannel = permsChannel
         permsChannel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "requestMicrophone" -> requestMicPermission(result)
@@ -301,9 +307,13 @@ class MainActivity : FlutterActivity() {
                 "installFrameScript" -> installFrameScript(
                     call.argument<String>("script") ?: "", result
                 )
+                "installRenderGuard" -> installRenderGuard(result)
+                "attachLocalMedia" -> attachLocalMedia(call.argument<String>("dir"), result)
                 "stopNativeRecording" -> stopNativeRecording(result)
                 "cancelNativeRecording" -> cancelNativeRecording(result)
                 "isNativeRecording" -> result.success(nativeRecorder != null)
+                "lastExitInfo" -> result.success(lastExitInfo())
+                "memoryBreakdown" -> result.success(memoryBreakdown())
                 "shareText" -> {
                     val text = call.argument<String>("text") ?: ""
                     val chooserTitle = call.argument<String>("chooserTitle") ?: "Share"
@@ -318,6 +328,178 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    // ---- Where is the memory actually going? -------------------------------
+    //
+    // A process dying at ~1 GB RSS tells you the size but not the owner, and
+    // guessing the owner from the code has a bad track record. This is the
+    // same breakdown `adb shell dumpsys meminfo` prints, read from inside the
+    // app so it works on a device where developer options are blocked.
+    //
+    // Which bucket grows is what identifies the culprit:
+    //   native-heap  → a native library (ML Kit / TFLite, audio, youtubedl)
+    //   graphics     → GPU textures, Flutter's raster cache, WebView layers
+    //   java-heap    → Dart/Java objects
+    //   code         → mapped .so / .dex, roughly constant
+    // Values are kB, as the platform reports them.
+    // Measured for EVERY process the app owns, not just this one. The WebView
+    // renderer is a separate process (<package>:sandboxed_process*), and
+    // anything the page holds — IndexedDB records read into JS, blobs, big
+    // strings — is charged to it, not to us. Sampling only our own pid would
+    // therefore report a healthy app while the process that is actually
+    // growing goes unseen. getRunningAppProcesses returns only the caller's
+    // own processes on modern Android, which is exactly the set we want.
+    private fun memoryBreakdown(): List<Map<String, Any?>> {
+        val am = getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                as? android.app.ActivityManager ?: return emptyList()
+        val procs = try {
+            am.runningAppProcesses ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+        // Always include ourselves, even if the query above came back empty.
+        val byPid = linkedMapOf(android.os.Process.myPid() to (packageName ?: "self"))
+        for (p in procs) byPid[p.pid] = p.processName
+        val pids = byPid.keys.toIntArray()
+        val infos = try {
+            am.getProcessMemoryInfo(pids)
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        val out = mutableListOf<Map<String, Any?>>()
+        for ((i, pid) in pids.withIndex()) {
+            val mi = infos?.getOrNull(i) ?: continue
+            // getMemoryStat is API 23+, so safe at minSdk 24. It returns
+            // decimal strings, and null for a key the platform withholds.
+            fun stat(key: String): Int =
+                try { mi.getMemoryStat(key)?.toIntOrNull() ?: 0 } catch (e: Exception) { 0 }
+            // ApplicationExitInfo reports RSS, the memory summary reports PSS,
+            // and they differ by a lot — RSS counts every resident page
+            // including shared system libraries, PSS only a proportional
+            // share. Reporting PSS alone makes a live sample look tiny next to
+            // a crash record and invites a false conclusion. /proc is hidden
+            // for other processes on modern Android, so reconstruct RSS from
+            // the parts instead: it is the sum of the four resident buckets.
+            val rss = mi.totalPrivateDirty + mi.totalPrivateClean +
+                      mi.totalSharedDirty + mi.totalSharedClean
+            out.add(mapOf(
+                "pid" to pid,
+                "name" to (byPid[pid] ?: ""),
+                "rss" to rss,
+                "totalPss" to stat("summary.total-pss"),
+                "javaHeap" to stat("summary.java-heap"),
+                "nativeHeap" to stat("summary.native-heap"),
+                "graphics" to stat("summary.graphics"),
+                "code" to stat("summary.code"),
+                "privateOther" to stat("summary.private-other"),
+            ))
+        }
+        return out
+    }
+
+    // ---- Why did we die last time? ----------------------------------------
+    //
+    // Some process deaths leave no crash report anywhere. The one that matters
+    // here: every WebView in the app shares ONE sandboxed renderer process, and
+    // WebViewClient.onRenderProcessGone decides what happens when it dies.
+    // Returning false — which is the default, and which webview_flutter_android
+    // never overrides — means "crash the app if the renderer crashed, kill it
+    // if the system killed the renderer". A kill raises no Java exception and
+    // writes no tombstone, so Play Console's crash vitals never hear about it
+    // and the app just seems to vanish.
+    //
+    // ActivityManager is the one place that records the real reason. Reading it
+    // at startup is the only way to see these deaths from inside the app.
+    // API 30+ only; older platforms get an empty list and no diagnosis.
+    private fun lastExitInfo(): List<Map<String, Any?>> {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) {
+            return emptyList()
+        }
+        return exitInfoSinceR()
+    }
+
+    @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.R)
+    private fun exitInfoSinceR(): List<Map<String, Any?>> {
+        val am = getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                as? android.app.ActivityManager ?: return emptyList()
+        // 0 = any pid, 8 = the last eight deaths. The system keeps a bounded
+        // ring per package, so this is everything available.
+        val records = try {
+            am.getHistoricalProcessExitReasons(packageName, 0, 8)
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        return records.map { info ->
+            mapOf(
+                "reason" to info.reason,
+                "reasonName" to exitReasonName(info.reason),
+                // For REASON_SIGNALED this is the signal number, for
+                // REASON_EXIT_SELF the exit status. Meaningless otherwise.
+                "status" to info.status,
+                "importance" to info.importance,
+                "pss" to info.pss,
+                "rss" to info.rss,
+                "timestamp" to info.timestamp,
+                "description" to info.description,
+                "processName" to info.processName,
+                // The tombstone. Android exposes it ONLY for native crashes
+                // and ANRs, and only through here — an app cannot read its own
+                // tombstone from /data/tombstones. This is what names the
+                // signal and the crashing library, so it is the whole reason
+                // a native crash is diagnosable without adb.
+                "trace" to traceOf(info),
+            )
+        }
+    }
+
+    /// Raw trace bytes for a native crash or ANR, capped so a huge tombstone
+    /// cannot blow up the platform channel. Null for every other exit reason.
+    ///
+    /// Returned as BYTES on purpose. The two formats here are not the same:
+    /// an ANR trace is text, but a native-crash tombstone is a protobuf
+    /// (Android 12+ is where native tombstones became readable by the app at
+    /// all). Decoding either as a string throws away the other, so hand the
+    /// bytes up and let the caller decide how to read them.
+    @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.R)
+    private fun traceOf(info: android.app.ApplicationExitInfo): ByteArray? {
+        return try {
+            info.traceInputStream?.use { stream ->
+                val out = java.io.ByteArrayOutputStream()
+                val buf = ByteArray(16 * 1024)
+                var total = 0
+                while (total < 512 * 1024) {
+                    val n = stream.read(buf)
+                    if (n <= 0) break
+                    out.write(buf, 0, n)
+                    total += n
+                }
+                if (total == 0) null else out.toByteArray()
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.R)
+    private fun exitReasonName(reason: Int): String = when (reason) {
+        android.app.ApplicationExitInfo.REASON_ANR -> "ANR"
+        android.app.ApplicationExitInfo.REASON_CRASH -> "CRASH-java"
+        android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH-native"
+        // The renderer dying can surface as this one: the app depended on a
+        // child process that went away.
+        android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "DEPENDENCY_DIED"
+        android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "EXCESSIVE_RESOURCE_USAGE"
+        android.app.ApplicationExitInfo.REASON_EXIT_SELF -> "EXIT_SELF"
+        android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "INITIALIZATION_FAILURE"
+        android.app.ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY"
+        android.app.ApplicationExitInfo.REASON_OTHER -> "OTHER"
+        android.app.ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "PERMISSION_CHANGE"
+        android.app.ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED"
+        android.app.ApplicationExitInfo.REASON_UNKNOWN -> "UNKNOWN"
+        android.app.ApplicationExitInfo.REASON_USER_REQUESTED -> "USER_REQUESTED"
+        android.app.ApplicationExitInfo.REASON_USER_STOPPED -> "USER_STOPPED"
+        else -> "reason=$reason"
     }
 
     // ---- Native MediaRecorder ----
@@ -448,6 +630,212 @@ class MainActivity : FlutterActivity() {
         if (view is android.view.ViewGroup) {
             for (i in 0 until view.childCount) collectWebViews(view.getChildAt(i), out)
         }
+    }
+
+    // ---- Stacking two WebViewClient wrappers safely ------------------------
+    //
+    // The app wraps each WebView's client twice, for unrelated reasons: once to
+    // block ad hosts, once to survive a dead renderer. Both are installed
+    // repeatedly (ad-block on every onPageFinished, the guard on every dialog
+    // open), so each must be able to tell whether ITS OWN wrapper is already
+    // present. Checking only the outermost client is not enough — the other
+    // wrapper is then mistaken for "not mine", and the two re-wrap each other
+    // forever: AB(RG(AB(RG(plugin)))) after two navigations, deeper after
+    // every one that follows. Exposing the delegate link makes the question
+    // answerable about the whole chain instead of just its top.
+    private interface ChainedWebViewClient {
+        val innerClient: WebViewClient
+    }
+
+    private fun chainHas(client: WebViewClient?, cls: Class<*>): Boolean {
+        var c: WebViewClient? = client
+        // Bounded rather than while(true): a cycle here would hang the UI
+        // thread, and no legitimate chain is more than a couple of links.
+        var hops = 0
+        while (c != null && hops++ < 8) {
+            if (cls.isInstance(c)) return true
+            c = (c as? ChainedWebViewClient)?.innerClient
+        }
+        return false
+    }
+
+    // ---- Surviving a dead WebView renderer ---------------------------------
+    //
+    // Every WebView in the app shares ONE sandboxed renderer process. When that
+    // process dies — the system reclaiming it under memory pressure, or it
+    // crashing on its own — WebViewClient.onRenderProcessGone decides what
+    // happens next, and the DEFAULT is to take the whole app down with it.
+    // webview_flutter_android subclasses WebViewClient but never overrides
+    // that method, so out of the box a renderer death is an unrecoverable
+    // native crash in the APP process. That is what the CRASH-native / SIGTRAP
+    // records with libwebviewchromium on the stack are.
+    //
+    // Returning true instead makes the death survivable. Two consequences the
+    // caller has to honour:
+    //   * The WebView is unusable afterwards. It cannot be reloaded, only
+    //     replaced. Dart owns every controller, so Dart does the replacing.
+    //   * Tearing the view out of the hierarchy here would be fighting Flutter
+    //     for ownership of a platform view, so this deliberately does NOT
+    //     remove or destroy it. Disposing the widget on the Dart side is what
+    //     releases it, through the path Flutter already knows about.
+    //
+    // API 26 is the floor for the whole feature: onRenderProcessGone,
+    // getWebViewClient() and setRendererPriorityPolicy all arrived there.
+    // Below it the guard is a no-op and the old behaviour stands.
+    private fun installRenderGuard(result: MethodChannel.Result) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            result.success("unsupported: needs API 26")
+            return
+        }
+        // allWebViews(), not a decorView walk: dialog1 and dialog2 can live in
+        // their own windows, and a WebView missed here is one that still takes
+        // the app down.
+        val views = try {
+            allWebViews()
+        } catch (e: Exception) {
+            result.success("failed to scan views: " + (e.message ?: ""))
+            return
+        }
+        if (views.isEmpty()) {
+            // Flutter builds the platform view lazily; the caller retries.
+            result.success("no-webview")
+            return
+        }
+        var guarded = 0
+        var already = 0
+        for (v in views) {
+            try {
+                // Ask the system to kill something else first. The second
+                // argument is what matters for this app: the default waives the
+                // renderer's priority the moment the WebView stops being
+                // visible, and dialog1 spends most of its life behind something.
+                v.setRendererPriorityPolicy(
+                    android.webkit.WebView.RENDERER_PRIORITY_IMPORTANT, false
+                )
+                // Re-wrapping is self-correcting rather than tracked: if the
+                // plugin has since set a fresh client on this view, ours is no
+                // longer in the chain and we wrap again. Asking about the whole
+                // chain — not just the outermost client — is what stops this
+                // and the ad-blocker from re-wrapping each other forever.
+                val current = v.webViewClient
+                if (chainHas(current, RenderGuardClient::class.java)) { already++; continue }
+                v.webViewClient = RenderGuardClient(current)
+                guarded++
+            } catch (e: Exception) {
+                // One stubborn view is not worth failing the whole install for.
+            }
+        }
+        result.success("guarded $guarded webview(s), $already already guarded")
+    }
+
+    /// Forwards every call to the plugin's own client and adds the one
+    /// behaviour it is missing. Delegation is by hand because WebViewClient is
+    /// a class, not an interface — there is no proxy to generate. The set below
+    /// is exactly what WebViewClientProxyApi overrides, plus the two intercept
+    /// hooks, so wrapping changes nothing the plugin can observe.
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.O)
+    private inner class RenderGuardClient(
+        private val inner: WebViewClient
+    ) : WebViewClient(), ChainedWebViewClient {
+
+        override val innerClient: WebViewClient get() = inner
+
+        override fun onRenderProcessGone(
+            view: WebView?,
+            detail: android.webkit.RenderProcessGoneDetail?
+        ): Boolean {
+            // didCrash() false means the SYSTEM killed the renderer to reclaim
+            // memory. That is the case that used to look like the app vanishing
+            // for no reason: no Java exception, no tombstone, nothing in Play
+            // Console. Recording which of the two it was is the whole point of
+            // reporting it rather than swallowing it.
+            val crashed = try { detail?.didCrash() ?: false } catch (e: Exception) { false }
+            val priority = try { detail?.rendererPriorityAtExit() ?: -1 } catch (e: Exception) { -1 }
+            try {
+                permsChannel?.invokeMethod(
+                    "onRenderProcessGone",
+                    mapOf("didCrash" to crashed, "priorityAtExit" to priority)
+                )
+            } catch (e: Exception) {
+                // If Dart cannot be reached we still must not return false —
+                // that would reinstate exactly the crash we are here to stop.
+            }
+            // true = "handled, do not kill the app".
+            return true
+        }
+
+        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean =
+            inner.shouldOverrideUrlLoading(view, request)
+
+        // Deprecated upstream, but still the path the platform takes on the
+        // older API levels this app supports, so it has to be forwarded too.
+        @Deprecated("Deprecated in Java")
+        @Suppress("DEPRECATION")
+        override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean =
+            inner.shouldOverrideUrlLoading(view, url)
+
+        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? =
+            inner.shouldInterceptRequest(view, request)
+
+        @Deprecated("Deprecated in Java")
+        @Suppress("DEPRECATION")
+        override fun shouldInterceptRequest(view: WebView?, url: String?): WebResourceResponse? =
+            inner.shouldInterceptRequest(view, url)
+
+        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) =
+            inner.onPageStarted(view, url, favicon)
+
+        override fun onPageFinished(view: WebView?, url: String?) =
+            inner.onPageFinished(view, url)
+
+        override fun onPageCommitVisible(view: WebView?, url: String?) =
+            inner.onPageCommitVisible(view, url)
+
+        override fun onLoadResource(view: WebView?, url: String?) =
+            inner.onLoadResource(view, url)
+
+        override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) =
+            inner.doUpdateVisitedHistory(view, url, isReload)
+
+        override fun onFormResubmission(
+            view: WebView?, dontResend: android.os.Message?, resend: android.os.Message?
+        ) = inner.onFormResubmission(view, dontResend, resend)
+
+        override fun onReceivedError(
+            view: WebView?, request: WebResourceRequest?, error: WebResourceError?
+        ) = inner.onReceivedError(view, request, error)
+
+        @Deprecated("Deprecated in Java")
+        @Suppress("DEPRECATION")
+        override fun onReceivedError(
+            view: WebView?, errorCode: Int, description: String?, failingUrl: String?
+        ) = inner.onReceivedError(view, errorCode, description, failingUrl)
+
+        override fun onReceivedHttpError(
+            view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?
+        ) = inner.onReceivedHttpError(view, request, errorResponse)
+
+        override fun onReceivedHttpAuthRequest(
+            view: WebView?, handler: HttpAuthHandler?, host: String?, realm: String?
+        ) = inner.onReceivedHttpAuthRequest(view, handler, host, realm)
+
+        override fun onReceivedSslError(
+            view: WebView?, handler: SslErrorHandler?, error: SslError?
+        ) = inner.onReceivedSslError(view, handler, error)
+
+        override fun onReceivedClientCertRequest(
+            view: WebView?, request: android.webkit.ClientCertRequest?
+        ) = inner.onReceivedClientCertRequest(view, request)
+
+        override fun onReceivedLoginRequest(
+            view: WebView?, realm: String?, account: String?, args: String?
+        ) = inner.onReceivedLoginRequest(view, realm, account, args)
+
+        override fun onScaleChanged(view: WebView?, oldScale: Float, newScale: Float) =
+            inner.onScaleChanged(view, oldScale, newScale)
+
+        override fun onUnhandledKeyEvent(view: WebView?, event: KeyEvent?) =
+            inner.onUnhandledKeyEvent(view, event)
     }
 
     private fun stopNativeRecording(result: MethodChannel.Result) {
@@ -838,9 +1226,234 @@ class MainActivity : FlutterActivity() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         for (webView in allWebViews()) {
             val current = webView.webViewClient
-            if (current is AdBlockWebViewClient) continue   // already wrapped
+            // Whole chain, not just the outermost client: the render guard can
+            // be sitting on top of an ad-blocker that is already installed, and
+            // re-wrapping on that basis stacks a new pair on every navigation.
+            if (chainHas(current, AdBlockWebViewClient::class.java)) continue
             webView.webViewClient = AdBlockWebViewClient(current)
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Serving the app's own audio files to the WebView.
+    //
+    // The background-music bed plays local files through a plain <audio>
+    // element, and a page loaded over https cannot reference a file:// URL. So
+    // the page asks for the audio over LocalMedia.HOST and this client answers
+    // it from the one directory Dart nominates.
+    //
+    // Dart supplies the directory rather than Kotlin guessing it: the files
+    // live under path_provider's application-documents directory, and
+    // duplicating that plugin's idea of where that is would be a bug waiting
+    // for the day it changes.
+    // ---------------------------------------------------------------------------
+    @Volatile
+    private var localMediaDir: String? = null
+
+    private fun attachLocalMedia(dir: String?, result: MethodChannel.Result) {
+        if (dir.isNullOrBlank()) {
+            result.error("BAD_ARG", "dir required", null)
+            return
+        }
+        localMediaDir = dir
+        // Same floor as the ad-blocker and the render guard: reading a
+        // WebView's current client — which wrapping requires — is API 26+.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            result.success("unsupported")
+            return
+        }
+        var attached = 0
+        var already = 0
+        for (webView in allWebViews()) {
+            try {
+                val current = webView.webViewClient
+                if (chainHas(current, LocalMediaWebViewClient::class.java)) { already++; continue }
+                webView.webViewClient = LocalMediaWebViewClient(current)
+                attached++
+            } catch (_: Exception) {
+                // One stubborn view is not worth failing the whole attach for.
+            }
+        }
+        // Wrapping nothing is not success. Flutter builds the platform view
+        // lazily, so Dart retries on this — the same contract installRenderGuard
+        // uses.
+        if (attached == 0 && already == 0) {
+            result.success("no-webview")
+            return
+        }
+        result.success("attached $attached webview(s), $already already attached")
+    }
+
+    private fun notFoundResponse() =
+        WebResourceResponse(
+            "text/plain", "utf-8", 404, "Not Found",
+            emptyMap(),
+            ByteArrayInputStream(ByteArray(0))
+        )
+
+    /**
+     * Answer a request for one of our own audio files, or null when the
+     * request is not ours and should carry on down the chain.
+     *
+     * Runs on a background thread — `shouldInterceptRequest` always does — so
+     * reading from disk here is safe.
+     */
+    private fun serveLocalMedia(request: WebResourceRequest): WebResourceResponse? {
+        val uri = request.url ?: return null
+        if (!LocalMedia.HOST.equals(uri.host, ignoreCase = true)) return null
+
+        // From here on the request IS ours, so every failure answers 404
+        // rather than returning null. Falling through would send it to the
+        // network, and LocalMedia.HOST does not resolve — the page would wait
+        // for a DNS failure instead of learning the file is missing.
+        val name = LocalMedia.fileNameFromPath(uri.encodedPath) ?: return notFoundResponse()
+        val dir = localMediaDir ?: return notFoundResponse()
+
+        return try {
+            val base = File(dir)
+            val file = File(base, name)
+            // Second guard, after LocalMedia's. That one proves the request
+            // asked for a bare filename; this one proves the filesystem agrees
+            // the result is still inside the directory — a symlink is the case
+            // the first guard cannot see.
+            val root = base.canonicalPath.trimEnd(File.separatorChar) + File.separatorChar
+            if (!file.canonicalPath.startsWith(root)) return notFoundResponse()
+            if (!file.isFile || !file.canRead()) return notFoundResponse()
+
+            val size = file.length()
+            val mime = LocalMedia.contentTypeFor(name)
+            // Header names are case-insensitive; the WebView happens to send
+            // "Range" but nothing guarantees it.
+            val rangeHeader = request.requestHeaders
+                ?.entries?.firstOrNull { it.key.equals("Range", ignoreCase = true) }?.value
+            val range = LocalMedia.parseRange(rangeHeader, size)
+            val raf = RandomAccessFile(file, "r")
+            try {
+                if (range == null) {
+                    WebResourceResponse(
+                        mime, null, 200, "OK",
+                        mapOf(
+                            "Accept-Ranges" to "bytes",
+                            "Content-Length" to size.toString(),
+                            "Cache-Control" to "no-store",
+                        ),
+                        RangeInputStream(raf, size)
+                    )
+                } else {
+                    raf.seek(range.start)
+                    WebResourceResponse(
+                        mime, null, 206, "Partial Content",
+                        mapOf(
+                            "Accept-Ranges" to "bytes",
+                            "Content-Length" to range.length.toString(),
+                            "Content-Range" to "bytes ${range.start}-${range.endInclusive}/$size",
+                            "Cache-Control" to "no-store",
+                        ),
+                        RangeInputStream(raf, range.length)
+                    )
+                }
+            } catch (e: Exception) {
+                // The response owns the stream once built; until then the
+                // handle is ours to close.
+                try { raf.close() } catch (_: Exception) {}
+                throw e
+            }
+        } catch (_: Exception) {
+            notFoundResponse()
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Delegating WebViewClient that answers requests for the app's own audio
+    // files and forwards everything else.
+    //
+    // Its own client rather than a branch inside AdBlockWebViewClient: that one
+    // returns to its delegate as its first act when ad-blocking is switched
+    // off, and background music must not stop working because of an unrelated
+    // setting.
+    // ---------------------------------------------------------------------------
+    private inner class LocalMediaWebViewClient(
+        private val delegate: WebViewClient
+    ) : WebViewClient(), ChainedWebViewClient {
+
+        override val innerClient: WebViewClient get() = delegate
+
+        override fun shouldInterceptRequest(
+            view: WebView,
+            request: WebResourceRequest
+        ): WebResourceResponse? =
+            serveLocalMedia(request) ?: delegate.shouldInterceptRequest(view, request)
+
+        // ---- Everything else goes straight through ----
+        // Whichever client is outermost is the only one Android calls, and this
+        // wrapper can end up outermost, so the navigation delegate has to be
+        // forwarded rather than left to WebViewClient's defaults.
+        override fun onRenderProcessGone(
+            view: WebView?, detail: android.webkit.RenderProcessGoneDetail?
+        ): Boolean = delegate.onRenderProcessGone(view, detail)
+
+        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest) =
+            delegate.shouldOverrideUrlLoading(view, request)
+
+        @Deprecated("Deprecated in Java")
+        @Suppress("DEPRECATION")
+        override fun shouldOverrideUrlLoading(view: WebView, url: String) =
+            delegate.shouldOverrideUrlLoading(view, url)
+
+        override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) =
+            delegate.onPageStarted(view, url, favicon)
+
+        override fun onPageFinished(view: WebView, url: String) =
+            delegate.onPageFinished(view, url)
+
+        override fun onPageCommitVisible(view: WebView, url: String) =
+            delegate.onPageCommitVisible(view, url)
+
+        override fun onReceivedError(
+            view: WebView, request: WebResourceRequest, error: WebResourceError
+        ) = delegate.onReceivedError(view, request, error)
+
+        @Deprecated("Deprecated in Java")
+        @Suppress("DEPRECATION")
+        override fun onReceivedError(
+            view: WebView, errorCode: Int, description: String?, failingUrl: String?
+        ) = delegate.onReceivedError(view, errorCode, description, failingUrl)
+
+        override fun onReceivedSslError(
+            view: WebView, handler: SslErrorHandler, error: SslError
+        ) = delegate.onReceivedSslError(view, handler, error)
+
+        override fun onReceivedHttpAuthRequest(
+            view: WebView, handler: HttpAuthHandler, host: String, realm: String
+        ) = delegate.onReceivedHttpAuthRequest(view, handler, host, realm)
+
+        override fun onScaleChanged(view: WebView, oldScale: Float, newScale: Float) =
+            delegate.onScaleChanged(view, oldScale, newScale)
+
+        // Forwarded for parity with RenderGuardClient rather than because Dart
+        // listens today: this wrapper is attached regardless of any setting,
+        // so it must never be the reason a callback stops arriving.
+        override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) =
+            delegate.doUpdateVisitedHistory(view, url, isReload)
+
+        override fun onLoadResource(view: WebView?, url: String?) =
+            delegate.onLoadResource(view, url)
+
+        override fun onFormResubmission(
+            view: WebView?, dontResend: android.os.Message?, resend: android.os.Message?
+        ) = delegate.onFormResubmission(view, dontResend, resend)
+
+        override fun onReceivedHttpError(
+            view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?
+        ) = delegate.onReceivedHttpError(view, request, errorResponse)
+
+        override fun onReceivedClientCertRequest(
+            view: WebView?, request: android.webkit.ClientCertRequest?
+        ) = delegate.onReceivedClientCertRequest(view, request)
+
+        override fun onReceivedLoginRequest(
+            view: WebView?, realm: String?, account: String?, args: String?
+        ) = delegate.onReceivedLoginRequest(view, realm, account, args)
     }
 
     /** Depth-first search for ALL WebViews in a view tree. */
@@ -878,7 +1491,18 @@ class MainActivity : FlutterActivity() {
     // ---------------------------------------------------------------------------
     private inner class AdBlockWebViewClient(
         private val delegate: WebViewClient
-    ) : WebViewClient() {
+    ) : WebViewClient(), ChainedWebViewClient {
+
+        override val innerClient: WebViewClient get() = delegate
+
+        // Forwarded because this wrapper can end up OUTSIDE the render guard,
+        // and whichever client is outermost is the only one Android calls. Not
+        // forwarding it would leave the guard installed but unreachable — the
+        // app would still die on a renderer death, with nothing to show why.
+        @androidx.annotation.RequiresApi(Build.VERSION_CODES.O)
+        override fun onRenderProcessGone(
+            view: WebView?, detail: android.webkit.RenderProcessGoneDetail?
+        ): Boolean = delegate.onRenderProcessGone(view, detail)
 
         // Cached on the main thread in onPageStarted; read safely from background threads.
         @Volatile

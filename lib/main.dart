@@ -4,6 +4,8 @@ import 'dart:io' show Platform, File, Directory;
 import 'dart:math' as math;
 import 'dart:ui' show DartPluginRegistrant;
 import 'package:path_provider/path_provider.dart';
+import 'package:file_picker/file_picker.dart';
+import 'local_music.dart';
 import 'package:flutter/foundation.dart'
     show compute, debugPrint, defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
@@ -20,6 +22,9 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:speech_to_text/speech_recognition_error.dart' as stt;
 import 'speech_hub.dart';
 import 'caption_capture.dart';
+import 'translate_detail.dart';
+import 'ai_prompt.dart';
+import 'youtube_urls.dart';
 import 'speech_session.dart';
 import 'package:google_mlkit_translation/google_mlkit_translation.dart' as mlkit;
 import 'package:flutter_tts/flutter_tts.dart';
@@ -142,7 +147,24 @@ class WebViewExample extends StatefulWidget {
 }
 
 class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObserver {
-  late final WebViewController _controller;
+  // NOT final: a renderer death makes the live WebView permanently unusable,
+  // and the only recovery is a brand-new controller. See
+  // [_recreateAfterRendererDeath].
+  late WebViewController _controller;
+
+  /// Rebuilds [_controller] from scratch against [initialUrl].
+  ///
+  /// Held as a closure rather than extracted into a method because the
+  /// construction cascade closes over a dozen locals from the SharedPreferences
+  /// block that creates it; capturing it in place keeps that wiring in one
+  /// piece and out of the class surface.
+  void Function(String initialUrl)? _rebuildMainController;
+
+  /// Last URL that actually finished loading in the main WebView.
+  ///
+  /// Needed because [_urlController] holds whatever the user may be halfway
+  /// through TYPING, and a rebuild has to navigate somewhere loadable.
+  String? _lastLoadedUrl;
   WebViewController? dialogController;
   final TextEditingController _urlController = TextEditingController(text: 'https://google.com');
   String _dialogUrl = 'https://trexsatya.github.io/language.html';
@@ -349,6 +371,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // under SharedPreferences key "youtubeFrontend".
   String? _youtubeFrontend;
 
+  /// Editable from Tools. Holds `{word}` / `{source}` / `{target}` until
+  /// [renderAiPrompt] fills them in at share time.
+  String _aiPromptTemplate = kDefaultAiPromptTemplate;
+
   // Filmot: persistent channel blacklist (results from these YouTube channels
   // are hidden on filmot.com pages). Edited per-page from the dialog.
   Set<String> _filmotChannelBlacklist = {};
@@ -447,6 +473,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // on the device. Unconditional: the flag tracks our intent, and if a
     // stop already failed it would be lying.
     _stopNativeRecordingIfAny();
+    _memSampler?.cancel();
     _isListeningNotifier.dispose();
     _dialog1FullscreenNotifier.dispose();
     _dialog1Tts?.stop();
@@ -500,6 +527,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     WakelockPlus.enable();
+    // Record why we died last time — a system kill leaves no crash report at
+    // all, so this log is the only evidence such a death ever happened. Runs
+    // un-awaited, so the lines land once the platform channel answers rather
+    // than ahead of the rest of startup.
+    _reportLastExit();
+    _startMemorySampler();
     // Kick the 10s auto-hide timer so the app bar fades on its own after
     // launch (otherwise it only starts on user-driven triggers like
     // selection/voice, and a fresh window would stay open indefinitely).
@@ -529,6 +562,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // autoplay fires before onPageFinished otherwise.
     _warmRemoteSnippetCache();
     _warmAndInstallFrameScript();
+    _permsChannel.setMethodCallHandler(_handlePermsCall);
+    _installRenderGuardSoon();
     // Notification delivery must init on EVERY platform (Windows/web/Linux
     // included), unlike the sentence-tagging DB probe below which is
     // Android||iOS only — see _initNotifDelivery's doc comment.
@@ -587,6 +622,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _scrollDiagEnabled = prefs.getBool('scrollDiag') ?? false;
       final yf = prefs.getString('youtubeFrontend');
       _youtubeFrontend = (yf != null && yf.isNotEmpty) ? yf : null;
+      // Blank or missing falls back to the shipped wording — see
+      // [renderAiPrompt], which treats an empty template the same way.
+      _aiPromptTemplate =
+          prefs.getString('aiPromptTemplate') ?? kDefaultAiPromptTemplate;
       _filmotChannelBlacklist = (prefs.getStringList('filmotChannelBlacklist') ?? []).toSet();
       final savedJson = prefs.getString('savedVideos');
       if (savedJson != null) {
@@ -609,7 +648,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // is intentionally NOT persisted (default off on each launch so a stale
       // "collect mode" doesn't silently swallow real clicks).
       _wiktCollectedWords.value = prefs.getStringList('wiktCollectedWords') ?? <String>[];
-      _controller = WebViewController()
+      _rebuildMainController = (String initialUrl) {
+      // Callbacks below close over THIS local, not the _controller field.
+      // The field is reassigned when a dead renderer forces a rebuild, and a
+      // callback still in flight from the outgoing controller would otherwise
+      // act on the incoming one — injecting the old page's scripts into the
+      // new WebView, or navigating it somewhere the user never asked for.
+      // A fresh local per call keeps each generation's callbacks on their own
+      // instance. Same shape as dialog2Controller.
+      late final WebViewController c;
+      c = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(_userAgent)
         ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) => _openDialogWithWebview(msg.message.toString().replaceAll('"', '')))
@@ -652,7 +700,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // longer matches the YouTube host check, so no infinite loop.
               final rewritten = _rewriteYouTubeUrl(request.url);
               if (rewritten != null) {
-                _controller.loadRequest(Uri.parse(rewritten));
+                c.loadRequest(Uri.parse(rewritten));
                 return NavigationDecision.prevent;
               }
               final url = request.url;
@@ -764,12 +812,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             onPageFinished: (url) {
               if (_isShowingOurHtml) {
                 _injectJs(); // only need word-click JS on our own text page
-                _controller.runJavaScript(_linkLongPressJs);
+                c.runJavaScript(_linkLongPressJs);
                 // Scroll to preserved page position if switching from PDF view
                 if (_pendingScrollToPage != null && _pendingScrollToPage! > 1) {
                   final pg = _pendingScrollToPage!;
                   _pendingScrollToPage = null;
-                  _controller.runJavaScript(
+                  c.runJavaScript(
                     'document.getElementById("pg-$pg")?.scrollIntoView({behavior:"instant"});'
                   );
                 }
@@ -779,7 +827,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               if (Platform.isAndroid) _attachAndroidAdBlocker();
               _injectJs();
               _injectAdBlocker();
-              _controller.runJavaScript(_linkLongPressJs);
+              c.runJavaScript(_linkLongPressJs);
               _injectSpaHook();
               _injectPageZoom();
               _injectSelectionWatcher();
@@ -787,19 +835,90 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // Detect PDF by content-type (handles non-.pdf URLs like download links)
               // and defer _injectPdfDetector so it never fires on native PDF pages.
               _detectPdfAndInject(url);
+              // Where to come back to if the renderer dies and this WebView
+              // has to be rebuilt from scratch.
+              _lastLoadedUrl = url;
               // Restore scroll position for this URL
               _restoreScrollPosition(url);
               _injectRemoteSnippet();
-              _injectScrollDiag(_controller, 'main');
+              _injectScrollDiag(c, 'main');
             },
           ),
         )
-        ..loadRequest(Uri.parse(savedUrl));
-      _enableThirdPartyCookies(_controller);
+        ..loadRequest(Uri.parse(initialUrl));
+      // Published only once fully built, so nothing can observe a half-wired
+      // controller through the field.
+      _controller = c;
+      _enableThirdPartyCookies(c);
+      };
+      _rebuildMainController!(savedUrl);
       setState(() {
         _isControllerReady = true;
       });
     });
+  }
+
+  /// Edit the prompt the share sheet sends to an AI app.
+  ///
+  /// Reset restores the shipped wording rather than clearing the box, so the
+  /// placeholders come back with it — a user who has deleted `{word}` has no
+  /// other way to recover the spelling.
+  void _showAiPromptDialog() {
+    final ctrl = TextEditingController(text: _aiPromptTemplate);
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('AI prompt'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Sent to whichever app you pick from the share sheet.\n'
+                '{word} is the text being looked up, {source} and {target} are '
+                'the languages — the direction follows the page toggle.',
+                style: TextStyle(fontSize: 12),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: ctrl,
+                maxLines: 8,
+                minLines: 4,
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                  hintText: kDefaultAiPromptTemplate,
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            child: const Text('Reset'),
+            onPressed: () => ctrl.text = kDefaultAiPromptTemplate,
+          ),
+          TextButton(
+            child: const Text('Cancel'),
+            onPressed: () => Navigator.of(ctx).pop(),
+          ),
+          TextButton(
+            child: const Text('Save'),
+            onPressed: () async {
+              final text = ctrl.text.trim();
+              // An emptied box means "give me the default back", which is what
+              // renderAiPrompt does with a blank template — store it rather
+              // than an empty string so the editor reopens showing it.
+              final next = text.isEmpty ? kDefaultAiPromptTemplate : text;
+              setState(() => _aiPromptTemplate = next);
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('aiPromptTemplate', next);
+              if (ctx.mounted) Navigator.of(ctx).pop();
+            },
+          ),
+        ],
+      ),
+    );
   }
 
   void _showTokenDialog() {
@@ -2040,11 +2159,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         onSetCaptureChipVisible: (_) => _toggleCaptureChipVisibility(),
         onSetMasksVisible: (v) => _setMasksVisible(v),
         onSetTransformsEnabled: (v) => _setTransformsEnabled(v),
-        onOpenMemoryManager: () {
-          Navigator.of(context).push(MaterialPageRoute<void>(
-            builder: (_) => const MemoryManagerScreen(),
-          ));
-        },
         onOpenNotificationManager: () async {
           await Navigator.of(context).push(MaterialPageRoute<void>(
             builder: (_) => const NotificationManagerScreen(),
@@ -2319,6 +2433,140 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return 'no WebView found after 12 attempts';
   }
 
+  /// Wrap every live WebView's client on the Android side so a dead renderer
+  /// stops taking the app down with it, and raise the renderer's priority so
+  /// the system reclaims something else first.
+  ///
+  /// Fire-and-forget, and safe to call as often as you like: views already
+  /// guarded are skipped, and a view whose client the plugin has since
+  /// replaced is wrapped again. Call it after anything that can add a WebView.
+  void _installRenderGuardSoon() {
+    if (!Platform.isAndroid) return;
+    () async {
+      final res = await _installRenderGuard();
+      // Logged rather than kept in state, for the same reason as the frame
+      // agent: nothing on screen reports it, so a failed install is only ever
+      // diagnosed from the log. Stay quiet when there was nothing to do — this
+      // runs on every dialog open, and it writes to a capped ring buffer that
+      // has to stay readable as an instrument.
+      if (!res.startsWith('guarded 0 ')) {
+        _appendSnippetLog('log', '[renderer] guard: $res');
+      }
+    }();
+  }
+
+  Future<String> _installRenderGuard() async {
+    // Flutter builds the platform view lazily, so early attempts can land
+    // before any WebView exists to attach to.
+    for (var attempt = 0; attempt < 12; attempt++) {
+      try {
+        final res =
+            await _permsChannel.invokeMethod<String>('installRenderGuard');
+        if (res == null || !res.startsWith('no-webview')) return res ?? 'no reply';
+      } catch (e) {
+        return 'install failed: $e';
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+    }
+    return 'no WebView found after 12 attempts';
+  }
+
+  /// The renderer died and the guard kept the app alive. Every WebView in the
+  /// app shared that renderer, so they are all dead — there is no "which one"
+  /// to report and nothing to reload selectively.
+  Future<dynamic> _handlePermsCall(MethodCall call) async {
+    if (call.method != 'onRenderProcessGone') return null;
+    final args = (call.arguments as Map?) ?? const {};
+    final didCrash = args['didCrash'] == true;
+    final priority = args['priorityAtExit'];
+    // Into the same log the [exit-info] records land in, deliberately: this is
+    // the event that used to show up there as CRASH-native, and reading the
+    // two side by side is how you tell a guarded death from an unguarded one.
+    _appendSnippetLog(
+      'warn',
+      '[renderer] gone — ${didCrash ? 'renderer crashed' : 'system killed it (memory pressure)'}'
+      '  priorityAtExit=$priority',
+    );
+    if (!mounted) return null;
+    _recreateAfterRendererDeath();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(didCrash
+            ? 'Web content crashed — the page has been reloaded.'
+            : 'Android reclaimed the web content to free memory — the page has been reloaded.'),
+        duration: const Duration(seconds: 6),
+      ),
+    );
+    return null;
+  }
+
+  /// Rebuild every WebView the dead renderer took with it.
+  ///
+  /// A WebView whose renderer died is permanently unusable — `reload()` on it
+  /// does nothing, because the object itself is what the platform invalidated.
+  /// Only a NEW WebView gets a new renderer, which is why this replaces the
+  /// controllers rather than reloading them.
+  ///
+  /// Flipping [_isControllerReady] is what makes the replacement take effect:
+  /// it drops the whole subtree, so the old WebViewWidget is disposed and the
+  /// next build creates a fresh one around the new controller. Without it the
+  /// widget keeps rendering the dead WebView no matter what the field says.
+  void _recreateAfterRendererDeath() {
+    final rebuild = _rebuildMainController;
+    if (rebuild == null) return; // died before the first build; nothing to redo
+    // The dead controller cannot be asked for its URL, and the address bar may
+    // hold something the user is midway through typing — which loadRequest
+    // rejects outright for having no scheme, throwing from the LAST line of
+    // the cascade and leaving a fully built but never-navigated WebView.
+    // Prefer the last URL that actually loaded.
+    final target = _firstLoadableUrl([_lastLoadedUrl, _urlController.text.trim()])
+        ?? 'https://google.com';
+    setState(() => _isControllerReady = false);
+    try {
+      rebuild(target);
+    } catch (e) {
+      _appendSnippetLog('warn', '[renderer] rebuild failed: $e');
+    }
+    setState(() => _isControllerReady = true);
+    // dialog1 reads its controller from a FIELD, and its WebViewWidget is
+    // re-evaluated every time _dialogErrorNotifier fires — so it can be
+    // rebuilt in place. Replace the controller first, then pulse the notifier
+    // so the builder runs again and wraps the NEW one.
+    if (dialogController != null) {
+      dialogController = null;
+      _openDialogWithWebview(''); // builds a fresh controller synchronously
+      _dialogErrorNotifier.value = 'Reloading — the web content was reclaimed.';
+      _dialogErrorNotifier.value = null;
+    }
+    // dialog2 panels capture their controller as a local when the panel is
+    // built, so a replacement cannot reach one that is already open, and
+    // clearing the map would only strand its minimised chip. Telling each
+    // panel is the honest option: the message reaches an open panel and
+    // survives into a restored one, and Close still works.
+    for (final n in _dialog2ErrorNotifiers.values) {
+      n.value = 'The web content was reclaimed to free memory. '
+          'Close this panel and reopen it.';
+    }
+    // New WebViews mean new clients: without this the replacements are
+    // unguarded and the next renderer death is fatal again.
+    _installRenderGuardSoon();
+  }
+
+  /// First candidate `WebViewController.loadRequest` will actually accept.
+  ///
+  /// It throws on a URI with no scheme, which is exactly what a half-typed
+  /// address bar contains — and because it is the last call in the build
+  /// cascade, that throw leaves a fully constructed WebView that never
+  /// navigated anywhere. Screening here keeps the failure out of the cascade.
+  String? _firstLoadableUrl(List<String?> candidates) {
+    for (final c in candidates) {
+      if (c == null || c.isEmpty) continue;
+      final u = Uri.tryParse(c);
+      if (u != null && u.hasScheme && u.hasAuthority) return c;
+    }
+    return null;
+  }
+
   /// Fire-and-forget cache warm so the first navigation after launch can
   /// still inject early. Runs in parallel with everything else in initState.
   void _warmRemoteSnippetCache() {
@@ -2371,6 +2619,167 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _snippetLogs.removeRange(0, _snippetLogs.length - _kSnippetLogCap);
     }
     _snippetLogVersion.value++;
+  }
+
+  /// Report why the app process died last time, into Snippet logs.
+  ///
+  /// Not every death is a crash, and only crashes reach Play Console. When the
+  /// system kills us — because the shared WebView renderer ran out of memory,
+  /// say — there is no exception and no tombstone, so crash vitals stay empty
+  /// however many times it happens. `ActivityManager` records the real reason;
+  /// this is the only way to read it. See `lastExitInfo` in MainActivity.kt.
+  ///
+  /// Runs once at startup. Android 11+ only — below that the OS keeps no
+  /// history and the list comes back empty.
+  Future<void> _reportLastExit() async {
+    if (!Platform.isAndroid) return;
+    // Native-crash tombstones only became readable by the app itself in
+    // Android 12, so the OS version decides whether [exit-trace] can ever
+    // produce anything. Record it rather than wonder later.
+    _appendSnippetLog('log', '[exit-info] os=${Platform.operatingSystemVersion}');
+    List<Object?> raw;
+    try {
+      raw = await _permsChannel.invokeMethod<List<Object?>>('lastExitInfo') ?? [];
+    } catch (e) {
+      if (!mounted) return;
+      _appendSnippetLog('warn', '[exit-info] unavailable: $e');
+      return;
+    }
+    // The reply crosses an await, so the shell can be gone by now — a hot
+    // restart, or teardown during a slow startup. `_appendSnippetLog` ticks a
+    // ValueNotifier that dispose() has already closed by then.
+    if (!mounted) return;
+    if (raw.isEmpty) {
+      _appendSnippetLog('log', '[exit-info] no process-death history '
+          '(needs Android 11+, or this is the first run since install)');
+      return;
+    }
+    // Newest first, per getHistoricalProcessExitReasons.
+    for (final entry in raw) {
+      if (entry is! Map) continue;
+      final name = entry['reasonName'] ?? entry['reason'];
+      final pssKb = (entry['pss'] as num?)?.toInt() ?? 0;
+      final rssKb = (entry['rss'] as num?)?.toInt() ?? 0;
+      final ms = (entry['timestamp'] as num?)?.toInt() ?? 0;
+      final when = ms > 0
+          ? DateTime.fromMillisecondsSinceEpoch(ms).toIso8601String().substring(0, 19)
+          : 'unknown time';
+      final desc = (entry['description'] as String?) ?? '';
+      // Which process died matters as much as why: every WebView in the app
+      // shares one renderer, and it runs as <package>:sandboxed_process*. A
+      // native crash there is a completely different bug from one in the app
+      // process, and the two are indistinguishable without this.
+      final proc = (entry['processName'] as String?) ?? '';
+      final shortProc = proc.contains(':') ? proc.substring(proc.indexOf(':')) : '';
+      _appendSnippetLog('log',
+          '[exit-info] $when  $name'
+          '${shortProc.isEmpty ? '' : '  proc=$shortProc'}'
+          '${pssKb > 0 ? '  pss=${(pssKb / 1024).round()}MB' : ''}'
+          '${rssKb > 0 ? '  rss=${(rssKb / 1024).round()}MB' : ''}'
+          '${desc.isEmpty ? '' : '  — $desc'}');
+      // Only ANRs and native crashes ever carry a trace; saying so for the
+      // others keeps the log honest instead of looking like a failure.
+      final wantsTrace = name == 'CRASH-native' || name == 'ANR';
+      if (wantsTrace) _logExitTrace(entry['trace'], '$name');
+    }
+  }
+
+  Timer? _memSampler;
+
+  /// Log the memory breakdown by category, every minute.
+  ///
+  /// A crash at ~1 GB says how much, never what. This shows which bucket is
+  /// growing, which is what names the owner — and because it samples while you
+  /// use the app, the growth lines up with whatever you were doing. Sampling
+  /// costs a `Debug.getMemoryInfo` call, tens of milliseconds, so once a
+  /// minute is deliberate; do not make it frequent.
+  void _startMemorySampler() {
+    if (!Platform.isAndroid) return;
+    _sampleMemory();
+    _memSampler?.cancel();
+    _memSampler = Timer.periodic(const Duration(minutes: 1), (_) => _sampleMemory());
+  }
+
+  Future<void> _sampleMemory() async {
+    List<Object?>? procs;
+    try {
+      procs = await _permsChannel.invokeMethod<List<Object?>>('memoryBreakdown');
+    } catch (_) {
+      return;
+    }
+    if (procs == null || !mounted) return;
+    for (final p in procs) {
+      if (p is! Map) continue;
+      int mb(String k) => (((p[k] as num?)?.toInt() ?? 0) / 1024).round();
+      // Only the suffix distinguishes the processes, and the package prefix is
+      // the same on every line — so drop it and keep the log readable.
+      final full = (p['name'] as String?) ?? '';
+      final label = full.contains(':') ? full.substring(full.indexOf(':')) : 'app';
+      // rss first, because that is the unit the exit-info records use and so
+      // the only one a live sample can be compared against.
+      _appendSnippetLog('log',
+          '[mem] $label rss=${mb('rss')}MB'
+          '  pss=${mb('totalPss')}MB'
+          '  native=${mb('nativeHeap')}MB'
+          '  graphics=${mb('graphics')}MB'
+          '  java=${mb('javaHeap')}MB'
+          '  code=${mb('code')}MB'
+          '  other=${mb('privateOther')}MB');
+    }
+  }
+
+  /// Surface what crashed, from the trace the system kept.
+  ///
+  /// Two formats arrive here and only one is text: an ANR trace is plain, but
+  /// a native-crash tombstone is a protobuf. Rather than parse the proto, pull
+  /// the printable runs out of the bytes — the signal name, any abort message
+  /// and the `.so` paths on the stack are all stored as plain strings inside
+  /// it, and those are what identify the culprit.
+  ///
+  /// Always logs something. An instrument that goes quiet when it fails is
+  /// indistinguishable from one reporting good news, which cost us two
+  /// crashes' worth of evidence.
+  void _logExitTrace(Object? raw, String reason) {
+    if (raw == null) {
+      _appendSnippetLog('log', '[exit-trace] $reason: no trace kept by the system');
+      return;
+    }
+    if (raw is! List<int> || raw.isEmpty) {
+      _appendSnippetLog('warn',
+          '[exit-trace] $reason: unexpected trace type ${raw.runtimeType}');
+      return;
+    }
+    // Replace every non-printable byte with a newline, so printable runs fall
+    // out as lines. Works the same for text and for protobuf.
+    final split = raw.map((b) => (b >= 0x20 && b < 0x7f) ? b : 0x0a).toList();
+    final runs = String.fromCharCodes(split)
+        .split('\n')
+        .map((s) => s.trim())
+        .where((s) => s.length >= 6)
+        .toList();
+    _appendSnippetLog('warn',
+        '[exit-trace] $reason: ${raw.length} bytes, ${runs.length} strings');
+    // Signals, abort messages and shared objects — the identifying parts.
+    final seen = <String>{};
+    var shown = 0;
+    for (final s in runs) {
+      final interesting = s.contains('.so') ||
+          s.startsWith('SIG') ||
+          s.contains('signal') ||
+          s.contains('Abort') ||
+          s.contains('abort_message');
+      if (!interesting || !seen.add(s) || shown >= 25) continue;
+      shown++;
+      _appendSnippetLog('warn', '[exit-trace] $s');
+    }
+    if (shown == 0) {
+      // Nothing matched: dump the longest few runs so the trace is never a
+      // total loss, and so the filter above can be corrected from real data.
+      runs.sort((a, b) => b.length.compareTo(a.length));
+      for (final s in runs.take(8)) {
+        _appendSnippetLog('warn', '[exit-trace] ? $s');
+      }
+    }
   }
 
   void _showSnippetLogs() {
@@ -2518,16 +2927,71 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
   }
 
+  /// Reads the language webapp's own search box (`#searchText`) and its
+  /// direction toggle (`#toggleLangCb`) out of dialog1's WebView.
+  ///
+  /// Returns null when the page can't be reached at all — no dialog1 yet, or
+  /// the renderer is wedged and the call times out. A page that simply lacks
+  /// those controls (dialog1 navigated elsewhere) reports empty text and the
+  /// default direction instead. Either way callers see no usable text and
+  /// fall back to their own sources.
+  Future<({String text, bool toEnglish})?> _readWebappSearchState() async {
+    final controller = dialogController;
+    if (controller == null) return null;
+    const js = '''
+      (function() {
+        try {
+          var el = document.getElementById('searchText');
+          var cb = document.getElementById('toggleLangCb');
+          return JSON.stringify({
+            text: el ? String(el.value || '') : '',
+            toEnglish: !(cb && cb.checked)
+          });
+        } catch (e) {
+          return JSON.stringify({ text: '', toEnglish: true });
+        }
+      })();
+    ''';
+    try {
+      final raw = await controller
+          .runJavaScriptReturningResult(js)
+          .timeout(const Duration(seconds: 2));
+      var s = raw.toString();
+      if (s.startsWith('"') && s.endsWith('"')) s = jsonDecode(s) as String;
+      final d = jsonDecode(s) as Map<String, dynamic>;
+      return (
+        text: (d['text'] as String? ?? '').trim(),
+        toEnglish: d['toEnglish'] != false,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Builds an "explain this word to me" prompt and hands it off to any
   /// installed app via Android's share-text chooser. Users typically pick
   /// an AI assistant (ChatGPT / Claude / Gemini / Perplexity / etc.) but
   /// the chooser surface accepts every text consumer the OS knows about.
   Future<void> _shareSearchTextToAi() async {
-    // Prefer whatever the user copied onto the system clipboard (e.g. text
-    // selected in the reader or elsewhere); fall back to the currently
-    // looked-up word when the clipboard holds no text.
-    final clip = (await Clipboard.getData(Clipboard.kTextPlain))?.text?.trim() ?? '';
-    final word = clip.isNotEmpty ? clip : _currentDialogText.trim();
+    // The webapp's search box is the source of truth: it holds exactly what
+    // the user is looking at, including anything they typed or edited
+    // straight into the page after the lookup was dispatched.
+    final state = await _readWebappSearchState();
+    var word = state?.text ?? '';
+    // The page's toggle describes THE SEARCH BOX's contents and nothing else,
+    // so it may only be trusted when the word actually came from there. A
+    // word taken from a fallback source keeps the app's usual direction
+    // (study language → English) no matter how the toggle happens to sit.
+    var toEnglish = true;
+    if (word.isNotEmpty) {
+      toEnglish = state!.toEnglish;
+    } else {
+      // Page unreadable or the box is empty — fall back to whatever the user
+      // copied onto the system clipboard (e.g. text selected in the reader),
+      // then to the currently looked-up word.
+      final clip = (await Clipboard.getData(Clipboard.kTextPlain))?.text?.trim() ?? '';
+      word = clip.isNotEmpty ? clip : _currentDialogText.trim();
+    }
     if (word.isEmpty) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -2537,12 +3001,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
     // _languageParams maps language codes ('sv') to friendly names
     // ('swedish'); title-case them since they're going into a sentence.
-    final src = _titleCase(_languageParams[_selectedLanguage] ?? _selectedLanguage);
-    // Target is English everywhere else in the app (cf. "Translation
-    // ($_selectedLanguage → en)" in the YouTube subtitle dialog).
-    const tgt = 'English';
-    final prompt =
-        'Give me translation of "$word" from $src to $tgt with some usage examples/patterns and nuances including everyday, literary, oldfashioned versions in both languages.';
+    final study = _titleCase(_languageParams[_selectedLanguage] ?? _selectedLanguage);
+    // English is the other side of every pair in this app (cf. "Translation
+    // ($_selectedLanguage → en)" in the YouTube subtitle dialog). The page's
+    // toggle says which side the search term is IN — checked means the user
+    // is searching in English — so the prompt's direction follows it.
+    const english = 'English';
+    final src = toEnglish ? study : english;
+    final tgt = toEnglish ? english : study;
+    final prompt = renderAiPrompt(
+      _aiPromptTemplate,
+      word: word,
+      source: src,
+      target: tgt,
+    );
     if (!Platform.isAndroid) {
       // iOS/macOS share-sheet would need a different channel — for now,
       // just put the prompt on the clipboard and tell the user.
@@ -3217,6 +3689,35 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       onTap: () {
                         Navigator.of(ctx).pop();
                         _showTokenDialog();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.auto_awesome),
+                      title: const Text('AI prompt'),
+                      subtitle: Text(
+                        _aiPromptTemplate == kDefaultAiPromptTemplate
+                            ? 'Default wording'
+                            : 'Customised',
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showAiPromptDialog();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.memory),
+                      title: const Text('Memory manager'),
+                      subtitle: const Text(
+                        'Storage overview per book, orphan-file cleanup, and '
+                        '.cupitor.zip import.',
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        Navigator.of(context).push(MaterialPageRoute<void>(
+                          builder: (_) => const MemoryManagerScreen(),
+                        ));
                       },
                     ),
                     ListTile(
@@ -3968,6 +4469,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _minimizedDialog2s.remove(dialogId); // Ensure it's not marked as minimized
 
     _showDialog2(dialogId);
+    // Same reason as dialog1: a WebView that did not exist a moment ago.
+    _installRenderGuardSoon();
   }
 
   void _showDialog2(String dialogId) {
@@ -4173,6 +4676,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     onPressed: () => _saveCurrentFilmotVideo(dialogId, controller),
                   ),
                 ],
+                // `url` is the address this dialog was OPENED with and is never
+                // rewritten as the user navigates, so loading it again restarts
+                // the video at the `t=` the dialog1 link carried. A plain
+                // reload would resume wherever the player had got to, which is
+                // the opposite of what a replay button is for.
+                if (isYouTubeWatchUrl(url, frontend: _youtubeFrontend))
+                  IconButton(
+                    tooltip: 'Replay from the start time this was opened at',
+                    icon: const Icon(Icons.replay, size: 20),
+                    onPressed: () {
+                      final uri = Uri.tryParse(url);
+                      if (uri != null) controller.loadRequest(uri);
+                    },
+                  ),
                 IconButton(
                   tooltip: 'Minimize',
                   icon: const Icon(Icons.minimize, size: 20),
@@ -5257,12 +5774,28 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final src = (req['source'] as String? ?? 'sv').trim();
     final tgt = (req['target'] as String? ?? 'en').trim();
     if (id == null || text.isEmpty) return;
+    // Opt-in, per request: a caller that doesn't ask gets exactly the reply it
+    // has always got, down to the argument count. That is what keeps the four
+    // existing call sites — playlist phrases, subtitle lines, the corresponding
+    // -words heading and its back-translation check — out of the blast radius.
+    final wantsDetail = req['detail'] == true;
 
     String? result;
+    Map<String, dynamic>? detail;
     String? errMsg;
     // Path 1: Google translate API (free, public).
     try {
-      result = await _translateText(text, src, tgt);
+      if (wantsDetail) {
+        final d = await _translateDetailed(text, src, tgt);
+        // An empty primary means the response held nothing usable. Fall
+        // through to ML Kit rather than hand the page a blank translation
+        // dressed up as a success.
+        if (d.primary.isEmpty) throw 'empty result';
+        result = d.primary;
+        detail = d.toJson(provider: 'google');
+      } else {
+        result = await _translateText(text, src, tgt);
+      }
     } catch (e) {
       errMsg = 'api: $e';
     }
@@ -5270,14 +5803,27 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (result == null) {
       try {
         final tr = await _getOrOpenTranslator(src, tgt);
-        if (tr != null) result = await tr.translateText(text);
+        if (tr != null) {
+          result = await tr.translateText(text);
+          // No dictionary exists on-device. Say so via `provider` — otherwise
+          // "no senses" is indistinguishable from "this word has one sense",
+          // and the page would state the second while meaning the first.
+          if (wantsDetail) {
+            detail = const TranslateDetail.empty().toJson(provider: 'mlkit');
+          }
+        }
         else errMsg = (errMsg ?? '') + '; mlkit: language unsupported';
       } catch (e) {
         errMsg = (errMsg ?? '') + '; mlkit: $e';
       }
     }
+    // Positional args are (id, result, err, detail). The detail argument is
+    // appended ONLY for a caller that asked, so an untouched call site keeps
+    // receiving the same two-argument invocation it always did.
     final js = result != null
-        ? 'window.__cupTranslated && window.__cupTranslated($id, ${jsonEncode(result)});'
+        ? (wantsDetail
+            ? 'window.__cupTranslated && window.__cupTranslated($id, ${jsonEncode(result)}, null, ${jsonEncode(detail)});'
+            : 'window.__cupTranslated && window.__cupTranslated($id, ${jsonEncode(result)});')
         : 'window.__cupTranslated && window.__cupTranslated($id, null, ${jsonEncode(errMsg ?? 'translate failed')});';
     // TranslateRequest is registered on BOTH controllers (main _controller for
     // snippet.js, dialogController for the study app), and a JavaScriptMessage
@@ -5437,6 +5983,27 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       }
     }
     return out.toString();
+  }
+
+  /// Same endpoint and same single request as [_translateText], asking also for
+  /// the dictionary (`dt=bd`) and alternate-translation (`dt=at`) blocks — the
+  /// per-sense data a word lookup needs, which the plain call throws away.
+  ///
+  /// Deliberately NOT merged into [_translateText]: the subtitle and batch
+  /// paths translate whole sentences, which carry no dictionary entry, so they
+  /// keep the lean request and are unaffected by any of this.
+  Future<TranslateDetail> _translateDetailed(
+      String text, String sourceLang, String targetLang) async {
+    final uri = Uri.parse(
+      'https://translate.googleapis.com/translate_a/single'
+      '?client=gtx&sl=$sourceLang&tl=$targetLang&dt=t&dt=bd&dt=at'
+      '&q=${Uri.encodeQueryComponent(text)}'
+    );
+    final resp = await http.get(uri).timeout(const Duration(seconds: 15));
+    if (resp.statusCode != 200) {
+      throw 'HTTP ${resp.statusCode}';
+    }
+    return parseTranslateResponse(jsonDecode(resp.body));
   }
 
   // ---------- YouTube subtitle download ----------
@@ -7060,6 +7627,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             },
             onPageFinished: (url) {
               _injectAdBlocker(dialogController);
+              // Let this WebView answer its own requests for the background
+              // music files. Attached per page load because a fresh dialog
+              // WebView starts unwrapped.
+              _attachLocalMedia();
               dialogController?.runJavaScript(_linkLongPressJs);
               // Polyfill window.speechSynthesis before the page tries to use
               // it. Safe to inject every page-finished — re-entry is gated.
@@ -7106,6 +7677,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
     // Always show the dialog (it may have been dismissed previously)
     _showDialog1();
+    // dialog1 adds a WebView the startup pass could not have seen.
+    _installRenderGuardSoon();
   }
 
   /// Notification body tap: open dialog1 AT [url] (spec: open_url). This is
@@ -7356,7 +7929,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               builder: (_, error, __) => error != null
                   ? _errorView(error, () {
                       _dialogErrorNotifier.value = null;
-                      dialogController?.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                      if (dialogController == null) {
+                        // A renderer death clears this. Behind a `?.` the
+                        // button would silently do nothing and leave an empty
+                        // panel, so rebuild instead of no-opping.
+                        _openDialogWithWebview('');
+                      } else {
+                        dialogController!.loadRequest(
+                            Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                      }
                     })
                   : ValueListenableBuilder<bool>(
                       valueListenable: einkMode,
@@ -7364,7 +7945,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         colorFilter: eink ? einkColorFilter : identityColorFilter,
                         child: child,
                       ),
-                      child: WebViewWidget(controller: dialogController!),
+                      // Null-safe rather than `!`: a renderer death drops this
+                      // controller while the dialog is still on screen, and the
+                      // force-unwrap turned that recovery into a crash.
+                      child: dialogController == null
+                          ? const SizedBox.shrink()
+                          : WebViewWidget(controller: dialogController!),
                     ),
             ),
           ),
@@ -7855,6 +8441,79 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return id.replaceAll(RegExp(r'[^A-Za-z0-9_\-]'), '_');
   }
 
+  // ---- Background music: files the user picked from the device ----
+  //
+  // Kept in their own directory, with their own resolver, so neither these ops
+  // nor the manual_audio ops above can reach the other's files.
+  //
+  // The WebView can't be handed a file:// URL — the page is loaded over https
+  // and cannot reference one — so the bytes reach it through the native
+  // LocalMedia interception instead. These ops only ever deal in file:// URLs
+  // and names; building the served URL is the page's job.
+  Future<Directory> _musicDir() async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docs.path}/music');
+    if (!await dir.exists()) await dir.create(recursive: true);
+    return dir;
+  }
+
+  /// Whether this device can serve local music to the WebView. The music ops
+  /// AWAIT this rather than reading a flag, so a panel opened before the
+  /// native attach has answered waits for the answer instead of being told
+  /// the device is unsupported. Null until the first page load.
+  Future<bool>? _localMediaAttach;
+
+  void _attachLocalMedia() {
+    if (!Platform.isAndroid) return;
+    _localMediaAttach = _attachLocalMediaOnce();
+  }
+
+  Future<bool> _attachLocalMediaOnce() async {
+    try {
+      final dir = await _musicDir();
+      // Flutter builds the platform view lazily, so early attempts can land
+      // before any WebView exists to attach to — the same reason
+      // [_installRenderGuard] retries. Wrapping nothing is not success.
+      for (var attempt = 0; attempt < 12; attempt++) {
+        final res = await _permsChannel.invokeMethod<String>(
+          'attachLocalMedia', {'dir': dir.path},
+        );
+        if (res == null || res == 'unsupported') return false;
+        if (!res.startsWith('no-webview')) return true;
+        await Future<void>.delayed(const Duration(milliseconds: 600));
+      }
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Where a picked file should be copied, and whether a copy is needed at
+  /// all. Returns `(file, true)` when a file of the same name AND size is
+  /// already there — the same song picked again — so the page's library sees
+  /// one track rather than a growing set of copies. A name that is taken by a
+  /// different file gets a counter rather than overwriting it.
+  Future<(File, bool)> _musicDestFor(
+      Directory dir, String original, int srcLength) async {
+    final (stem, ext) = musicSplitExt(musicSafeFileName(original));
+    var candidate = File('${dir.path}/$stem$ext');
+    var n = 2;
+    while (await candidate.exists()) {
+      if (await candidate.length() == srcLength) return (candidate, true);
+      candidate = File('${dir.path}/$stem ($n)$ext');
+      n++;
+    }
+    return (candidate, false);
+  }
+
+  /// Map a `file://` URL back to a file inside the music directory, refusing
+  /// anything outside it — including a path that only leaves via `..`.
+  Future<File?> _resolveMusicUrl(String url) async {
+    final dir = await _musicDir();
+    final path = filePathInsideDir(url, dir.path);
+    return path == null ? null : File(path);
+  }
+
   String _extFromDataUrl(String dataUrl) {
     // data:audio/webm;codecs=opus;base64,XXXX → 'webm'.
     final m = RegExp(r'^data:audio/([a-zA-Z0-9.+-]+)').firstMatch(dataUrl);
@@ -7872,12 +8531,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// confined to our manual_audio directory (defensive — refuse paths outside
   /// it so a malicious page can't read random files).
   Future<File?> _resolveAudioUrl(String url) async {
-    if (!url.startsWith('file://')) return null;
-    final path = url.substring('file://'.length);
     final dir = await _manualAudioDir();
-    final canonicalDir = dir.path.endsWith('/') ? dir.path : '${dir.path}/';
-    if (!path.startsWith(canonicalDir)) return null;
-    return File(path);
+    // Collapses `..` before checking, so a URL that only leaves the
+    // directory through a dot segment is refused too.
+    final path = filePathInsideDir(url, dir.path);
+    return path == null ? null : File(path);
   }
 
   void _audioReply(String op, String rid, String? result, String? err) {
@@ -8181,6 +8839,62 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         final f = await _resolveAudioUrl(url);
         if (f != null && await f.exists()) await f.delete();
         _audioReply('delete', rid, 'ok', null);
+      } else if (op == 'musicPick' || op == 'musicList' || op == 'musicDelete') {
+        // One gate for all three: the page hides its device controls on this
+        // error, so it has to come back from the call it makes first.
+        final ready = await (_localMediaAttach ?? Future<bool>.value(false));
+        if (!ready) {
+          _audioReply(op, rid, null, 'unsupported');
+          return;
+        }
+        if (op == 'musicPick') {
+          final picked = await FilePicker.platform.pickFiles(
+            type: FileType.audio,
+            allowMultiple: true,
+          );
+          final dir = await _musicDir();
+          final out = <Map<String, dynamic>>[];
+          var failed = 0;
+          for (final f in picked?.files ?? const <PlatformFile>[]) {
+            final src = f.path;
+            if (src == null) { failed++; continue; }
+            try {
+              final srcFile = File(src);
+              final (dest, reused) =
+                  await _musicDestFor(dir, f.name, await srcFile.length());
+              // Copy rather than reference: the picker hands back a path in
+              // a cache directory the system is free to reclaim.
+              if (!reused) await srcFile.copy(dest.path);
+              out.add({
+                'url': _fileUrlForPath(dest.path),
+                // The user's own name for the file, not the sanitised copy.
+                'name': musicDisplayName(f.name),
+              });
+            } catch (_) {
+              // Reported by count rather than swallowed: a picker cache the
+              // system already reclaimed, or a full disk, would otherwise look
+              // exactly like the user cancelling.
+              failed++;
+            }
+          }
+          _audioReply(op, rid, jsonEncode({'picked': out, 'failed': failed}), null);
+        } else if (op == 'musicList') {
+          final dir = await _musicDir();
+          final out = <Map<String, dynamic>>[];
+          for (final e in dir.listSync()) {
+            if (e is! File) continue;
+            out.add({
+              'url': _fileUrlForPath(e.path),
+              'name': musicDisplayName(e.path),
+              'size': await e.length(),
+            });
+          }
+          _audioReply(op, rid, jsonEncode(out), null);
+        } else {
+          final f = await _resolveMusicUrl((req['url'] as String?) ?? '');
+          if (f != null && await f.exists()) await f.delete();
+          _audioReply(op, rid, 'ok', null);
+        }
       } else if (op == 'ensureMicPerm') {
         // Pre-flight for JS — let it know whether the Android `RECORD_AUDIO`
         // grant is in place (asking the user if not) BEFORE it calls

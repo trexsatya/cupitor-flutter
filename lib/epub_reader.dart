@@ -34,7 +34,6 @@ import 'book_transfer.dart';
 import 'db.dart';
 import 'eink_mode.dart';
 import 'jslog.dart';
-import 'memory_manager.dart';
 import 'notif/notification_manager.dart';
 import 'playlist_screen.dart';
 import 'playlist_service.dart';
@@ -2774,11 +2773,6 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
           ));
         },
         onExportBook: _exportCurrentBook,
-        onOpenMemoryManager: () {
-          Navigator.of(context).push(MaterialPageRoute<void>(
-            builder: (_) => const MemoryManagerScreen(),
-          ));
-        },
         onOpenNotificationManager: () {
           Navigator.of(context).push(MaterialPageRoute<void>(
             builder: (_) => const NotificationManagerScreen(),

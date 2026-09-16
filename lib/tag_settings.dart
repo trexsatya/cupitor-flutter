@@ -64,8 +64,6 @@ class TagSettingsCallbacks {
   final VoidCallback? onOpenPlaylistScreen;
   /// EPUB-only. Opens the export flow for the currently-open book.
   final VoidCallback? onExportBook;
-  /// Available on both surfaces — opens the top-level storage overview.
-  final VoidCallback? onOpenMemoryManager;
   /// Available on both surfaces — opens the notification manager.
   final VoidCallback? onOpenNotificationManager;
   const TagSettingsCallbacks({
@@ -80,7 +78,6 @@ class TagSettingsCallbacks {
     this.onSetPlaylistChipVisible,
     this.onOpenPlaylistScreen,
     this.onExportBook,
-    this.onOpenMemoryManager,
     this.onOpenNotificationManager,
   });
 }
@@ -382,8 +379,7 @@ class _TagSettingsSheetState extends State<_TagSettingsSheet> {
                   },
                 ),
               ],
-              if (widget.callbacks.onExportBook != null ||
-                  widget.callbacks.onOpenMemoryManager != null) ...[
+              if (widget.callbacks.onExportBook != null) ...[
                 const Divider(height: 1),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
@@ -402,20 +398,6 @@ class _TagSettingsSheetState extends State<_TagSettingsSheet> {
                     onTap: () {
                       Navigator.of(context).pop();
                       widget.callbacks.onExportBook!();
-                    },
-                  ),
-                if (widget.callbacks.onOpenMemoryManager != null)
-                  ListTile(
-                    leading: const Icon(Icons.memory),
-                    title: const Text('Memory manager'),
-                    subtitle: const Text(
-                      'Storage overview per book, orphan-file cleanup, and '
-                      '.cupitor.zip import.',
-                    ),
-                    trailing: const Icon(Icons.chevron_right),
-                    onTap: () {
-                      Navigator.of(context).pop();
-                      widget.callbacks.onOpenMemoryManager!();
                     },
                   ),
               ],
