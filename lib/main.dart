@@ -25,6 +25,8 @@ import 'caption_capture.dart';
 import 'translate_detail.dart';
 import 'ai_prompt.dart';
 import 'youtube_urls.dart';
+import 'history_store.dart';
+import 'history_screen.dart';
 import 'speech_session.dart';
 import 'package:google_mlkit_translation/google_mlkit_translation.dart' as mlkit;
 import 'package:flutter_tts/flutter_tts.dart';
@@ -99,6 +101,9 @@ void main() async {
   // sentence-tagging JS injection. Must land before the first
   // `onPageFinished` so the guard in `_injectJs` sees the real list.
   await LookupExclusions.init();
+  // Browsing history, so the URL bar can suggest from the first keystroke
+  // rather than after a first page load.
+  await HistoryStore.init();
   // Open the global-search full-text index and honour the user's
   // configured cap before the first search runs.
   await SearchIndex.init();
@@ -167,6 +172,22 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String? _lastLoadedUrl;
   WebViewController? dialogController;
   final TextEditingController _urlController = TextEditingController(text: 'https://google.com');
+  /// Owned here rather than left to the TextField, because
+  /// [RawAutocomplete] needs the same node to know when to show and hide
+  /// its suggestion list.
+  final FocusNode _urlFocusNode = FocusNode();
+
+  /// True once the user has arrowed off the first suggestion.
+  ///
+  /// A URL bar must load what you typed when you press Enter, so the
+  /// highlight is only honoured after you have moved it. [RawAutocomplete]
+  /// would otherwise select the first suggestion on every Enter, quietly
+  /// replacing a typed address with a guess.
+  bool _urlSuggestionHighlightMoved = false;
+
+  /// Set by [RawAutocomplete]'s onSelected, so an Enter that resolved to a
+  /// suggestion doesn't then also load the field text on top of it.
+  bool _urlSuggestionPicked = false;
   String _dialogUrl = 'https://trexsatya.github.io/language.html';
   final List<String> _languages = ['sv', 'es'];
   final Map<String, String> _languageParams = {'sv': 'swedish', 'es': 'spanish'};
@@ -442,11 +463,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final url = _urlController.text.trim();
     if (url.isNotEmpty) _saveScrollPosition(url);
     _urlController.dispose();
+    _urlFocusNode.dispose();
     _findController.dispose();
     _dialogErrorNotifier.dispose();
     _snippetLogVersion.dispose();
     // Clean up all dialog controllers on app dispose
     dialogController = null;
+    _dialog1Loaded = false;
     _dialog2Controllers.clear();
     for (final notifier in _dialog2ErrorNotifiers.values) {
       notifier.dispose();
@@ -716,6 +739,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               }
               // Always intercept .pdf extension URLs on Android before WebView touches them.
               if (Platform.isAndroid && _looksLikePdfUrl(url)) {
+                // Navigation is prevented here, so onPageFinished never fires
+                // and the usual recorder never runs — yet the document is
+                // about to fill the screen. Without this, history would hold
+                // different things on Android and macOS for the same reading.
+                HistoryStore.record(url);
                 if (mounted) setState(() {
                   _urlController.text = url;
                   _currentPdfUrl = url;
@@ -738,6 +766,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         .timeout(const Duration(seconds: 5));
                     final ct = response.headers['content-type'] ?? '';
                     if (ct.contains('application/pdf') && mounted) {
+                      HistoryStore.record(url);
                       setState(() {
                         _urlController.text = url;
                         _currentPdfUrl = url;
@@ -838,6 +867,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // Where to come back to if the renderer dies and this WebView
               // has to be rebuilt from scratch.
               _lastLoadedUrl = url;
+              _recordHistory(url);
               // Restore scroll position for this URL
               _restoreScrollPosition(url);
               _injectRemoteSnippet();
@@ -1618,11 +1648,33 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     setState(() => _urlController.text = url);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('lastUrl', url);
+    // A route change inside a single-page site is a page visit to the person
+    // using it, even though onPageFinished never fires again.
+    _recordHistory(url);
     _injectJs();
     _injectRemoteSnippet();
     _injectAdBlocker();
     _injectYouTubeAdBlocker();
     _injectPdfDetector();
+  }
+
+  /// Remembers [url] for the URL bar's suggestions.
+  ///
+  /// The title is read first and the row written once, rather than writing
+  /// twice and patching the title in: a second write arriving after the
+  /// same-visit window would count the page as visited twice.
+  Future<void> _recordHistory(String url) async {
+    if (!isRecordableHistoryUrl(url)) return;
+    var title = '';
+    try {
+      // A wedged renderer never answers. Two seconds, then record without it;
+      // the next visit fills the title in.
+      title = (await _controller.getTitle().timeout(
+            const Duration(seconds: 2),
+          )) ??
+          '';
+    } catch (_) {}
+    await HistoryStore.record(url, title: title);
   }
 
   Future<void> _injectPdfDetector() {
@@ -2023,6 +2075,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       initialMask: s.mask ?? '',
       extendDisabled: true,
       existingDbId: dbid,
+      onSendToPlaylist: (t) => _sendSentenceToWebappPlaylist(
+        text: t,
+        title: row.pageTitle ?? '',
+        // A web locator IS the canonical page address, so it doubles as the
+        // card's link back. An EPUB locator is an internal chapter reference
+        // and would render as a link that goes nowhere.
+        url: row.surface == 'web' ? row.locator : '',
+      ),
     );
     if (res == null) return;
     if (res.deleted) {
@@ -2269,6 +2329,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       surface: 'web',
       locator: locator,
       onExtendRequested: (dir) => _requestExtend(sid, dir),
+      onSendToPlaylist: (t) => _sendSentenceToWebappPlaylist(
+        text: t,
+        title: title ?? '',
+        url: url,
+      ),
     );
     if (res == null) {
       // Cancelled.
@@ -2534,6 +2599,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // so the builder runs again and wraps the NEW one.
     if (dialogController != null) {
       dialogController = null;
+      // The rebuild below takes the "no controller yet" branch, which resets
+      // the loaded flag for us.
       _openDialogWithWebview(''); // builds a fresh controller synchronously
       _dialogErrorNotifier.value = 'Reloading — the web content was reclaimed.';
       _dialogErrorNotifier.value = null;
@@ -3618,6 +3685,24 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     _toolsSectionDivider(),
                     _toolsSectionHeader('Web behavior'),
                     ListTile(
+                      leading: const Icon(Icons.history),
+                      title: const Text('History'),
+                      subtitle: const Text(
+                        'Pages you have visited. Search, remove, or clear.',
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () async {
+                        Navigator.of(ctx).pop();
+                        final picked = await Navigator.of(context)
+                            .push<String>(MaterialPageRoute<String>(
+                          builder: (_) => const HistoryScreen(),
+                        ));
+                        if (picked == null || !mounted) return;
+                        _urlController.text = picked;
+                        _loadUrl();
+                      },
+                    ),
+                    ListTile(
                       leading: const Icon(Icons.language),
                       title: const Text('Language'),
                       trailing: DropdownButton<String>(
@@ -3818,6 +3903,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // pre-fill a "context" field.
         _openDialogWithWebview(word);
       },
+      onSendToPlaylist: ({required text, required title, required url}) =>
+          _sendSentenceToWebappPlaylist(text: text, title: title, url: url),
     );
   }
 
@@ -7551,6 +7638,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (dialogController != null) {
       dialogController?.runJavaScript(jsCodeToFilterData(text));
     } else {
+      _dialog1Loaded = false;
       dialogController = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(_userAgent)
@@ -7651,10 +7739,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 _pendingCapturedSubtitle = null;
                 dialogController?.runJavaScript(_jsCodeForCapturedSubtitle(pending));
               }
-              final pendingCaption = _pendingCaptionCapture;
-              if (pendingCaption != null) {
-                _pendingCaptionCapture = null;
-                dialogController?.runJavaScript(_jsCodeForCaptionCapture(pendingCaption));
+              _dialog1Loaded = true;
+              if (_pendingCaptionCaptures.isNotEmpty) {
+                final queued =
+                    List<Map<String, dynamic>>.from(_pendingCaptionCaptures);
+                _pendingCaptionCaptures.clear();
+                for (final d in queued) {
+                  dialogController?.runJavaScript(_jsCodeForCaptionCapture(d));
+                }
               }
               // Warm the language app with the current playlist state
               // so it can render manual cards without an explicit fetch.
@@ -9834,7 +9926,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   /// Its own slot rather than sharing `_pendingCapturedSubtitle`: the two
   /// events are independent and either could be waiting on dialog1.
-  Map<String, dynamic>? _pendingCaptionCapture;
+  /// Captures waiting for dialog1's page to exist.
+  ///
+  /// A list, not a single slot. Two sends in quick succession are easy to
+  /// produce, and the second overwriting the first loses the user's text with
+  /// nothing said about it.
+  final List<Map<String, dynamic>> _pendingCaptionCaptures = [];
+
+  /// True once dialog1's page has finished loading, which is when its
+  /// listeners exist. Dispatching an event before that drops it silently.
+  bool _dialog1Loaded = false;
 
   void _handleCaptionCollector(JavaScriptMessage msg) {
     Object? raw;
@@ -9858,14 +9959,50 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       "window.dispatchEvent(new CustomEvent('cupitorCaptionCapture', "
       "{ detail: ${jsonEncode(detail)} }));";
 
-  void _sendCaptionCaptureToDialog1(Map<String, dynamic> detail) {
-    if (dialogController != null) {
-      dialogController!.runJavaScript(_jsCodeForCaptionCapture(detail));
+  /// Throws if the page refuses the event — a dead renderer, a navigation
+  /// mid-flight. The caller decides whether that is worth telling the user
+  /// about.
+  Future<void> _sendCaptionCaptureToDialog1(Map<String, dynamic> detail) async {
+    if (dialogController != null && _dialog1Loaded) {
+      await dialogController!.runJavaScript(_jsCodeForCaptionCapture(detail));
       _showDialog1();
       return;
     }
-    _pendingCaptionCapture = detail;
-    _openDialogWithWebview('');
+    // The page is not there to receive it yet. Hold it until it is, rather
+    // than firing into a document with no listener registered.
+    _pendingCaptionCaptures.add(detail);
+    if (dialogController == null) {
+      _openDialogWithWebview('');
+    } else {
+      _showDialog1();
+    }
+  }
+
+  /// Pushes ONE sentence from the tagging sheet to the language webapp, which
+  /// offers its playlist picker and files the sentence as a manual card.
+  ///
+  /// Rides the caption-capture contract as a `page` block rather than
+  /// inventing a second one: same validation, same webapp listener, same
+  /// dialog. Returns a message for the sheet to show, or null when the send
+  /// went through — the webapp comes to the front and speaks for itself.
+  Future<String?> _sendSentenceToWebappPlaylist({
+    required String text,
+    required String title,
+    required String url,
+  }) async {
+    final detail = buildCaptionCaptureDetail(
+      sentenceCaptureBlock(text: text, title: title, url: url),
+      fallbackLang: _selectedLanguage,
+    );
+    if (detail == null) return 'Nothing to send.';
+    try {
+      await _sendCaptionCaptureToDialog1(detail);
+    } catch (e) {
+      // Silence here would be the worst outcome: the sheet closes the loop by
+      // showing nothing, and the user believes the sentence was filed.
+      return 'Could not reach Cupitor: $e';
+    }
+    return null;
   }
 
   Widget _errorView(String message, VoidCallback onRetry) {
@@ -9985,21 +10122,96 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           if (_autoHideAppBar) setState(() => _urlBarFocused = focused);
           if (focused) { _appBarTimer?.cancel(); }
         },
-        child: TextField(
-          controller: _urlController,
-          decoration: InputDecoration(
-            hintText: 'Enter URL',
-            border: InputBorder.none,
-            suffixIcon: IconButton(icon: Icon(Icons.arrow_forward), onPressed: () {
-              _loadUrl();
-              FocusManager.instance.primaryFocus?.unfocus();
-            }),
-          ),
-          keyboardType: TextInputType.url,
-          onTap: () => _urlController.selection = TextSelection(baseOffset: 0, extentOffset: _urlController.text.length),
-          onSubmitted: (_) {
+        child: RawAutocomplete<HistoryEntry>(
+          textEditingController: _urlController,
+          focusNode: _urlFocusNode,
+          // Picking a suggestion puts its address in the field; the load is
+          // triggered from onSelected below.
+          displayStringForOption: (e) => e.url,
+          optionsBuilder: (value) {
+            final q = value.text.trim();
+            if (q.isEmpty) return const Iterable<HistoryEntry>.empty();
+            // An untouched bar holds the address of the page already on
+            // screen — this is its state on every tap into the field, before
+            // a character is typed. Suggesting anything then is noise, and
+            // the page itself is never a useful suggestion.
+            final here = (_lastLoadedUrl ?? '').trim();
+            if (q == here || q == here.split('#').first) {
+              return const Iterable<HistoryEntry>.empty();
+            }
+            return HistoryStore.suggest(q).where((e) => e.url != q);
+          },
+          onSelected: (_) {
+            _urlSuggestionPicked = true;
             _loadUrl();
             FocusManager.instance.primaryFocus?.unfocus();
+          },
+          optionsViewBuilder: (context, onSelected, options) {
+            // Read during build and never written back into the tree, so this
+            // cannot trigger a rebuild; it is only consulted on Enter.
+            final highlighted = AutocompleteHighlightedOption.of(context);
+            _urlSuggestionHighlightMoved = highlighted > 0;
+            return Align(
+              alignment: Alignment.topLeft,
+              child: Material(
+                elevation: 4,
+                borderRadius: BorderRadius.circular(8),
+                clipBehavior: Clip.antiAlias,
+                child: ConstrainedBox(
+                  // Width is left alone so the list matches the field it
+                  // drops out of; the framework bounds it to exactly that.
+                  constraints: const BoxConstraints(maxHeight: 280),
+                  child: ListView.builder(
+                    padding: EdgeInsets.zero,
+                    shrinkWrap: true,
+                    itemCount: options.length,
+                    itemBuilder: (context, i) {
+                      final e = options.elementAt(i);
+                      return ListTile(
+                        dense: true,
+                        selected: i == highlighted,
+                        selectedTileColor:
+                            Theme.of(context).colorScheme.surfaceContainerHighest,
+                        leading: const Icon(Icons.history, size: 18),
+                        title: Text(e.label,
+                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                        subtitle: Text(
+                          e.url,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        onTap: () => onSelected(e),
+                      );
+                    },
+                  ),
+                ),
+              ),
+            );
+          },
+          fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
+            return TextField(
+              controller: controller,
+              focusNode: focusNode,
+              decoration: InputDecoration(
+                hintText: 'Enter URL',
+                border: InputBorder.none,
+                suffixIcon: IconButton(icon: Icon(Icons.arrow_forward), onPressed: () {
+                  _loadUrl();
+                  FocusManager.instance.primaryFocus?.unfocus();
+                }),
+              ),
+              keyboardType: TextInputType.url,
+              onTap: () => controller.selection = TextSelection(baseOffset: 0, extentOffset: controller.text.length),
+              onSubmitted: (_) {
+                _urlSuggestionPicked = false;
+                // Only when the user arrowed to a suggestion. onSelected runs
+                // synchronously from here and sets the flag below.
+                if (_urlSuggestionHighlightMoved) onFieldSubmitted();
+                if (!_urlSuggestionPicked) _loadUrl();
+                FocusManager.instance.primaryFocus?.unfocus();
+              },
+            );
           },
         ),
       ),

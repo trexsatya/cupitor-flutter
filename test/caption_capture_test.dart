@@ -245,4 +245,66 @@ void main() {
       expect(d['url'], '');
     });
   });
+
+  // One sentence sent from the tagging sheet. It has to come out the far side
+  // of buildCaptionCaptureDetail intact, because that is the only validation
+  // the host does before the webapp sees it.
+  group('single sentence from the tagging sheet', () {
+    test('survives the shaping it is fed into', () {
+      final d = build(sentenceCaptureBlock(
+        text: 'Han gick hem.',
+        title: 'Langtan till landet',
+        url: 'https://urplay.se/program/1',
+      ))!;
+      expect(d['source'], 'page');
+      expect(d['title'], 'Langtan till landet');
+      expect(d['url'], 'https://urplay.se/program/1');
+      expect(d['lang'], 'sv'); // the app's language, since the block carries none
+      final lines = d['lines'] as List;
+      expect(lines, hasLength(1));
+      expect(lines.first['text'], 'Han gick hem.');
+      // No media time: a page block is what an untimed selection looks like.
+      expect(lines.first['start'], 0.0);
+      expect(lines.first['end'], 0.0);
+    });
+
+    test('an EPUB sentence carries a title and no address', () {
+      final d = build(sentenceCaptureBlock(
+        text: 'Det var en gang.',
+        title: 'Rontgenbilden - Kapitel 3',
+        url: '',
+      ))!;
+      expect(d['url'], '');
+      expect(d['title'], 'Rontgenbilden - Kapitel 3');
+      expect((d['lines'] as List).first['text'], 'Det var en gang.');
+    });
+
+    test('surrounding whitespace is trimmed off the metadata', () {
+      final d = build(sentenceCaptureBlock(
+        text: 'Hej.',
+        title: '  spaced out  ',
+        url: '  https://example.test/a  ',
+      ))!;
+      expect(d['title'], 'spaced out');
+      expect(d['url'], 'https://example.test/a');
+    });
+
+    // The send button must not be able to push an empty card into a playlist.
+    test('a blank sentence produces nothing to send', () {
+      expect(build(sentenceCaptureBlock(text: '   ', title: 't', url: '')), isNull);
+      expect(build(sentenceCaptureBlock(text: '', title: 't', url: '')), isNull);
+    });
+
+    test('a multi-line selection stays one line, one card', () {
+      final d = build(sentenceCaptureBlock(
+        text: 'Forsta raden\nandra raden',
+        title: '',
+        url: '',
+      ))!;
+      // The host does not split on newlines; the webapp collapses them when it
+      // builds the card face.
+      expect((d['lines'] as List), hasLength(1));
+      expect((d['lines'] as List).first['text'], 'Forsta raden\nandra raden');
+    });
+  });
 }

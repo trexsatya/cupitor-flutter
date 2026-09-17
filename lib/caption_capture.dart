@@ -77,6 +77,30 @@ Map<String, dynamic>? buildCaptionCaptureDetail(
   };
 }
 
+/// Shapes ONE hand-picked sentence into the raw block
+/// [buildCaptionCaptureDetail] accepts, so a sentence sent from the tagging
+/// sheet travels the same validated path as a basket of page selections.
+///
+/// [url] may be empty. A sentence out of an EPUB has no address worth
+/// linking to, and the webapp treats an empty url as "no media link, no
+/// de-duplication" rather than as an error.
+Map<String, dynamic> sentenceCaptureBlock({
+  required String text,
+  required String title,
+  required String url,
+}) {
+  return <String, dynamic>{
+    'source': 'page',
+    'title': title.trim(),
+    'url': url.trim(),
+    // A hand-picked sentence has no media time, which is what every 'page'
+    // block looks like.
+    'lines': <Map<String, dynamic>>[
+      {'start': 0, 'end': 0, 'text': text},
+    ],
+  };
+}
+
 String _str(Object? v) => v == null ? '' : v.toString();
 
 double _num(Object? v) {

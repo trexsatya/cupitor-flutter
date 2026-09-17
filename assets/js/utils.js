@@ -41,6 +41,13 @@
     // (e.g. <a><span>foo</span></a> — parent is <span>, not <a>).
     if (parent.closest('a')) return true;
     if (parent.closest('.clickable-word')) return true;
+    // Opt-out marker. Page scripts we control (snippet.js's subtitle sidebar,
+    // the webapp) put this on chrome that is text but not reading material —
+    // a cue's "12:34" timestamp, a status readout, a settings dialog. Without
+    // it those get wrapped like prose and a tap on them opens a lookup for
+    // "12". Honoured here rather than in the click handler so the spans are
+    // never created in the first place.
+    if (parent.closest('.cup-nolookup')) return true;
     return false;
   }
 
@@ -88,6 +95,9 @@
     if (root.nodeType !== Node.ELEMENT_NODE) return;
     if (SKIP_TAGS.has(root.nodeName)) return;
     if (root.classList && root.classList.contains('clickable-word')) return;
+    // `closest`, not `contains`: the observer can hand us a node nested
+    // inside an opted-out container, not just the container itself.
+    if (root.closest && root.closest('.cup-nolookup')) return;
     if (root.isContentEditable) return;
 
     // Walk both elements and text nodes so FILTER_REJECT on an element
@@ -101,6 +111,7 @@
           if (n.nodeType === Node.ELEMENT_NODE) {
             if (SKIP_TAGS.has(n.nodeName)) return NodeFilter.FILTER_REJECT;
             if (n.classList && n.classList.contains('clickable-word')) return NodeFilter.FILTER_REJECT;
+            if (n.classList && n.classList.contains('cup-nolookup')) return NodeFilter.FILTER_REJECT;
             if (n.isContentEditable) return NodeFilter.FILTER_REJECT;
             return NodeFilter.FILTER_SKIP;  // don't emit, but descend
           }
@@ -255,6 +266,14 @@
       // stopPropagation() on their own click handlers can't swallow us.
       document.addEventListener('click', (e) => {
         let t = e.target && e.target.closest && e.target.closest('.clickable-word');
+        // The same opt-out the wrapper honours, applied to the tap itself.
+        // The wrapper alone only promises "no new spans under here", which is
+        // not enough for a container that gains the class after its words
+        // were already wrapped — the subtitle sidebar does exactly that when
+        // it enters select mode, where a tap must tick the line rather than
+        // look a word up. Checked before capture mode too: a region that
+        // opts out of lookups is not somewhere to tag a sentence either.
+        if (t && t.closest('.cup-nolookup')) t = null;
         if (t) {
           try {
              // Sentence-tag capture mode: route to the tagging handler

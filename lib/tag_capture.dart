@@ -149,6 +149,7 @@ Future<CaptureSaveResult?> showTagCaptureSheet({
   bool extendDisabled = false,
   int? existingDbId,
   String? speechLocale,
+  Future<String?> Function(String text)? onSendToPlaylist,
 }) {
   return showModalBottomSheet<CaptureSaveResult>(
     context: context,
@@ -169,6 +170,7 @@ Future<CaptureSaveResult?> showTagCaptureSheet({
       extendDisabled: extendDisabled,
       existingDbId: existingDbId,
       speechLocale: speechLocale,
+      onSendToPlaylist: onSendToPlaylist,
     ),
   );
 }
@@ -184,6 +186,15 @@ class _TagCaptureSheet extends StatefulWidget {
   final bool extendDisabled;
   final int? existingDbId;
   final String? speechLocale;
+
+  /// When non-null the sheet offers a "send to playlist" action. Called with
+  /// the sentence as it currently reads; returns a message to show the user,
+  /// or null to say nothing — the normal case, because the send brings the
+  /// webapp to the front and it does the talking from there.
+  ///
+  /// The call site supplies this because only it knows where the sentence
+  /// came from: a web page sends its address, a book sends its title.
+  final Future<String?> Function(String text)? onSendToPlaylist;
   const _TagCaptureSheet({
     required this.initial,
     required this.profileId,
@@ -195,6 +206,7 @@ class _TagCaptureSheet extends StatefulWidget {
     this.extendDisabled = false,
     this.existingDbId,
     this.speechLocale,
+    this.onSendToPlaylist,
   });
 
   @override
@@ -1001,6 +1013,33 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
     });
   }
 
+  /// True while a send is in flight. The action is a one-shot that reaches
+  /// out of this sheet, so it has to be un-pressable until it comes back —
+  /// two taps would file the same sentence twice.
+  bool _sendingToPlaylist = false;
+
+  Future<void> _sendToPlaylist() async {
+    final send = widget.onSendToPlaylist;
+    if (send == null || _sendingToPlaylist) return;
+    final text = _text.trim();
+    if (text.isEmpty) return;
+    setState(() => _sendingToPlaylist = true);
+    String? message;
+    try {
+      message = await send(text);
+    } catch (e) {
+      message = 'Could not send: $e';
+    }
+    // The send opens the webapp over this sheet, so the sheet can be gone by
+    // the time we get back.
+    if (!mounted) return;
+    setState(() => _sendingToPlaylist = false);
+    if (message != null && message.isNotEmpty) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
   void _save() {
     Navigator.of(context).pop(CaptureSaveResult(
       text: _text,
@@ -1060,7 +1099,29 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Text('Tag this sentence', style: theme.textTheme.titleMedium),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text('Tag this sentence',
+                        style: theme.textTheme.titleMedium),
+                  ),
+                  if (widget.onSendToPlaylist != null)
+                    _sendingToPlaylist
+                        ? const Padding(
+                            padding: EdgeInsets.all(12),
+                            child: SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          )
+                        : IconButton(
+                            tooltip: 'Send to a playlist in Cupitor',
+                            icon: const Icon(Icons.playlist_add),
+                            onPressed: _sendToPlaylist,
+                          ),
+                ],
+              ),
               const SizedBox(height: 8),
               Container(
                 constraints: const BoxConstraints(maxHeight: 180),

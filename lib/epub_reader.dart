@@ -827,6 +827,11 @@ Future<void> openEpubReader(
   required EpubLibrary library,
   required void Function(String word, String context) onLookup,
   String? initialHighlight,
+  Future<String?> Function({
+    required String text,
+    required String title,
+    required String url,
+  })? onSendToPlaylist,
 }) async {
   // Parse the EPUB on a microtask so the caller isn't blocked while the
   // library entry is recorded and the screen is pushed.
@@ -852,6 +857,7 @@ Future<void> openEpubReader(
       book: book,
       onLookup: onLookup,
       initialHighlight: initialHighlight,
+      onSendToPlaylist: onSendToPlaylist,
     ),
     fullscreenDialog: true,
   ));
@@ -865,10 +871,20 @@ class EpubReaderScreen extends StatefulWidget {
     required this.book,
     required this.onLookup,
     this.initialHighlight,
+    this.onSendToPlaylist,
   });
 
   final EpubBook book;
   final void Function(String word, String context) onLookup;
+
+  /// Sends one sentence to the language webapp to be filed in a playlist.
+  /// Lives in the host because only it holds the webapp's WebView. Null
+  /// hides the action from the tagging sheet.
+  final Future<String?> Function({
+    required String text,
+    required String title,
+    required String url,
+  })? onSendToPlaylist;
 
   /// Phrase to scroll to after the initial chapter loads. When
   /// non-null the reader opens with the find bar visible and the
@@ -1225,6 +1241,17 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
   // ─── Sentence tagging (JS injection + bridge + UI hooks) ───────────────
 
   String get _tagLocator => epubLocator(book.key, _state.chapterIdx);
+
+  /// Binds where-it-came-from to the host's sender, or returns null when the
+  /// host gave us no way to reach the webapp — which hides the action.
+  Future<String?> Function(String)? _playlistSender({
+    required String title,
+    required String url,
+  }) {
+    final send = widget.onSendToPlaylist;
+    if (send == null) return null;
+    return (text) => send(text: text, title: title, url: url);
+  }
 
   // Tag helpers script, injected on each `chapterReady`. Works against
   // the existing `.cup-sent[data-sent=N]` spans that the chapter wrapper
@@ -2543,6 +2570,12 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
       initialMask: s.mask ?? '',
       extendDisabled: true,
       existingDbId: dbid,
+      onSendToPlaylist: _playlistSender(
+        title: row.pageTitle ?? '',
+        // A book chapter has no address; sending the internal locator would
+        // put a link that goes nowhere on the card.
+        url: row.surface == 'web' ? row.locator : '',
+      ),
     );
     if (res == null) return;
     if (res.deleted) {
@@ -2852,6 +2885,10 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
       surface: 'epub',
       locator: _tagLocator,
       onExtendRequested: (d) => _requestTagExtend(sid, d),
+      onSendToPlaylist: _playlistSender(
+        title: '${book.title} — ${book.chapters[_state.chapterIdx].title}',
+        url: '',
+      ),
     );
     if (res == null) {
       _controller?.runJavaScript(
