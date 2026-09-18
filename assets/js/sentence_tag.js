@@ -50,6 +50,14 @@
   // line wrapper spans. Slower per tap but more accurate on those
   // sites. Dart sets this on each page load via the setting.
   var segmentationScope = 'block';
+  // Spans already taken by a record in the current rehydrate pass, so two
+  // records that read alike do not both land on the same occurrence.
+  var rehydrateClaimed = new Set();
+  // Bumped by every snapshot. A pass that finds it has moved on stops:
+  // Dart's runJavaScript resolves when the call returns, not when this
+  // finishes, so a second snapshot can arrive mid-pass.
+  var rehydratePass = 0;
+  var rehydrateBusy = false;
 
   function nextSid() { return 's_' + (++captureCounter); }
 
@@ -162,9 +170,9 @@
     if (document.getElementById('__cupitor_st_styles')) return;
     var style = document.createElement('style');
     style.id = '__cupitor_st_styles';
-    // body.cupitor-filter-active dims ALL inherited text colour so
-    // short words (utils.js skips ≤2-char words) + punctuation +
-    // whitespace also fade. Kept .clickable-word spans get `color:
+    // body.cupitor-filter-active dims ALL inherited text colour so the
+    // text between the word spans — punctuation and whitespace — fades
+    // with them. Kept .clickable-word spans get `color:
     // initial` to restore the page's default text colour, so the
     // existing .cupitor-fade opacity rule alone differentiates kept
     // from dimmed within the wrapped set.
@@ -312,6 +320,10 @@
     HEADER:1, FOOTER:1, NAV:1, MAIN:1, FIGURE:1, FIGCAPTION:1, TD:1, TH:1,
     DD:1, DT:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, PRE:1
   };
+  // The same set as a selector: a capture's block and a rehydrate's block
+  // have to be the same thing, or a sentence captured in, say, a
+  // <figcaption> has nowhere to be found again.
+  var BLOCK_SELECTOR = Object.keys(BLOCK_TAGS).join(',').toLowerCase();
 
   function nearestBlock(el) {
     var n = el;
@@ -322,18 +334,152 @@
     return el.parentElement || document.body;
   }
 
+  // Does this element start on a new line when rendered? The layout engine
+  // is asked first: a hidden <p> or an inline-styled <li> breaks nothing,
+  // while a <span> styled display:block — one per verse line on
+  // litteraturbanken — breaks the line just like a paragraph. Floats and
+  // absolutely positioned boxes report display:block too but sit inside
+  // the line, so they are excluded. Table cells share a line with their
+  // neighbours. The tag list is only for when the engine gives no answer.
+  // Only called per capture, never on the rehydrate path.
+  var OWN_LINE_DISPLAY = /^(block|flex|grid|list-item|table|table-row|table-caption|table-row-group|table-header-group|table-footer-group|flow-root)$/;
+  var OWN_LINE_TAGS = /^(BR|HR|P|DIV|LI|UL|OL|DL|DD|DT|BLOCKQUOTE|SECTION|ARTICLE|ASIDE|HEADER|FOOTER|NAV|MAIN|FIGURE|FIGCAPTION|TABLE|TR|H[1-6]|PRE)$/;
+  // Style reads are the expensive part of a rehydrate walk, and the answers
+  // do not change within one. The cache is dropped at the start of each.
+  var styleCache = null;
+  function styleOf(el) {
+    if (!el || el.nodeType !== 1) return null;
+    if (!styleCache) styleCache = new WeakMap();
+    if (styleCache.has(el)) return styleCache.get(el);
+    var cs = null;
+    try { cs = window.getComputedStyle(el); } catch (e) { cs = null; }
+    styleCache.set(el, cs);
+    return cs;
+  }
+  // A pass asks the same questions of the same blocks for every record, so
+  // the answers are kept for its duration. All of it is dropped whenever
+  // the page may have moved under us.
+  var walkCache = null;
+  var blocksCache = null;
+  function resetStyleCache() {
+    styleCache = null;
+    walkCache = null;
+    blocksCache = null;
+  }
+  function indexedBlock(block) {
+    if (!walkCache) walkCache = new Map();
+    var hit = walkCache.get(block);
+    if (hit) return hit;
+    var idx = blockWordIndex(block);
+    hit = { idx: idx, sents: idx.entries.length ? segmentSentences(idx.text) : [] };
+    walkCache.set(block, hit);
+    return hit;
+  }
+
+  // Text the reader cannot see is not part of a sentence — and the capture
+  // and the rehydrate walk must agree about that, or a tag stops finding
+  // its own sentence when a page's hidden strings change.
+  var NON_TEXT_TAGS = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD|TITLE|LINK|META)$/;
+  function notRendered(el) {
+    if (NON_TEXT_TAGS.test(el.tagName || '')) return true;
+    var cs = styleOf(el);
+    return !!cs && cs.display === 'none';
+  }
+  // visibility is inherited but a descendant can turn it back on, so this
+  // asks about the element holding the text, never about its ancestors.
+  function invisible(el) {
+    var cs = styleOf(el);
+    return !!cs && cs.visibility === 'hidden';
+  }
+
+  function startsOwnLine(el) {
+    var tag = el.tagName || '';
+    var cs = styleOf(el);
+    var display = cs ? (cs.display || '') : '';
+    if (!display) return OWN_LINE_TAGS.test(tag);
+    if (display === 'none') return false;
+    // A <br> has no box of its own and reports inline.
+    if (tag === 'BR') return true;
+    var fl = cs.cssFloat || cs['float'] || 'none';
+    if (fl !== 'none') return false;
+    if (cs.position === 'absolute' || cs.position === 'fixed') return false;
+    if (!OWN_LINE_DISPLAY.test(display)) return false;
+    // A flex or grid container blockifies its children whatever they are,
+    // so the child's own display says nothing about lines here — a row of
+    // flex items shares one. The container has the answer.
+    var parent = el.parentNode;
+    var ps = parent ? styleOf(parent) : null;
+    var pd = ps ? (ps.display || '') : '';
+    if (pd === 'flex' || pd === 'inline-flex') {
+      return /^column/.test(ps.flexDirection || '');
+    }
+    return true;
+  }
+
+  // Shares the line with its neighbours but keeps a box of its own, so the
+  // reader reads a gap even where the markup has none. Own-line elements
+  // are excluded: those are a break, not a gap.
+  function ownBoxOnLine(el) {
+    var cs = styleOf(el);
+    var d = cs ? (cs.display || '') : '';
+    if (!d) return /^(TD|TH|CAPTION)$/.test(el.tagName || '');
+    if (d === 'none') return false;
+    // An inline-block flows inline: the text beside it touches it.
+    if (d.indexOf('inline') === 0) return false;
+    return /^table-(cell|caption)$/.test(d);
+  }
+
+  // A newline in the source is a line the reader sees only inside
+  // preformatted text; anywhere else the browser draws it as a space.
+  function keepsNewlines(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.closest && el.closest('pre')) return true;
+    var cs = styleOf(el);
+    var ws = cs ? (cs.whiteSpace || '') : '';
+    return /^(pre|pre-wrap|pre-line|break-spaces)$/.test(ws);
+  }
+
   // Returns the text of the block + an array of word-span entries
   // [{span, start, end}] giving each clickable-word's offset range
   // inside the block's textContent.
-  function blockWordIndex(block) {
+  //
+  // With `withBreaks`, also `breaks`: the offsets in that text where the
+  // reader sees a line break — a <br>, either edge of an element that
+  // starts its own line, or a newline inside preformatted text. The text
+  // itself is never altered by this, so segmentation and fingerprints see
+  // exactly what they always did. Rehydration walks every block on the
+  // page and never asks for breaks; a tap asks once.
+  function blockWordIndex(block, withBreaks) {
     var text = '';
     var entries = [];
+    var breaks = withBreaks ? [] : null;
+    var gaps = withBreaks ? [] : null;
+    function parentKeepsNewlines(el) {
+      return el ? keepsNewlines(el) : false;
+    }
     function walk(node) {
       if (node.nodeType === 3) {
+        if (invisible(node.parentNode)) return;
+        if (breaks && parentKeepsNewlines(node.parentNode)) {
+          var v = node.nodeValue;
+          for (var k = 0; k < v.length; k++) if (v[k] === '\n') breaks.push(text.length + k);
+        }
         text += node.nodeValue;
       } else if (node.nodeType === 1) {
-        if (node.tagName === 'SPAN' && node.classList &&
-            node.classList.contains('clickable-word')) {
+        if (notRendered(node)) return;
+        var wordSpan = node.tagName === 'SPAN' && node.classList &&
+            node.classList.contains('clickable-word');
+        if (wordSpan && invisible(node)) return;
+        if (wordSpan && breaks && startsOwnLine(node)) {
+          // Sites that print one word per line wrap the word itself.
+          breaks.push(text.length);
+          var inner0 = originalTextOf(node);
+          text += inner0;
+          entries.push({ span: node, start: text.length - inner0.length, end: text.length });
+          breaks.push(text.length);
+          return;
+        }
+        if (wordSpan) {
           var start = text.length;
           // Use the ORIGINAL (pre-transform) word text when a rule has
           // rewritten this span. This keeps blockWordIndex + sentence
@@ -343,12 +489,19 @@
           text += inner;
           entries.push({ span: node, start: start, end: start + inner.length });
         } else {
+          var ownLine = breaks && startsOwnLine(node);
+          var ownBox = !ownLine && breaks && ownBoxOnLine(node);
+          if (ownLine) breaks.push(text.length);
+          if (ownBox) gaps.push(text.length);
           for (var i = 0; i < node.childNodes.length; i++) walk(node.childNodes[i]);
+          if (ownLine) breaks.push(text.length);
+          if (ownBox) gaps.push(text.length);
         }
       }
     }
     for (var i = 0; i < block.childNodes.length; i++) walk(block.childNodes[i]);
-    return { text: text, entries: entries };
+    return breaks ? { text: text, entries: entries, breaks: breaks, gaps: gaps }
+                  : { text: text, entries: entries };
   }
 
   function segmentSentences(text) {
@@ -441,10 +594,12 @@
   window.__cupitorOnWordTap = async function (span) {
     if (!span) return;
     ensureStyles();
+    resetStyleCache();
     var block = segmentationScope === 'document'
       ? document.body
       : nearestBlock(span);
-    var idx = blockWordIndex(block);
+    // With breaks: this index feeds the text the sheet shows.
+    var idx = blockWordIndex(block, true);
     if (!idx.entries.length) return;
     // Find a representative offset for the tapped span (middle of its range).
     var tappedEntry = null;
@@ -520,7 +675,54 @@
   function sliceSent(st, from, to) {
     var lo = st.sents[from].start;
     var hi = st.sents[to].end;
-    return st.idx.text.substring(lo, hi).replace(/\s+/g, ' ').trim();
+    return renderWhitespace(st.idx.text, lo, hi, st.idx.breaks, st.idx.gaps);
+  }
+
+  // Whitespace as the reader saw it. Every run of whitespace becomes one
+  // character: a line break when a rendered break (see blockWordIndex)
+  // falls on or inside the run, otherwise a space. A break that falls
+  // between two characters with no whitespace at all — Google Docs writes
+  // `</p><p>` with nothing in between — becomes a line break too: the
+  // reader saw two lines there.
+  //
+  // So this text can differ from the raw slice by whitespace, which is why
+  // rehydration compares with normEq(), which ignores it.
+  function renderWhitespace(text, lo, hi, breaks, gaps) {
+    var slice = text.substring(lo, hi);
+    var at = {};
+    var gapAt = {};
+    var k, o;
+    if (breaks) {
+      for (k = 0; k < breaks.length; k++) {
+        o = breaks[k] - lo;
+        if (o >= 0 && o <= slice.length) at[o] = true;
+      }
+    }
+    if (gaps) {
+      for (k = 0; k < gaps.length; k++) {
+        o = gaps[k] - lo;
+        if (o >= 0 && o <= slice.length && !at[o]) gapAt[o] = true;
+      }
+    }
+    var out = '';
+    var i = 0;
+    while (i < slice.length) {
+      if (!/\s/.test(slice[i])) {
+        if (at[i] && out.length && out.charAt(out.length - 1) !== '\n') out += '\n';
+        else if (gapAt[i] && out.length && !/\s/.test(out.charAt(out.length - 1))) out += ' ';
+        out += slice[i++];
+        continue;
+      }
+      var j = i;
+      var lineBreak = !!at[i];
+      while (j < slice.length && /\s/.test(slice[j])) {
+        j++;
+        if (at[j]) lineBreak = true;
+      }
+      out += lineBreak ? '\n' : ' ';
+      i = j;
+    }
+    return out.trim();
   }
 
   // Dart asks JS to extend the current capture range by one sentence
@@ -657,8 +859,13 @@
   // Dart pushes the full snapshot of tagged sentences for the current
   // page after onPageFinished. We text-search the DOM for each and
   // paint permanent highlights. Stash the snapshot for the filter.
-  window.__cupitorApplyTags = function (json) {
+  window.__cupitorApplyTags = async function (json) {
     ensureStyles();
+    resetStyleCache();
+    rehydrateClaimed = new Set();
+    var pass = ++rehydratePass;
+    rehydrateBusy = true;
+    try {
     var list;
     try { list = JSON.parse(json); } catch (_) { list = []; }
     rehydrated = list || [];
@@ -677,10 +884,15 @@
     });
     var matched = 0;
     var pending = [];
-    for (var i = 0; i < rehydrated.length; i++) {
-      if (paintRehydratedSentence(rehydrated[i])) matched++;
-      else pending.push(rehydrated[i]);
+    // Hold the snapshot locally: the module field belongs to whichever
+    // pass is newest.
+    var records = rehydrated;
+    for (var i = 0; i < records.length; i++) {
+      if (rehydratePass !== pass) return;
+      if (await paintRehydratedSentence(records[i])) matched++;
+      else pending.push(records[i]);
     }
+    if (rehydratePass !== pass) return;
     if (masksVisible) refreshAllMaskInjections();
     if (window.SnippetLogChannel) {
       window.SnippetLogChannel.postMessage(
@@ -693,15 +905,42 @@
     // If we matched at least one and a filter is already active, the
     // first applyFilter pass ran on an empty DOM — re-fade now.
     if (matched > 0 && filterTagIds) refreshFilterFade();
+    } finally {
+      // A newer snapshot owns the flag once it has bumped the pass.
+      if (rehydratePass === pass) rehydrateBusy = false;
+    }
   };
 
+  var OBSERVE_OPTS = {
+    childList: true,
+    subtree: true,
+    // An accordion, a tab or a <details> reveals its text by flipping a
+    // class or a style, and until then the walk cannot see that text.
+    attributes: true,
+    attributeFilter: ['class', 'style', 'hidden']
+  };
+
+  // Our own writes to the page are not news. Without this, painting a mask
+  // would wake the observer, which would repaint it, for ever.
+  function withObserverPaused(fn) {
+    var had = !!rehydrateObserver;
+    if (had) rehydrateObserver.disconnect();
+    try { fn(); } finally {
+      if (had && rehydrateObserver) rehydrateObserver.observe(document.body, OBSERVE_OPTS);
+    }
+  }
+
   function startRehydrateObserver() {
-    if (rehydrateObserver || !document.body) return;
-    rehydrateObserver = new MutationObserver(function () {
-      if (rehydrateRetryTimer !== null) clearTimeout(rehydrateRetryTimer);
-      rehydrateRetryTimer = setTimeout(retryRehydrate, REHYDRATE_DEBOUNCE_MS);
-    });
-    rehydrateObserver.observe(document.body, {childList: true, subtree: true});
+    // Already watching: give it the full budget again rather than letting
+    // it expire on the old clock.
+    if (rehydrateObserver) {
+      if (rehydrateStopTimer !== null) clearTimeout(rehydrateStopTimer);
+      rehydrateStopTimer = setTimeout(stopRehydrateObserver, REHYDRATE_GIVE_UP_MS);
+      return;
+    }
+    if (!document.body) return;
+    rehydrateObserver = new MutationObserver(scheduleRetry);
+    rehydrateObserver.observe(document.body, OBSERVE_OPTS);
     rehydrateStopTimer = setTimeout(stopRehydrateObserver, REHYDRATE_GIVE_UP_MS);
   }
 
@@ -711,18 +950,37 @@
     if (rehydrateStopTimer !== null) { clearTimeout(rehydrateStopTimer); rehydrateStopTimer = null; }
   }
 
-  function retryRehydrate() {
+  function scheduleRetry() {
+    if (rehydrateRetryTimer !== null) clearTimeout(rehydrateRetryTimer);
+    rehydrateRetryTimer = setTimeout(retryRehydrate, REHYDRATE_DEBOUNCE_MS);
+  }
+
+  async function retryRehydrate() {
     rehydrateRetryTimer = null;
+    // Something else is walking the page. Come back rather than dropping
+    // this wake-up: the mutation that caused it may be the one that
+    // finally brings a pending record's text onto the page.
+    if (rehydrateBusy) { scheduleRetry(); return; }
+    var pass = rehydratePass;
+    rehydrateBusy = true;
+    // A retry searches a DOM that has just changed, so it re-reads styles.
+    resetStyleCache();
+    try {
     var newlyMatched = 0;
     if (rehydratePending.length) {
+      var maskedWhileSearching = masksVisible;
+      if (maskedWhileSearching) withObserverPaused(clearAllMaskInjections);
       var still = [];
-      for (var i = 0; i < rehydratePending.length; i++) {
-        if (paintRehydratedSentence(rehydratePending[i])) newlyMatched++;
-        else still.push(rehydratePending[i]);
+      var records = rehydratePending;
+      for (var i = 0; i < records.length; i++) {
+        if (rehydratePass !== pass) return;
+        if (await paintRehydratedSentence(records[i])) newlyMatched++;
+        else still.push(records[i]);
       }
+      if (rehydratePass !== pass) return;
       rehydratePending = still;
+      if (maskedWhileSearching) withObserverPaused(refreshAllMaskInjections);
       if (newlyMatched > 0) {
-        if (masksVisible) refreshAllMaskInjections();
         if (window.SnippetLogChannel) {
           window.SnippetLogChannel.postMessage(
             '[tagging] rehydrate retry +' + newlyMatched + ' (pending=' + rehydratePending.length + ')'
@@ -734,10 +992,16 @@
     // need to fade any .clickable-word spans that the SPA just added.
     if (filterTagIds) refreshFilterFade();
     if (!rehydratePending.length && !filterTagIds) stopRehydrateObserver();
+    } finally {
+      if (rehydratePass === pass) rehydrateBusy = false;
+    }
   }
 
   function refreshFilterFade() {
     if (!filterTagIds) return;
+    withObserverPaused(applyFilterFade);
+  }
+  function applyFilterFade() {
     var spans = document.querySelectorAll('span.clickable-word, .cupitor-mask');
     for (var j = 0; j < spans.length; j++) {
       var tagsAttr = spans[j].getAttribute('data-cupitor-tagids');
@@ -754,37 +1018,116 @@
     }
   }
 
-  function paintRehydratedSentence(rec) {
-    var sid = 's_db_' + rec.id;
-    // Mirror the capture-time scope. 'document' uses body as the single
-    // search root so sentences spanning many per-line wrappers are
-    // findable; 'block' iterates conventional block elements.
-    var blocks = segmentationScope === 'document'
-      ? [document.body]
-      : document.querySelectorAll(
-          'p,div,li,blockquote,section,article,td,th,dd,dt,h1,h2,h3,h4,h5,h6,pre'
-        );
-    for (var b = 0; b < blocks.length; b++) {
-      var idx = blockWordIndex(blocks[b]);
-      if (!idx.entries.length) continue;
-      var sents = segmentSentences(idx.text);
-      for (var s = 0; s < sents.length; s++) {
-        if (!normEq(sents[s].segment, rec.text)) continue;
-        var spans = collectSpansInRange(idx, sents[s].start, sents[s].end);
-        if (!spans.length) continue;
-        for (var i = 0; i < spans.length; i++) {
-          // Keep data-cupitor-sent for commit-flow lookup. Overlapping
-          // captures share the bare element identity; the per-group
-          // dbid CSV (set via stampGroup below) is what filter and
-          // mask logic consult.
-          spans[i].setAttribute('data-cupitor-sent', sid);
-        }
-        registerTagSet(rec.id, rec.tagIds || [], rec.tagColors || [], spans, rec.mask || '');
-        stampGroup(rec.id);
-        return true;
-      }
+  // The roots a scope segments over. 'document' uses body as the single
+  // search root so sentences spanning many per-line wrappers are findable;
+  // 'block' iterates conventional block elements.
+  function blocksForScope(scope) {
+    if (scope === 'document') return [document.body];
+    if (!blocksCache) blocksCache = {};
+    if (blocksCache[scope]) return blocksCache[scope];
+    var all = document.querySelectorAll(BLOCK_SELECTOR);
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      if (!hiddenHere(all[i])) out.push(all[i]);
+    }
+    blocksCache[scope] = out;
+    return out;
+  }
+
+  // display:none does not reach a descendant's own computed style, so a
+  // walk that starts inside a hidden container would index text the reader
+  // cannot see. Ask the ancestors once, at the root of each walk.
+  function hiddenHere(el) {
+    var n = el;
+    while (n && n.nodeType === 1) {
+      if (notRendered(n)) return true;
+      n = n.parentNode;
     }
     return false;
+  }
+
+  // Every place on the page that reads like this record's sentence.
+  function candidatesFor(rec, blocks) {
+    var out = [];
+    var want = normKey(rec.text);
+    if (!want) return out;
+    for (var b = 0; b < blocks.length; b++) {
+      var walked = indexedBlock(blocks[b]);
+      var idx = walked.idx;
+      var sents = walked.sents;
+      if (!idx.entries.length) continue;
+      for (var s = 0; s < sents.length; s++) {
+        // Prev/Next extend a capture over several sentences, so a record
+        // can span a run of them. Grow the run until it reads alike or
+        // overshoots.
+        var acc = '';
+        for (var e = s; e < sents.length; e++) {
+          acc += sents[e].segment;
+          var key = normKey(acc);
+          if (key === want) {
+            var spans = collectSpansInRange(idx, sents[s].start, sents[e].end);
+            // The same words surface once per block that wraps them, and
+            // each wrapper reads different neighbours around them, so all
+            // of them are evidence worth scoring.
+            if (spans.length) out.push({ sents: sents, s: s, e: e, spans: spans });
+            break;
+          }
+          if (key.length >= want.length) break;
+        }
+      }
+    }
+    return out;
+  }
+
+  // Two places on a page can read alike — a refrain, a bare "Ja." — which
+  // is what the neighbour fingerprints are for. A place already claimed in
+  // this pass loses a tie, so two records of the same sentence take one
+  // occurrence each.
+  async function bestCandidate(rec, cands) {
+    var best = cands[0], bestScore = -1;
+    for (var i = 0; i < cands.length; i++) {
+      var c = cands[i];
+      var prevText = c.s > 0 ? c.sents[c.s - 1].segment : '';
+      var nextText = c.e < c.sents.length - 1 ? c.sents[c.e + 1].segment : '';
+      var score = 0;
+      if ((await _fp(prevText)) === (rec.prevFp || '')) score += 2;
+      if ((await _fp(nextText)) === (rec.nextFp || '')) score += 2;
+      if (!rehydrateClaimed.has(c.spans[0])) score += 1;
+      if (score > bestScore) { bestScore = score; best = c; }
+      if (score === 5) break;
+    }
+    return best;
+  }
+
+  async function paintRehydratedSentence(rec) {
+    var sid = 's_db_' + rec.id;
+    // Everything below writes to the page, and there is an await in the
+    // middle of it. A snapshot that arrived meanwhile owns the page now.
+    var pass = rehydratePass;
+    // A record captured under the other scope reads differently — a block
+    // sentence is a fragment of a document one — so fall back to the other
+    // scope rather than leaving the page unpainted when the setting moves.
+    var cands = candidatesFor(rec, blocksForScope(segmentationScope));
+    if (!cands.length) {
+      cands = candidatesFor(rec, blocksForScope(
+        segmentationScope === 'document' ? 'block' : 'document'));
+    }
+    if (!cands.length) return false;
+    var pick = cands.length === 1 ? cands[0] : await bestCandidate(rec, cands);
+    if (rehydratePass !== pass) return false;
+    var spans = pick.spans;
+    for (var i = 0; i < spans.length; i++) {
+      // Keep data-cupitor-sent for commit-flow lookup. Overlapping
+      // captures share the bare element identity; the per-group
+      // dbid CSV (set via stampGroup below) is what filter and
+      // mask logic consult.
+      spans[i].setAttribute('data-cupitor-sent', sid);
+    }
+    rehydrateClaimed.add(spans[0]);
+    if (tagSets[rec.id]) unstampGroup(rec.id);
+    registerTagSet(rec.id, rec.tagIds || [], rec.tagColors || [], spans, rec.mask || '');
+    stampGroup(rec.id);
+    return true;
   }
 
   function collectSpansInRange(idx, lo, hi) {
@@ -796,8 +1139,14 @@
     return out;
   }
 
+  // Whitespace tells nothing apart here. The stored text carries the line
+  // breaks the reader saw; this walk reads the raw text, where the page may
+  // run those same lines together with nothing in between.
+  function normKey(s) {
+    return fpNormalize(s).replace(/\s+/g, '');
+  }
   function normEq(a, b) {
-    return fpNormalize(a) === fpNormalize(b);
+    return normKey(a) === normKey(b);
   }
 
   // ---------- Filter ----------
@@ -812,6 +1161,12 @@
   // Used by the Dart side when switching profiles — we re-rehydrate
   // immediately after with the new profile's records.
   window.__cupitorClearAllTags = function () {
+    // Take the page away from any pass still walking it, or the profile
+    // just switched away from repaints itself over the cleared page.
+    ++rehydratePass;
+    // No pass owns the page now, so nothing else will clear this.
+    rehydrateBusy = false;
+    rehydrateClaimed = new Set();
     rehydrated = [];
     rehydratePending = [];
     stopRehydrateObserver();
@@ -950,6 +1305,9 @@
   }
 
   window.__cupitorSetMasksVisible = function (active) {
+    // Masks change which words are rendered, so any cached reading of the
+    // page is now wrong.
+    resetStyleCache();
     ensureStyles();
     masksVisible = !!active;
     refreshAllMaskInjections();

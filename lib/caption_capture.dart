@@ -69,7 +69,23 @@ Map<String, dynamic>? buildCaptionCaptureDetail(
     // into manual playlist item(s) — never a book-derived item.
     'source': source,
     'title': _str(raw['title']).trim(),
+    // The page itself. This is the block's identity — the webapp matches it to
+    // recognise lines it has already filed — so it stays the same for every
+    // send from one video.
     'url': _str(raw['url']).trim(),
+    // What this player calls a start offset, so the webapp can address one
+    // moment of it. Only the page can name it, and only the webapp knows
+    // which lines reach the card and therefore which moment to point at.
+    // Empty for a player that cannot be deep-linked.
+    //
+    // It is sent even where no link is wanted, because the name is also what
+    // lets the webapp take an offset off an address stored with an older
+    // card and recognise it as the same page.
+    'timeParam': _str(raw['timeParam']).trim(),
+    // Whether that link is worth making on this page — false for a live
+    // channel, whose timeline is anchored to nothing an hour later. Only an
+    // explicit no counts, so a page that says nothing keeps its link.
+    'timeLink': raw['timeLink'] != false,
     // The page knows the caption track's language; the app's own setting is
     // the fallback when it doesn't.
     'lang': pageLang.isNotEmpty ? pageLang : fallbackLang,
@@ -84,15 +100,22 @@ Map<String, dynamic>? buildCaptionCaptureDetail(
 /// [url] may be empty. A sentence out of an EPUB has no address worth
 /// linking to, and the webapp treats an empty url as "no media link, no
 /// de-duplication" rather than as an error.
+/// [timeParam] is what the page's player calls a start offset, when the page
+/// could be asked. It carries no link here — one sentence has no media time —
+/// but it is what lets the webapp recognise the address as the same page as
+/// one filed by the subtitle sidebar, whatever the player had written into the
+/// address bar at the time.
 Map<String, dynamic> sentenceCaptureBlock({
   required String text,
   required String title,
   required String url,
+  String timeParam = '',
 }) {
   return <String, dynamic>{
     'source': 'page',
     'title': title.trim(),
     'url': url.trim(),
+    'timeParam': timeParam.trim(),
     // A hand-picked sentence has no media time, which is what every 'page'
     // block looks like.
     'lines': <Map<String, dynamic>>[

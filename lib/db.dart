@@ -736,29 +736,18 @@ class CupitorDb {
           whereArgs: [pageId],
         );
       }
-      // sentences: upsert by full identity tuple (now incl. profile_id).
-      await tx.insert(
-        'sentences',
-        {
-          'profile_id': profileId,
-          'page_id': pageId,
-          'text': text,
-          'prev_fp': prevFp,
-          'next_fp': nextFp,
-          'mask': mask,
-          'created_at': now,
-        },
-        conflictAlgorithm: ConflictAlgorithm.ignore,
+      // sentences: the row for this text on this page, created if there is
+      // none. Not the bare identity tuple — see upsertSentenceRow.
+      final sentenceId = await upsertSentenceRow(
+        tx,
+        profileId: profileId,
+        pageId: pageId,
+        text: text,
+        prevFp: prevFp,
+        nextFp: nextFp,
+        mask: mask,
+        now: now,
       );
-      final sentRows = await tx.query(
-        'sentences',
-        columns: ['id'],
-        where:
-            'profile_id = ? AND page_id = ? AND text = ? AND IFNULL(prev_fp, "") = IFNULL(?, "") AND IFNULL(next_fp, "") = IFNULL(?, "")',
-        whereArgs: [profileId, pageId, text, prevFp, nextFp],
-        limit: 1,
-      );
-      final sentenceId = sentRows.first['id'] as int;
       // Update mask on the row. null means "leave existing mask alone";
       // '' means "clear the mask"; any other string overwrites.
       if (mask != null) {
@@ -1024,23 +1013,27 @@ class CupitorDb {
       JOIN pages p ON p.id = s.page_id
       LEFT JOIN sentence_tags st ON st.sentence_id = s.id
       LEFT JOIN tags t ON t.id = st.tag_id
-      WHERE s.profile_id = ? AND p.surface = ? AND p.locator = ? AND s.text = ?
-        AND IFNULL(s.prev_fp, "") = IFNULL(?, "")
-        AND IFNULL(s.next_fp, "") = IFNULL(?, "")
+      WHERE s.profile_id = ? AND p.surface = ? AND p.locator = ?
+        AND IFNULL(s.prev_fp, "") = ?
+        AND IFNULL(s.next_fp, "") = ?
       ORDER BY t.created_at
       ''',
-      [profileId, surface, locator, text, prevFp, nextFp],
+      [profileId, surface, locator, prevFp ?? '', nextFp ?? ''],
     );
     if (rows.isEmpty) return null;
+    final hit = matchSentenceRow(rows, text, idKey: 'sid');
+    if (hit == null) return null;
+    final sid = hit['sid'] as int;
+    final mine = rows.where((r) => r['sid'] == sid).toList();
     final s = SentenceWithTags(
-      id: rows.first['sid'] as int,
-      text: rows.first['text'] as String,
-      prevFp: rows.first['prev_fp'] as String?,
-      nextFp: rows.first['next_fp'] as String?,
-      mask: rows.first['mask'] as String?,
+      id: sid,
+      text: hit['text'] as String,
+      prevFp: hit['prev_fp'] as String?,
+      nextFp: hit['next_fp'] as String?,
+      mask: hit['mask'] as String?,
       tags: [],
     );
-    for (final r in rows) {
+    for (final r in mine) {
       final tid = r['tid'] as int?;
       if (tid != null) {
         s.tags.add(TagRow(
@@ -1766,6 +1759,93 @@ String canonUrl(String url) {
 /// EPUB locator: 'epub:<book_sha>:<chapter_idx>'.
 String epubLocator(String bookSha, int chapterIdx) =>
     'epub:$bookSha:$chapterIdx';
+
+/// Whitespace-insensitive key for a sentence's text. Two readings of one
+/// sentence — its lines joined by spaces, or by the line breaks the reader
+/// saw — are the same sentence.
+String sentenceTextKey(String s) => s.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+/// The key that decides whether two texts are the same sentence read twice.
+///
+/// Whitespace is dropped rather than collapsed: a page may run two lines
+/// together with nothing between them where another separates them with a
+/// space or a line break, and all three are one sentence. [sentenceTextKey]
+/// keeps its spaces, being the reading used for search.
+String sentenceMatchKey(String s) => s.replaceAll(RegExp(r'\s+'), '');
+
+/// The row among [rows] holding this [text] read again, or null for none.
+///
+/// An exact match wins; failing that one that differs only in whitespace,
+/// since how a sentence's line breaks are read depends on the markup it was
+/// captured from. [rows] must already be narrowed to one page and one pair
+/// of neighbours, and each row must carry its `text`.
+Map<String, Object?>? matchSentenceRow(
+  List<Map<String, Object?>> rows,
+  String text, {
+  String idKey = 'id',
+}) {
+  for (final r in rows) {
+    if (r['text'] == text) return r;
+  }
+  final want = sentenceMatchKey(text);
+  Map<String, Object?>? best;
+  for (final r in rows) {
+    if (sentenceMatchKey(r['text'] as String) != want) continue;
+    final id = r[idKey];
+    final bestId = best?[idKey];
+    // The oldest row wins, whatever order the query returned: the lookup
+    // that fills the capture sheet and the save that follows it read
+    // through different queries and have to choose the same row.
+    if (best == null || (id is int && bestId is int && id < bestId)) best = r;
+  }
+  return best;
+}
+
+/// The `sentences` row for [text] on [pageId] under [profileId], created if
+/// there is none. Returns its id.
+///
+/// The identity tuple compares text byte-for-byte, and the text of a
+/// multi-line sentence depends on how its line breaks were read when it was
+/// captured. So among the rows that share this page and these neighbours an
+/// exact match wins; failing that, a match that ignores whitespace
+/// ([sentenceMatchKey]) is taken and its stored text moves to the newer
+/// reading; only then is a row inserted. Without the middle step, re-tagging
+/// a sentence whose lines were once joined would put a second row beside it.
+Future<int> upsertSentenceRow(
+  DatabaseExecutor tx, {
+  required int profileId,
+  required int pageId,
+  required String text,
+  String? prevFp,
+  String? nextFp,
+  String? mask,
+  required int now,
+}) async {
+  final rows = await tx.query(
+    'sentences',
+    columns: ['id', 'text'],
+    where:
+        'profile_id = ? AND page_id = ? AND IFNULL(prev_fp, "") = ? AND IFNULL(next_fp, "") = ?',
+    whereArgs: [profileId, pageId, prevFp ?? '', nextFp ?? ''],
+  );
+  final hit = matchSentenceRow(rows, text);
+  if (hit != null) {
+    final id = hit['id'] as int;
+    if (hit['text'] != text) {
+      await tx.update('sentences', {'text': text}, where: 'id = ?', whereArgs: [id]);
+    }
+    return id;
+  }
+  return tx.insert('sentences', {
+    'profile_id': profileId,
+    'page_id': pageId,
+    'text': text,
+    'prev_fp': prevFp,
+    'next_fp': nextFp,
+    'mask': mask,
+    'created_at': now,
+  });
+}
 
 /// 8-char sha1 prefix of normalised text. Normalisation: lowercase →
 /// collapse whitespace runs → strip ASCII punctuation. The JS-side

@@ -11,6 +11,7 @@ import 'db.dart';
 import 'epub_reader.dart' show EpubLibrary, EpubLibraryEntry;
 import 'media_store.dart';
 import 'recording_selection.dart';
+import 'save_file.dart';
 import 'search_index.dart';
 
 /// Storage overview + per-book breakdown.
@@ -206,7 +207,7 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
       );
       final suggestedName = await BookExporter.defaultFileNameForBook(stat.bookKey);
       if (!mounted) return;
-      final savedPath = await FilePicker.platform.saveFile(
+      final savedPath = await saveBytesToPickedFile(
         dialogTitle: 'Save Cupitor bundle',
         fileName: suggestedName,
         bytes: bytes,

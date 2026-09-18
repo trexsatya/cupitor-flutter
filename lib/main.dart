@@ -6,6 +6,7 @@ import 'dart:ui' show DartPluginRegistrant;
 import 'package:path_provider/path_provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'local_music.dart';
+import 'save_file.dart';
 import 'package:flutter/foundation.dart'
     show compute, debugPrint, defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
@@ -252,6 +253,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String? _extractedPdfHtml;
   String _lastStartedUrl = '';
   bool _isEinkMode = einkMode.value;
+  // "Save page HTML…": strip Cupitor's own additions from the saved file.
+  // Off by default — the page exactly as it stands is the usual ask.
+  bool _savePageStrip = false;
   // Notifier + filters now live in `eink_mode.dart` so screens opened
   // via a fresh route (EPUB reader) read the same value as this shell.
   // `_isEinkMode` mirrors `einkMode.value` for local setState paths
@@ -643,6 +647,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _githubToken = prefs.getString('githubToken');
       _pageZoomLevel = prefs.getInt('pageZoom') ?? 0;
       _scrollDiagEnabled = prefs.getBool('scrollDiag') ?? false;
+      _savePageStrip = prefs.getBool('savePageStripCupitor') ?? false;
       final yf = prefs.getString('youtubeFrontend');
       _youtubeFrontend = (yf != null && yf.isNotEmpty) ? yf : null;
       // Blank or missing falls back to the shipped wording — see
@@ -2144,9 +2149,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           currentUrl != null &&
           canonUrl(currentUrl) == row.locator;
       if (inCurrentWebPage) {
+        // data-cupitor-dbid is a CSV wherever two captures share a span, so
+        // the id has to be matched against the list, not against the whole
+        // attribute — otherwise an edit of one of a pair of overlapping
+        // tags re-stamps nothing and the commit then unpaints it.
         await _controller.runJavaScript(
-          "(function(d,s){document.querySelectorAll('[data-cupitor-dbid=\"'+d+'\"]')"
-          ".forEach(function(el){el.setAttribute('data-cupitor-sent',s);});})('$dbid','$sid');",
+          "(function(d,s){document.querySelectorAll('[data-cupitor-dbid].clickable-word')"
+          ".forEach(function(el){"
+          "var ids=(el.getAttribute('data-cupitor-dbid')||'').split(',');"
+          "if(ids.indexOf(d)!==-1)el.setAttribute('data-cupitor-sent',s);});})('$dbid','$sid');",
         );
         await _controller.runJavaScript(
           "window.__cupitorCommitTags && window.__cupitorCommitTags('$sid', $dbid, "
@@ -2295,7 +2306,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final c = Completer<ExtendResult>();
     _pendingTagExtend = c;
     _controller.runJavaScript(
-      "window.__cupitorRequestExtend && window.__cupitorRequestExtend('$sid','$direction');",
+      "window.__cupitorRequestExtend && window.__cupitorRequestExtend("
+      "${jsonEncode(sid)},${jsonEncode(direction)});",
     );
     // Safety net: if JS never replies (page reloaded mid-capture), unblock.
     Future.delayed(const Duration(seconds: 3), () {
@@ -2329,11 +2341,18 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       surface: 'web',
       locator: locator,
       onExtendRequested: (dir) => _requestExtend(sid, dir),
-      onSendToPlaylist: (t) => _sendSentenceToWebappPlaylist(
-        text: t,
-        title: title ?? '',
-        url: url,
-      ),
+      onSendToPlaylist: (t) async {
+        // Asked at send time rather than when the sheet opened: the player
+        // rewrites the address as it plays, so the address that was current a
+        // minute ago is not the one this sentence would be filed under.
+        final id = await _pageCaptureIdentity();
+        return _sendSentenceToWebappPlaylist(
+          text: t,
+          title: title ?? '',
+          url: id.$1.isEmpty ? url : id.$1,
+          timeParam: id.$2,
+        );
+      },
     );
     if (res == null) {
       // Cancelled.
@@ -2369,7 +2388,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           .toList();
       final tagIdsCsv = res.tagIds.join(',');
       _controller.runJavaScript(
-        "window.__cupitorCommitTags && window.__cupitorCommitTags('$sid', ${dbid ?? 'null'}, ${jsonEncode(jsonEncode(tagColors))}, ${jsonEncode(tagIdsCsv)}, ${jsonEncode(res.mask)});",
+        "window.__cupitorCommitTags && window.__cupitorCommitTags(${jsonEncode(sid)}, ${dbid ?? 'null'}, ${jsonEncode(jsonEncode(tagColors))}, ${jsonEncode(tagIdsCsv)}, ${jsonEncode(res.mask)});",
       );
     } catch (e) {
       if (mounted) {
@@ -3304,6 +3323,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // document-start (no document.head yet).
         function setupDom() {
           const style = document.createElement('style');
+          // Marks the element as ours, so "Save page HTML" can strip it.
+          style.setAttribute('data-cupitor-injected', '');
           style.textContent = `
             .ytp-ad-overlay-container,
             .ytp-ad-player-overlay,
@@ -3377,6 +3398,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         if (window._adBlockerInjected) return;
         window._adBlockerInjected = true;
         const style = document.createElement('style');
+        // Marks the element as ours, so "Save page HTML" can strip it.
+        style.setAttribute('data-cupitor-injected', '');
         style.textContent = `
           /* Common ad containers */
           ins.adsbygoogle,
@@ -3543,6 +3566,120 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         child: Divider(height: 1),
       );
 
+  /// Asks how the page should be saved, then saves it.
+  ///
+  /// The choice is put here rather than left as a switch elsewhere in Tools
+  /// because it only means anything at this moment, and it decides what the
+  /// file contains. The answer is remembered as the next save's default, so
+  /// someone who always wants one of them is asked a question they can pass
+  /// straight through.
+  Future<void> _showSavePageHtmlDialog() async {
+    var strip = _savePageStrip;
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => StatefulBuilder(
+        builder: (dctx, setDialogState) => AlertDialog(
+          title: const Text('Save page HTML'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('The page as it stands now, to a file you pick.'),
+              const SizedBox(height: 8),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                controlAffinity: ListTileControlAffinity.leading,
+                value: strip,
+                title: const Text("Strip Cupitor's markup"),
+                subtitle: Text(strip
+                    ? 'Saved as the site rendered it'
+                    : "Saved with Cupitor's own markup included"),
+                onChanged: (val) => setDialogState(() => strip = val ?? false),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dctx).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dctx).pop(true),
+              child: const Text('Save…'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (go != true || !mounted) return;
+    // Remembered from here on, not from the tick: a box flipped and then
+    // cancelled said nothing about what the next save should do. Backing out
+    // of the file picker after this point still leaves the answer standing,
+    // which is the question the user did answer.
+    if (strip != _savePageStrip) {
+      setState(() => _savePageStrip = strip);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('savePageStripCupitor', strip);
+    }
+    await _savePageHtml(strip: strip);
+  }
+
+  /// "Save page HTML…": the main WebView's document as rendered, to a file
+  /// the user picks. With [strip] every addition Cupitor made to the page is
+  /// taken out first, so the file is the page as the site rendered it — see
+  /// assets/js/page_export.js for what that covers.
+  Future<void> _savePageHtml({required bool strip}) async {
+    try {
+      // Injected on demand; the page never needs this otherwise.
+      final js = await rootBundle.loadString('assets/js/page_export.js');
+      await _controller.runJavaScript(js);
+      final raw = await _controller.runJavaScriptReturningResult(
+        'window.__cupitorExportHtml(${strip ? 'true' : 'false'})',
+      );
+      // Android hands back a JSON-encoded string; anything that is not
+      // valid JSON is taken verbatim. Never quote-stripped — it is HTML.
+      // A JS error or an undefined result comes back as the string `null`,
+      // which is nothing to save rather than a four-byte file.
+      var html = raw.toString();
+      try {
+        final decoded = jsonDecode(html);
+        if (decoded is String) html = decoded;
+        if (decoded == null) html = '';
+      } catch (_) {}
+      if (html.trim().isEmpty) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Nothing to save')),
+        );
+        return;
+      }
+      final url = await _controller.currentUrl() ?? '';
+      final host = Uri.tryParse(url)?.host ?? '';
+      final t = DateTime.now();
+      String two(int n) => n.toString().padLeft(2, '0');
+      final stamp =
+          '${t.year}${two(t.month)}${two(t.day)}-${two(t.hour)}${two(t.minute)}';
+      final fileName = '${host.isEmpty ? 'page' : host}-$stamp.html';
+      if (!mounted) return;
+      final savedPath = await saveBytesToPickedFile(
+        dialogTitle: 'Save page HTML',
+        fileName: fileName,
+        bytes: utf8.encode(html),
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(
+          savedPath == null ? 'Save cancelled' : 'Saved: $savedPath',
+        )),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Save failed: $e')),
+      );
+    }
+  }
+
   void _showToolsDrawer() {
     showModalBottomSheet(
       context: context,
@@ -3573,7 +3710,71 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 child: ListView(
                   controller: scrollController,
                   children: [
+                    // ── Reading & content ──────────────────────────────
+                    // First, because it is what the app is for. Everything
+                    // below it adjusts how reading works rather than doing it.
+                    _toolsSectionHeader('Reading & content'),
+                    ListTile(
+                      leading: const Icon(Icons.bookmarks_outlined),
+                      title: const Text('Bookmarks'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showBookmarks();
+                      },
+                    ),
+                    if (_tagDbReady)
+                      ListTile(
+                        leading: const Icon(Icons.label_outline),
+                        title: const Text('Tag sentences…'),
+                        subtitle: const Text(
+                          'Capture chip, masks, filter, segmentation scope, '
+                          'and the global browser — all in one place.',
+                        ),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _openTagSettingsSheet();
+                        },
+                      ),
+
+                    // ── Books ──────────────────────────────────────────
+                    // Opening a book, returning to one, and searching across
+                    // all of them are the same errand at different stages.
+                    _toolsSectionDivider(),
+                    _toolsSectionHeader('Books'),
+                    ListTile(
+                      leading: const Icon(Icons.menu_book_outlined),
+                      title: const Text('Open EPUB'),
+                      subtitle: const Text('From device storage or a URL'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showEpubSourcePicker();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.history_edu_outlined),
+                      title: const Text('EPUB library'),
+                      subtitle: const Text('Resume a recent book'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showEpubLibrary();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.search),
+                      title: const Text('Global search…'),
+                      subtitle: const Text(
+                        'Across every EPUB · use `|` for OR (e.g. cat|dog)',
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _openGlobalSearch();
+                      },
+                    ),
+
                     // ── Appearance ─────────────────────────────────────
+                    _toolsSectionDivider(),
                     _toolsSectionHeader('Appearance'),
                     SwitchListTile(
                       secondary: Icon(_isEinkMode ? Icons.invert_colors_off : Icons.invert_colors),
@@ -3625,62 +3826,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       ),
                     ],
 
-                    // ── Reading & content ──────────────────────────────
-                    _toolsSectionDivider(),
-                    _toolsSectionHeader('Reading & content'),
-                    if (_tagDbReady)
-                      ListTile(
-                        leading: const Icon(Icons.label_outline),
-                        title: const Text('Tag sentences…'),
-                        subtitle: const Text(
-                          'Capture chip, masks, filter, segmentation scope, '
-                          'and the global browser — all in one place.',
-                        ),
-                        trailing: const Icon(Icons.chevron_right),
-                        onTap: () {
-                          Navigator.of(ctx).pop();
-                          _openTagSettingsSheet();
-                        },
-                      ),
-                    ListTile(
-                      leading: const Icon(Icons.bookmarks_outlined),
-                      title: const Text('Bookmarks'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showBookmarks();
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.menu_book_outlined),
-                      title: const Text('Open EPUB'),
-                      subtitle: const Text('From device storage or a URL'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showEpubSourcePicker();
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.history_edu_outlined),
-                      title: const Text('EPUB library'),
-                      subtitle: const Text('Resume a recent book'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showEpubLibrary();
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.search),
-                      title: const Text('Global search…'),
-                      subtitle: const Text(
-                        'Across every EPUB · use `|` for OR (e.g. cat|dog)',
-                      ),
-                      trailing: const Icon(Icons.chevron_right),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _openGlobalSearch();
-                      },
-                    ),
-
                     // ── Web behavior ───────────────────────────────────
                     _toolsSectionDivider(),
                     _toolsSectionHeader('Web behavior'),
@@ -3723,6 +3868,37 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         underline: const SizedBox(),
                       ),
                     ),
+                    ListTile(
+                      leading: const Icon(Icons.smart_display_outlined),
+                      title: const Text('YouTube playback'),
+                      subtitle: Text(_youtubeFrontend == null
+                          ? 'Native YouTube (with ad blocker)'
+                          : 'Via ${_youtubeFrontend!}'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showYoutubeFrontendPicker();
+                      },
+                    ),
+                    // The one choice that changes what lands in the file is
+                    // asked on the way out, where it is being made — not kept
+                    // as a separate switch to find and set beforehand.
+                    ListTile(
+                      leading: const Icon(Icons.save_alt_outlined),
+                      title: const Text('Save page HTML…'),
+                      subtitle: Text(_savePageStrip
+                          ? "As the site rendered it, Cupitor's markup stripped"
+                          : "Exactly as it stands, Cupitor's markup included"),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showSavePageHtmlDialog();
+                      },
+                    ),
+
+                    // ── Exclusions & blocking ──────────────────────────
+                    // Both name what Cupitor should leave alone, one for its
+                    // own features and one for the network.
+                    _toolsSectionDivider(),
+                    _toolsSectionHeader('Exclusions & blocking'),
                     ValueListenableBuilder<List<String>>(
                       valueListenable: LookupExclusions.patterns,
                       builder: (_, list, __) => ListTile(
@@ -3742,17 +3918,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                           ));
                         },
                       ),
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.smart_display_outlined),
-                      title: const Text('YouTube playback'),
-                      subtitle: Text(_youtubeFrontend == null
-                          ? 'Native YouTube (with ad blocker)'
-                          : 'Via ${_youtubeFrontend!}'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showYoutubeFrontendPicker();
-                      },
                     ),
                     ListTile(
                       leading: const Icon(Icons.security_outlined),
@@ -3806,15 +3971,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       },
                     ),
                     ListTile(
-                      leading: const Icon(Icons.code),
-                      title: const Text('Inject remote snippet'),
-                      subtitle: const Text('Run remote JavaScript on current page'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _injectRemoteSnippet();
-                      },
-                    ),
-                    ListTile(
                       leading: Icon(_tagCaptureArmed
                           ? Icons.playlist_add_check
                           : Icons.playlist_add),
@@ -3824,6 +3980,22 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       onTap: () {
                         Navigator.of(ctx).pop();
                         _armSentenceCollecting();
+                      },
+                    ),
+
+                    // ── Diagnostics ────────────────────────────────────
+                    // Run something against the page, watch what it does,
+                    // read what it said — in that order, because that is the
+                    // order they are used in.
+                    _toolsSectionDivider(),
+                    _toolsSectionHeader('Diagnostics'),
+                    ListTile(
+                      leading: const Icon(Icons.code),
+                      title: const Text('Inject remote snippet'),
+                      subtitle: const Text('Run remote JavaScript on current page'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _injectRemoteSnippet();
                       },
                     ),
                     // Turn on while a page/modal refuses to scroll, then drag
@@ -5490,6 +5662,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             if (ch2) seenChannels[ch2] = true;
             dl.parentNode.insertBefore(lbl2, dl);
             var b2 = document.createElement('button');
+            b2.className = '__cup_btn';
             b2.textContent = '🚫';
             b2.title = 'Blacklist this channel';
             b2.style.cssText = 'margin:0 4px;padding:1px 6px;font-size:11px;border:1px solid #888;background:#fee;cursor:pointer;border-radius:3px;line-height:1';
@@ -5503,6 +5676,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             if (detailId) {
               unknownIds.push(detailId);
               var s2 = document.createElement('button');
+              s2.className = '__cup_btn';
               s2.textContent = '💾';
               s2.title = 'Save video URL';
               s2.style.cssText = 'margin:0 4px;padding:1px 6px;font-size:11px;border:1px solid #888;background:#efe;cursor:pointer;border-radius:3px;line-height:1';
@@ -9978,6 +10152,36 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
   }
 
+  /// The page's address as every other capture path sees it: with whatever
+  /// start offset the player has written into it taken out, and the name of
+  /// the parameter that offset lives under.
+  ///
+  /// Answered by the injected snippet, because the site table that names the
+  /// parameter is fetched at runtime and lives there. `('', '')` when the page
+  /// cannot answer — an older snippet, a page it never installed into — and
+  /// the caller then files the address it already had.
+  Future<(String, String)> _pageCaptureIdentity() async {
+    try {
+      final raw = await _controller.runJavaScriptReturningResult(
+        'window.__cupCaptureIdentity ? window.__cupCaptureIdentity() : ""',
+      );
+      // Android hands back a JSON-encoded string; WKWebView the value itself.
+      var s = raw.toString();
+      try {
+        final once = jsonDecode(s);
+        if (once is String) s = once;
+      } catch (_) {}
+      final m = jsonDecode(s);
+      if (m is! Map) return ('', '');
+      return (
+        (m['url'] ?? '').toString(),
+        (m['timeParam'] ?? '').toString(),
+      );
+    } catch (_) {
+      return ('', '');
+    }
+  }
+
   /// Pushes ONE sentence from the tagging sheet to the language webapp, which
   /// offers its playlist picker and files the sentence as a manual card.
   ///
@@ -9989,9 +10193,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     required String text,
     required String title,
     required String url,
+    String timeParam = '',
   }) async {
     final detail = buildCaptionCaptureDetail(
-      sentenceCaptureBlock(text: text, title: title, url: url),
+      sentenceCaptureBlock(
+          text: text, title: title, url: url, timeParam: timeParam),
       fallbackLang: _selectedLanguage,
     );
     if (detail == null) return 'Nothing to send.';

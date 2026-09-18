@@ -72,7 +72,9 @@ Both sources post to the same channel, and the host shapes both with the same fu
 window.CaptionCollector.postMessage(JSON.stringify({
   source: 'caption',                           // omitted by older scripts; defaults to this
   title: (document.title || '').trim(),
-  url:   location.href,
+  url:   '…/video/abc/en-serie',               // the page itself: the block's identity
+  timeParam: 'position',                       // what this player calls a start offset
+  timeLink: true,                              // …and whether to point at one, see §3.1
   lang:  state.translationSource || '',        // sidebar's source-language field
   lines: [ { start, end, text, translation? }, … ],
 }));
@@ -86,7 +88,9 @@ A send only happens when at least one cue is ticked. On success the sidebar leav
 window.CaptionCollector.postMessage(JSON.stringify({
   source: 'page',
   title: (document.title || '').trim(),
-  url:   location.href,
+  url:   '…/video/abc/en-serie',               // cleaned the same way, see §3.1
+  timeParam: 'position',
+  timeLink: true,
   lang:  '',                                   // host falls back to the app language
   lines: [ { text: 'Han gick hem.' }, … ],     // order is what the user picked
 }));
@@ -99,6 +103,38 @@ Two ways to collect them, because one is not enough:
 
 Both paths install into the top document **and** every same-origin frame, so a book rendered inside an iframe is reachable. A cross-origin frame is not, and cannot be made so from JavaScript — that would need WebView-level injection. `window.cupFrameReport()` lists each frame and whether it could be reached.
 
+**One tagged sentence**, sent from the tagging sheet, does not go through this channel at all: the host builds that block itself. It asks the page for the same identity first, with `window.__cupCaptureIdentity()` — see §3.1.
+
+### 3.1 The address and the offset
+
+`url` is the page, and it means the same thing however far into the video the viewer happens to be: the player rewrites its own address as it plays, so the start offset is taken **out** of `url` before it is sent. That is what makes it usable as identity — the webapp matches it to recognise lines it has already filed, and a key that moved would recognise nothing.
+
+`timeParam` is what this player calls a start offset, or `''` for one that has none. It is what makes identity possible, so it is sent on every block — including from a page where no link is wanted, because it is also what lets the webapp take an offset off an address stored with an older card and recognise it as the same page.
+
+`timeLink` is the separate question of whether pointing at a moment is worth it here. Only an outright no refuses.
+
+The page names both; the **webapp** builds the link, because only the webapp knows which lines reach the card — it drops the ones already captured from this video first, and a link must point at the earliest moment among the lines it is put on, not among everything the user ticked.
+
+The name lives with the rest of the site's configuration in `db/js/src/30-caption-sites.js`, which is fetched at runtime, so teaching Cupitor a new player is an edit there and no app release:
+
+```js
+{
+  id: 'svt',
+  timeParam: 'position',                    // → …/en-serie?position=128
+  timeLinkOn: () =>                         // …but only on these pages
+    /(^|\.)svtplay\.se$/.test(location.host) &&
+    /^\/(video|klipp)\//.test(location.pathname),
+}
+```
+
+`timeLinkOn` marks the pages where such a link is worth making, for a site whose player is timed on some and live on others; a plain `false` covers a player that should never be linked into.
+
+One rule reads the answer at every layer: **anything that is not a no is a yes.** An entry that says nothing means everywhere, a plain value is read for truth, and a predicate is called — a predicate that throws is the one case with no answer at all, and that means nowhere.
+
+Rules the link follows (see `captionMediaLink` in the webapp): whole seconds; nothing added for a passage that starts at the very beginning, or for an offset too large for a player to read; a parameter of that name already on the address is replaced rather than repeated; every other parameter is left byte for byte, hash included; and an address that is not `http`/`https` carries no link at all.
+
+A `page` block has no time to point at, but it names `timeParam` all the same: sentences picked off a video page at 12:30 belong to the same page as sentences picked at the start.
+
 ---
 
 ## 4. Host → WebApp (`cupitorCaptionCapture`)
@@ -107,7 +143,10 @@ Both paths install into the top document **and** every same-origin frame, so a b
 type CaptionCapture = {
   source: 'caption' | 'page';   // never a book-derived item either way
   title: string;                // video / page title, '' when unknown
-  url: string;                  // page the text came from, '' when unknown
+  url: string;                  // page the text came from, '' when unknown — the block's
+                                //   identity, carrying no start offset
+  timeParam: string;            // what its player calls a start offset; '' when it has none
+  timeLink: boolean;            // whether pointing at one is worth it on this page
   lang: string;                 // advisory source language, see §6
   lines: CaptionLine[];         // never empty, ordered
 };
@@ -154,6 +193,8 @@ The page scrapes a third-party player whose markup changes without notice, so th
 | `text` is non-blank | Trimmed, and blank cues are dropped rather than forwarded. |
 | `translation` is meaningful | Trimmed, and omitted entirely when blank. It is never `''` or whitespace. |
 | `title` / `url` are strings | Missing values become `''`, never `null` or `undefined`. |
+| `timeParam` is a string | Trimmed, and `''` when the player has no such parameter. Address one moment as `url` + that parameter in whole seconds; match on `url` alone for anything that has to stay stable across sends, putting any address stored earlier through the same removal first. |
+| `timeLink` is a bool | `true` unless the page said `false` outright. |
 | `lang` is non-empty | Falls back to the app's language setting. |
 | Malformed input is silent | Non-JSON, a non-object payload, or a non-list `lines` produces no event and no error. |
 

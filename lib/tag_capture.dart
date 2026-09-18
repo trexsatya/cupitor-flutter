@@ -259,6 +259,16 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
 
   List<TagRow> _allTags = [];
   final Set<int> _selected = {};
+  /// True while `_selected` is exactly what a lookup put there. A range
+  /// change may then re-fill it; once the user has touched a tag it is
+  /// theirs and only they change it.
+  bool _selectionIsStored = true;
+  /// The twin of [_selectionIsStored] for the mask field.
+  bool _maskIsStored = true;
+  /// Bumped by every range change. A lookup that comes back for an older
+  /// range is stale and must not touch the sheet.
+  int _rangeGen = 0;
+  bool _rangeBusy = false;
   bool _loadingTags = true;
 
   bool _newTagOpen = false;
@@ -443,6 +453,7 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
   }
 
   Future<void> _loadInitial() async {
+    final gen = _rangeGen;
     final tags = await CupitorDb.instance.listTags(widget.profileId);
     Iterable<int> preselected = const [];
     if (widget.preselectedTagIds != null) {
@@ -470,7 +481,10 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
     if (!mounted) return;
     setState(() {
       _allTags = tags;
-      _selected.addAll(preselected);
+      // Prev/Next can fire while these queries are in flight, and those
+      // tags belong to the range the sheet opened on, not the one it is
+      // showing now.
+      if (gen == _rangeGen) _selected.addAll(preselected);
       _existingMedia = media;
       _loadingTags = false;
     });
@@ -912,6 +926,7 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
                   : ' ';
               _dictatedRunningText = '$_dictatedRunningText$sep$words';
             }
+            _maskIsStored = false;
             _maskCtrl.text = _dictatedRunningText;
           } else {
             // Show partial appended after the committed text so the
@@ -920,6 +935,7 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
                     _dictatedRunningText.endsWith(' ')
                 ? ''
                 : ' ';
+            _maskIsStored = false;
             _maskCtrl.text = '$_dictatedRunningText$sep$words';
           }
           _maskCtrl.selection = TextSelection.collapsed(
@@ -949,7 +965,37 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
     });
   }
 
+  /// Re-read the row the save would now land on. Prev/Next/Trim change the
+  /// identity — text and both neighbour fingerprints — so the tags shown
+  /// have to follow, or Save silently replaces a tag set the sheet never
+  /// displayed.
+  Future<void> _refreshStoredTags(int gen) async {
+    if (widget.preselectedTagIds != null) return;
+    final existing = await CupitorDb.instance.sentenceByIdentity(
+      profileId: widget.profileId,
+      surface: widget.surface,
+      locator: widget.locator,
+      text: _text,
+      prevFp: _prevFp.isEmpty ? null : _prevFp,
+      nextFp: _nextFp.isEmpty ? null : _nextFp,
+    );
+    if (!mounted || gen != _rangeGen) return;
+    setState(() {
+      if (_selectionIsStored) {
+        _selected
+          ..clear()
+          ..addAll(existing?.tags.map((t) => t.id) ?? const <int>[]);
+      }
+      // Clear as well as fill: the tags do, and a mask left over from the
+      // previous range would be saved onto this one.
+      if (_maskIsStored) _maskCtrl.text = existing?.mask ?? '';
+    });
+  }
+
   Future<void> _extend(String direction) async {
+    if (_rangeBusy) return;
+    _rangeBusy = true;
+    try {
     final res = await widget.onExtendRequested(direction);
     if (!mounted) return;
     setState(() {
@@ -967,10 +1013,17 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
         if (direction == 'next') _prevAvailable = true;
       }
     });
+    if (res.text != null) await _refreshStoredTags(++_rangeGen);
     _scrollCapturedTextToEnd();
+    } finally {
+      _rangeBusy = false;
+    }
   }
 
   Future<void> _trim(String side) async {
+    if (_rangeBusy) return;
+    _rangeBusy = true;
+    try {
     // side: 'start' | 'end' — mapped to JS direction names.
     final direction = side == 'start' ? 'trimStart' : 'trimEnd';
     final res = await widget.onExtendRequested(direction);
@@ -990,7 +1043,11 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
       if (side == 'start') _prevAvailable = true;
       if (side == 'end') _nextAvailable = true;
     });
+    await _refreshStoredTags(++_rangeGen);
     _scrollCapturedTextToEnd();
+    } finally {
+      _rangeBusy = false;
+    }
   }
 
   Future<void> _createNewTag() async {
@@ -1006,6 +1063,7 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
     }
     setState(() {
       _allTags = List.of(_allTags)..add(created);
+      _selectionIsStored = false;
       _selected.add(created.id);
       _newTagOpen = false;
       _newTagCtrl.clear();
@@ -1198,6 +1256,9 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
               TextField(
                 controller: _maskCtrl,
                 scrollController: _maskScrollCtrl,
+                // Once the mask is the user's words, a range change must
+                // not replace them with a stored one.
+                onChanged: (_) => _maskIsStored = false,
                 decoration: InputDecoration(
                   hintText: 'Shown in place of the sentence when "Show masks" is on',
                   border: const OutlineInputBorder(),
@@ -1328,6 +1389,7 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
                               width: sel ? 2 : 1,
                             ),
                             onSelected: (v) => setState(() {
+                              _selectionIsStored = false;
                               if (v) {
                                 _selected.add(t.id);
                               } else {

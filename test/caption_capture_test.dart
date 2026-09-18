@@ -29,6 +29,54 @@ void main() {
       ]);
     });
 
+    // Only the page can name it — it is the one that knows which player it is
+    // reading — and only the webapp can use it, since it is the one that
+    // knows which lines reach the card.
+    test('carries the name this player gives a start offset', () {
+      final d = build({
+        'url': 'https://www.svtplay.se/video/abc/en-serie',
+        'timeParam': '  position  ',
+        'lines': [
+          {'start': 128.4, 'end': 131.0, 'text': 'Han gick hem.'}
+        ],
+      })!;
+      expect(d['timeParam'], 'position');
+      expect(d['timeLink'], isTrue, reason: 'nothing said no');
+      expect(d['url'], 'https://www.svtplay.se/video/abc/en-serie',
+          reason: 'identity must not move with the selection, or the '
+              "webapp's de-dupe recognises nothing");
+    });
+
+    // A live channel names the parameter — that is what cleaned its address —
+    // and separately says a moment is not worth pointing at.
+    test('a page can name the parameter and still refuse the link', () {
+      final d = build({
+        'url': 'https://www.svtplay.se/kanaler/svt1',
+        'timeParam': 'position',
+        'timeLink': false,
+        'lines': [
+          {'start': 4212, 'end': 4214, 'text': 'Han gick hem.'}
+        ],
+      })!;
+      expect(d['timeParam'], 'position');
+      expect(d['timeLink'], isFalse);
+    });
+
+    // The page is scraped markup, so anything that is not an outright no is
+    // read as "nothing said" rather than as a refusal.
+    test('only an explicit no refuses the link', () {
+      for (final said in [null, 'false', 0, 'no', true]) {
+        final d = build({
+          'timeParam': 'position',
+          if (said != null) 'timeLink': said,
+          'lines': [
+            {'start': 5, 'end': 6, 'text': 'x'}
+          ],
+        })!;
+        expect(d['timeLink'], isTrue, reason: 'a timeLink of $said');
+      }
+    });
+
     test('orders by media time whatever order they arrived in', () {
       final d = build({
         'lines': [
@@ -244,6 +292,18 @@ void main() {
       expect(d['title'], '');
       expect(d['url'], '');
     });
+
+    // A player with no deep link names nothing, and the card then links to
+    // the page itself.
+    test('an unnamed offset is an empty string, not a null', () {
+      final d = build({
+        'url': 'https://example.test/watch',
+        'lines': [
+          {'start': 5, 'end': 6, 'text': 'x'}
+        ],
+      })!;
+      expect(d['timeParam'], '');
+    });
   });
 
   // One sentence sent from the tagging sheet. It has to come out the far side
@@ -266,6 +326,33 @@ void main() {
       // No media time: a page block is what an untimed selection looks like.
       expect(lines.first['start'], 0.0);
       expect(lines.first['end'], 0.0);
+      // …and with no time there is no moment to link at, so the card links to
+      // the page.
+      expect(d['timeParam'], '');
+      expect(d['timeLink'], isTrue, reason: 'nothing to refuse');
+    });
+
+    // The tagging sheet's own sender builds its block in Dart, so it has to
+    // name the parameter too — a sentence tagged on a video page at 12:30
+    // belongs to the same page as one tagged at the start.
+    test('a sentence names the parameter its page reads an offset from', () {
+      final d = build(sentenceCaptureBlock(
+        text: 'Han gick hem.',
+        title: 'En serie',
+        url: 'https://www.svtplay.se/video/abc/en-serie',
+        timeParam: '  position  ',
+      ))!;
+      expect(d['timeParam'], 'position');
+      expect(d['url'], 'https://www.svtplay.se/video/abc/en-serie');
+    });
+
+    test('a page that could not be asked names nothing', () {
+      final d = build(sentenceCaptureBlock(
+        text: 'Han gick hem.',
+        title: '',
+        url: 'https://example.test/a',
+      ))!;
+      expect(d['timeParam'], '');
     });
 
     test('an EPUB sentence carries a title and no address', () {
@@ -301,8 +388,9 @@ void main() {
         title: '',
         url: '',
       ))!;
-      // The host does not split on newlines; the webapp collapses them when it
-      // builds the card face.
+      // The host does not split on newlines. A 'page' block keeps them — the
+      // webapp lays such a line across as many rows of the card as it has —
+      // so the break the reader saw survives all the way to the card.
       expect((d['lines'] as List), hasLength(1));
       expect((d['lines'] as List).first['text'], 'Forsta raden\nandra raden');
     });

@@ -116,7 +116,9 @@ class _TagBrowserScreenState extends State<TagBrowserScreen> {
         if (!hit) return false;
       }
       if (q.isNotEmpty) {
-        final inText = r.sentence.text.toLowerCase().contains(q);
+        // Whitespace-insensitive: a sentence may carry the line breaks the
+        // reader saw, and a two-word query must still find it across one.
+        final inText = sentenceTextKey(r.sentence.text).toLowerCase().contains(q);
         final inMask = (r.sentence.mask ?? '').toLowerCase().contains(q);
         final inTitle = (r.pageTitle ?? '').toLowerCase().contains(q);
         if (!inText && !inMask && !inTitle) return false;

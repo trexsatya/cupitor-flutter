@@ -34,6 +34,7 @@ import 'book_transfer.dart';
 import 'db.dart';
 import 'eink_mode.dart';
 import 'jslog.dart';
+import 'save_file.dart';
 import 'notif/notification_manager.dart';
 import 'playlist_screen.dart';
 import 'playlist_service.dart';
@@ -1626,15 +1627,162 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
       return hex.substring(0, 8);
     } catch (e) { return ''; }
   }
+  // Does this element start on a new line when rendered? The layout engine
+  // is asked first: a hidden footnote <aside> or an inline-styled heading
+  // breaks nothing, while a <span> styled display:block — one per verse
+  // line in many EPUBs — breaks the line just like a paragraph. Floats and
+  // absolutely positioned boxes (drop caps, page-number markers) report
+  // display:block too but sit inside the line, so they are excluded. Table
+  // cells share a line with their neighbours. The tag list is only for
+  // when the engine gives no answer.
+  var OWN_LINE_DISPLAY = /^(block|flex|grid|list-item|table|table-row|table-caption|table-row-group|table-header-group|table-footer-group|flow-root)\$/;
+  var OWN_LINE_TAGS = /^(BR|HR|P|DIV|LI|UL|OL|DL|DD|DT|BLOCKQUOTE|SECTION|ARTICLE|ASIDE|HEADER|FOOTER|NAV|MAIN|FIGURE|FIGCAPTION|TABLE|TR|H[1-6]|PRE)\$/;
+  function startsOwnLine(el) {
+    var tag = el.tagName || '';
+    var cs = null;
+    try { cs = window.getComputedStyle(el); } catch (e) { cs = null; }
+    var display = cs ? (cs.display || '') : '';
+    if (!display) return OWN_LINE_TAGS.test(tag);
+    if (display === 'none') return false;
+    if (tag === 'BR') return true;
+    var fl = cs.cssFloat || cs['float'] || 'none';
+    if (fl !== 'none') return false;
+    if (cs.position === 'absolute' || cs.position === 'fixed') return false;
+    if (!OWN_LINE_DISPLAY.test(display)) return false;
+    // A flex or grid container blockifies its children whatever they are,
+    // so the child's own display says nothing about lines here — a row of
+    // flex items shares one. The container has the answer.
+    var parent = el.parentNode;
+    var ps = null;
+    if (parent && parent.nodeType === 1) {
+      try { ps = window.getComputedStyle(parent); } catch (e) { ps = null; }
+    }
+    var pd = ps ? (ps.display || '') : '';
+    if (pd === 'flex' || pd === 'inline-flex') {
+      return /^column/.test(ps.flexDirection || '');
+    }
+    return true;
+  }
+  // The nearest ancestor that starts its own line — the line this span is
+  // printed on — or null when that is the body itself.
+  function ownLineAncestor(el) {
+    var n = el ? el.parentNode : null;
+    while (n && n !== document.body && n.nodeType === 1) {
+      if (startsOwnLine(n)) return n;
+      n = n.parentNode;
+    }
+    return null;
+  }
+  // Does this element generate a box of its own, rather than flowing inline
+  // with its neighbours? Table cells and flex items do, <em> and
+  // inline-block do not.
+  function isBoxy(el) {
+    var d = '';
+    try { d = window.getComputedStyle(el).display || ''; } catch (e) { d = ''; }
+    if (!d) return /^(TD|TH|CAPTION)\$/.test(el.tagName || '') ||
+                   OWN_LINE_TAGS.test(el.tagName || '');
+    if (d === 'none') return false;
+    if (d.indexOf('inline') === 0 || d === 'contents') return false;
+    return true;
+  }
+  function boxAncestor(el) {
+    var n = el ? el.parentNode : null;
+    while (n && n !== document.body && n.nodeType === 1) {
+      if (isBoxy(n)) return n;
+      n = n.parentNode;
+    }
+    return null;
+  }
+  // What the markup holds between two spans. Whitespace there is the
+  // reader's word gap; nothing there means the two pieces are printed
+  // without one.
+  var SEAM_SKIP_TAGS = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|LINK|META)\$/;
+  function seamVisible(n) {
+    var el = n.parentNode;
+    while (el && el.nodeType === 1) {
+      if (SEAM_SKIP_TAGS.test(el.tagName || '')) return false;
+      var d = '';
+      try { d = window.getComputedStyle(el).display || ''; } catch (e) { d = ''; }
+      if (d === 'none') return false;
+      el = el.parentNode;
+    }
+    return true;
+  }
+  function commonAncestor(a, b) {
+    var n = a;
+    while (n && n.nodeType === 1) {
+      if (n.contains(b)) return n;
+      n = n.parentNode;
+    }
+    return document.body;
+  }
+  function textBetween(a, b) {
+    if (a.contains(b) || b.contains(a)) return '';
+    var out = '';
+    try {
+      var walker = document.createTreeWalker(
+        commonAncestor(a, b), NodeFilter.SHOW_TEXT, null, false);
+      var started = false, n;
+      while ((n = walker.nextNode())) {
+        if (!started) { if (a.contains(n)) started = true; continue; }
+        if (a.contains(n)) continue;
+        if (b.contains(n)) break;
+        if (seamVisible(n)) out += n.nodeValue;
+      }
+    } catch (e) { return ' '; }
+    return out;
+  }
+  // Is there a rendered line break between two sentence spans?
+  //
+  // Two checks, because each sees what the other cannot. Spans printed on
+  // different lines — one inside a paragraph, the next in bare text after
+  // it — is a break the forward walk misses, since it never revisits the
+  // first span's own ancestors. The walk then finds what lies BETWEEN two
+  // spans on the same line: a <br>, or an element that starts its own line.
+  // Bounded so a pathological DOM cannot hang the tap.
+  function lineBreakBetween(a, b) {
+    if (!a || !b || a === b) return false;
+    if (ownLineAncestor(a) !== ownLineAncestor(b)) return true;
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
+    walker.currentNode = a;
+    var n, steps = 0;
+    while ((n = walker.nextNode()) && steps++ < 50000) {
+      if (n === b) return false;
+      if (startsOwnLine(n)) return true;
+    }
+    return false;
+  }
   function sliceText(from, to) {
     var t = '';
+    var prev = null;
     for (var i = from; i <= to; i++) {
       var el = getSentSpan(i);
+      if (!el) continue;
       // Use the ORIGINAL text when a transform has rewritten this
       // .cup-sent so captured payloads fingerprint against source text.
-      if (el) t += (t ? ' ' : '') + originalTextOf(el).replace(/\\s+/g, ' ').trim();
+      // Whitespace inside one sentence is source formatting, so it
+      // collapses — but each piece keeps its own edges, because the
+      // wrapper splits a sentence at every inline element and the space
+      // around one belongs to the text, not to us. A rendered line break
+      // replaces whatever whitespace sits at that seam.
+      var piece = originalTextOf(el).replace(/\\s+/g, ' ');
+      if (t) {
+        if (lineBreakBetween(prev, el)) {
+          t = t.replace(/\\s+\$/, '') + '\\n';
+          piece = piece.replace(/^\\s+/, '');
+        } else if (!/\\s\$/.test(t) && !/^\\s/.test(piece) &&
+                   (/\\s/.test(textBetween(prev, el)) ||
+                    boxAncestor(prev) !== boxAncestor(el))) {
+          // Either the markup put a gap here, or the two pieces sit in
+          // different boxes — neighbouring table cells, say — which the
+          // reader also reads as a gap.
+          t += ' ';
+        }
+      }
+      t += piece;
+      prev = el;
     }
-    return t;
+    return t.trim();
   }
   function applyTempHighlight() {
     document.querySelectorAll('.cup-sent.cupitor-temp-highlight').forEach(function(el) {
@@ -1647,8 +1795,8 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
   }
   async function emitCapture(op) {
     var text = sliceText(st.from, st.to);
-    var prevText = st.from > 0 ? (getSentSpan(st.from - 1)?.textContent || '') : '';
-    var nextText = st.to < sentenceCount() - 1 ? (getSentSpan(st.to + 1)?.textContent || '') : '';
+    var prevText = st.from > 0 ? originalTextOf(getSentSpan(st.from - 1)) : '';
+    var nextText = st.to < sentenceCount() - 1 ? originalTextOf(getSentSpan(st.to + 1)) : '';
     var prevFp = prevText ? await fp(prevText) : '';
     var nextFp = nextText ? await fp(nextText) : '';
     if (window.SentenceTagHandler) {
@@ -1778,8 +1926,8 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     applyTempHighlight();
     var payload = await (async function() {
       var text = sliceText(st.from, st.to);
-      var prevText = st.from > 0 ? (getSentSpan(st.from - 1)?.textContent || '') : '';
-      var nextText = st.to < sentenceCount() - 1 ? (getSentSpan(st.to + 1)?.textContent || '') : '';
+      var prevText = st.from > 0 ? originalTextOf(getSentSpan(st.from - 1)) : '';
+      var nextText = st.to < sentenceCount() - 1 ? originalTextOf(getSentSpan(st.to + 1)) : '';
       var prevFp = prevText ? await fp(prevText) : '';
       var nextFp = nextText ? await fp(nextText) : '';
       return { op: 'extend', sentenceId: sid, direction: direction, text: text,
@@ -1871,13 +2019,32 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     // No upper cap on run length — the inner loop bails as soon as the
     // running concatenation exceeds the record's target length + 8 chars,
     // which is a tighter bound than any fixed sentence-count would be.
+    // A sentence printed twice takes one record each: without this the
+    // second record matches the first occurrence again and the second
+    // stays bare.
+    var claimed = {};
+    // Claim every span a record took, not just the one it started on.
+    function claimRange(map, from, to) {
+      for (var c = from; c <= to; c++) map[c] = true;
+    }
     for (var r = 0; r < rehydrated.length; r++) {
       var rec = rehydrated[r];
       var normRec = fpNormalize(rec.text);
+      // Nothing to look for: an empty key matches the first punctuation
+      // -only span on the page.
+      if (!normRec) { unmatched.push(rec); continue; }
       var found = false;
+      for (var pick = 0; pick < 2 && !found; pick++) {
+      var skipClaimed = pick === 0;
       for (var i = 0; i < all.length && !found; i++) {
+        // A span of bare punctuation carries no key of its own, so a run
+        // starting there is indistinguishable from the one starting after
+        // it — and claiming it would leave the real span free.
+        if (!norms[i]) continue;
+        if (skipClaimed && claimed[i]) continue;
         var acc = norms[i];
         if (acc === normRec) {
+          claimRange(claimed, i, i);
           registerTagSet(rec.id, rec.tagIds || [], rec.tagColors || [], i, i, rec.mask || '');
           stampGroup(rec.id);
           __applyMediaMarker(all[i], rec.mediaKinds);
@@ -1889,6 +2056,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
           // committing multi-sentence captures.
           acc = acc + (acc && norms[j] ? ' ' : '') + norms[j];
           if (acc === normRec) {
+            claimRange(claimed, i, j);
             registerTagSet(rec.id, rec.tagIds || [], rec.tagColors || [], i, j, rec.mask || '');
             stampGroup(rec.id);
             __applyMediaMarker(all[i], rec.mediaKinds);
@@ -1897,6 +2065,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
           }
           if (acc.length > normRec.length + 8) break;
         }
+      }
       }
       if (!found) {
         unmatched.push(rec);
@@ -1911,11 +2080,19 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
       for (var u = 0; u < unmatched.length; u++) {
         var rec2 = unmatched[u];
         var collapsedRec = fpNormalize(rec2.text).replace(/\\s+/g, '');
+        // An empty key matches the first punctuation-only span on the
+        // page, which is not this record.
+        if (!collapsedRec) { stillUnmatched.push(rec2); continue; }
         var found2 = false;
+        for (var pick2 = 0; pick2 < 2 && !found2; pick2++) {
+        var skipClaimed2 = pick2 === 0;
         for (var i2 = 0; i2 < all.length && !found2; i2++) {
+          if (!norms[i2]) continue;
+          if (skipClaimed2 && claimed[i2]) continue;
           var acc2 = norms[i2];
           var collapsedAcc = acc2.replace(/\\s+/g, '');
           if (collapsedAcc === collapsedRec) {
+            claimRange(claimed, i2, i2);
             registerTagSet(rec2.id, rec2.tagIds || [], rec2.tagColors || [], i2, i2, rec2.mask || '');
             stampGroup(rec2.id);
             __applyMediaMarker(all[i2], rec2.mediaKinds);
@@ -1926,6 +2103,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
             acc2 = acc2 + (acc2 && norms[j2] ? ' ' : '') + norms[j2];
             collapsedAcc = acc2.replace(/\\s+/g, '');
             if (collapsedAcc === collapsedRec) {
+              claimRange(claimed, i2, j2);
               registerTagSet(rec2.id, rec2.tagIds || [], rec2.tagColors || [], i2, j2, rec2.mask || '');
               stampGroup(rec2.id);
               __applyMediaMarker(all[i2], rec2.mediaKinds);
@@ -1934,6 +2112,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
             }
             if (collapsedAcc.length > collapsedRec.length + 8) break;
           }
+        }
         }
         if (!found2) stillUnmatched.push(rec2);
       }
@@ -3019,7 +3198,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
       );
       final suggestedName = await BookExporter.defaultFileNameForBook(book.key);
       if (!mounted) return;
-      final savedPath = await FilePicker.platform.saveFile(
+      final savedPath = await saveBytesToPickedFile(
         dialogTitle: 'Save Cupitor bundle',
         fileName: suggestedName,
         bytes: bytes,

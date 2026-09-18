@@ -410,16 +410,22 @@ class BookImporter {
         final prevFp = s['prev_fp'] as String?;
         final nextFp = s['next_fp'] as String?;
         final mask = s['mask'] as String?;
+        // Same rule as a capture: a reading that differs only in whitespace
+        // is the sentence already here, not a second one.
         final existing = await rawDb.query(
           'sentences',
-          where: 'profile_id = ? AND page_id = ? AND text = ? '
-              'AND IFNULL(prev_fp,"") = IFNULL(?,"") '
-              'AND IFNULL(next_fp,"") = IFNULL(?,"")',
-          whereArgs: [localProfileId, localPage, text, prevFp, nextFp],
-          limit: 1,
+          where: 'profile_id = ? AND page_id = ? '
+              'AND IFNULL(prev_fp,"") = ? '
+              'AND IFNULL(next_fp,"") = ?',
+          whereArgs: [localProfileId, localPage, prevFp ?? '', nextFp ?? ''],
         );
-        final localId = existing.isNotEmpty
-            ? existing.first['id'] as int
+        final hit = matchSentenceRow(existing, text);
+        if (hit != null && mask != null && (hit['mask'] as String?) == null) {
+          await rawDb.update('sentences', {'mask': mask},
+              where: 'id = ?', whereArgs: [hit['id']]);
+        }
+        final localId = hit != null
+            ? hit['id'] as int
             : await rawDb.insert('sentences', {
                 'profile_id': localProfileId,
                 'page_id': localPage,

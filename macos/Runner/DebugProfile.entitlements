@@ -4,6 +4,11 @@
 <dict>
 	<key>com.apple.security.app-sandbox</key>
 	<true/>
+	<!-- Saving an export and opening an EPUB both go through a system
+	     panel; without this the panel returns a path the sandbox then
+	     refuses to read or write. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
 	<key>com.apple.security.network.server</key>
