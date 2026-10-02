@@ -23,6 +23,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:speech_to_text/speech_recognition_error.dart' as stt;
 import 'speech_hub.dart';
 import 'caption_capture.dart';
+import 'video_note.dart';
 import 'translate_detail.dart';
 import 'ai_prompt.dart';
 import 'youtube_urls.dart';
@@ -237,6 +238,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   bool _tagCaptureToggleVisible = false;
   bool _tagCaptureArmed = false;
   Offset _tagCaptureChipPos = const Offset(-1, -1);
+  // Floating "note at this moment" button over video pages. Switched on from
+  // the Tools drawer; shown only while the page has a video.
+  bool _videoNoteEnabled = false;
+  // Page fullscreen is kept inside the main screen so the floating chips stay
+  // on top of it. macOS: the page's own element is pinned over the WebView
+  // (kInPageFullscreenJs). Android: the WebView's fullscreen view is drawn
+  // here instead of on a route of its own.
+  bool _macPageFullscreen = false;
+  Widget? _androidFullscreenView;
+  OnHideCustomWidgetCallback? _hideAndroidFullscreen;
+  bool get _webFullscreen =>
+      _macPageFullscreen || _androidFullscreenView != null;
+  bool _videoNoteHasVideo = false;
+  Offset _videoNoteChipPos = const Offset(-1, -1);
+  late final VideoPresencePoller _videoNotePoller = VideoPresencePoller(
+    probe: () => _controller.runJavaScriptReturningResult(kHasVideoJs),
+    onChange: (has) {
+      if (mounted) setState(() => _videoNoteHasVideo = has);
+    },
+  );
   Set<int> _tagFilterTagIds = <int>{};
   bool _tagMasksVisible = false;
   bool _tagTransformsEnabled = true;
@@ -454,6 +475,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     ProfileService.active.removeListener(_onProfileChanged);
     WidgetsBinding.instance.removeObserver(this);
     SpeechHub.release(_speechHubListener);
+    _videoNotePoller.dispose();
     _notifTimer.stop();
     WakelockPlus.disable();
     _adBlockChannel.setMethodCallHandler(null); // stop receiving callbacks
@@ -648,6 +670,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _pageZoomLevel = prefs.getInt('pageZoom') ?? 0;
       _scrollDiagEnabled = prefs.getBool('scrollDiag') ?? false;
       _savePageStrip = prefs.getBool('savePageStripCupitor') ?? false;
+      _videoNoteEnabled = prefs.getBool('videoNoteButton') ?? false;
+      if (_videoNoteEnabled) _videoNotePoller.start();
       final yf = prefs.getString('youtubeFrontend');
       _youtubeFrontend = (yf != null && yf.isNotEmpty) ? yf : null;
       // Blank or missing falls back to the shipped wording — see
@@ -3980,6 +4004,18 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       onTap: () {
                         Navigator.of(ctx).pop();
                         _armSentenceCollecting();
+                      },
+                    ),
+                    SwitchListTile(
+                      secondary: const Icon(Icons.edit_note),
+                      title: const Text('Video note button'),
+                      subtitle: const Text(
+                          'Floating button on videos: type or dictate a note '
+                          'at the current time, send it to a playlist'),
+                      value: _videoNoteEnabled,
+                      onChanged: (val) async {
+                        await _setVideoNoteEnabled(val);
+                        setModalState(() {});
                       },
                     ),
 
@@ -9026,6 +9062,71 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// produces no Dart callback at all once partials have been seen — so
   /// without this the page would wait on the watchdog. Answer it now instead;
   /// 'cancelled' is silent in the webapp and restores the field.
+  Future<void> _setVideoNoteEnabled(bool on) async {
+    setState(() => _videoNoteEnabled = on);
+    on ? _videoNotePoller.start() : _videoNotePoller.stop();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('videoNoteButton', on);
+  }
+
+  /// Floating video-note button: note the video's current moment, take typed
+  /// or dictated text, and send it down the caption-capture path so the
+  /// webapp files it as a card whose link opens the video at that moment.
+  Future<void> _openVideoNote() async {
+    VideoMoment? moment;
+    try {
+      moment = parseVideoMoment(await _controller
+          .runJavaScriptReturningResult(videoMomentJs(pause: true)));
+    } catch (_) {}
+    if (!mounted) return;
+    if (moment == null) {
+      // The page may have paused something it could not report on.
+      _controller.runJavaScript(kResumeNoteVideoJs).catchError((_) {});
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No video found on this page')),
+      );
+      return;
+    }
+    final note = await showVideoNoteDialog(
+      context,
+      moment: moment,
+      speechLocale: _speechLocale(),
+      prepareMic: () async {
+        if (_nativeRecordingActive) return false;
+        await _sttCancelForMicHandoff();
+        await _releaseMicFromSpeechToText();
+        return _ensureMicPermission();
+      },
+    );
+    // Anything short of handing the note over goes back to watching. After a
+    // send the video stays paused: dialog1 opens over it to file the card.
+    void resume() {
+      if (moment!.wasPlaying) {
+        _controller.runJavaScript(kResumeNoteVideoJs).catchError((_) {});
+      }
+    }
+    if (!mounted) return;
+    final detail = note == null
+        ? null
+        : buildCaptionCaptureDetail(
+            videoNoteBlock(moment, note.text, seconds: note.seconds),
+            fallbackLang: _selectedLanguage,
+          );
+    if (detail == null) {
+      resume();
+      return;
+    }
+    try {
+      await _sendCaptionCaptureToDialog1(detail);
+    } catch (e) {
+      resume();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not send the note: $e')),
+      );
+    }
+  }
+
   /// One-tap entry point for collecting sentences off a web page.
   ///
   /// The underlying mechanism is the same capture mode the tag chip arms, but
@@ -10721,6 +10822,25 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   );
                 },
                 onMoved: (pos) => _tagCaptureChipPos = pos,
+              ),
+            if (_videoNoteEnabled && _videoNoteHasVideo)
+              TagCaptureFloatingChip(
+                armed: true,
+                armedIcon: Icons.edit_note,
+                armedColor: Colors.indigo,
+                armedBorderColor: const Color(0xFF1A237E),
+                // Above the capture chip's default corner so the two never
+                // start stacked on each other.
+                initialPos: _videoNoteChipPos.dx >= 0
+                    ? _videoNoteChipPos
+                    : Offset(
+                        MediaQuery.of(context).size.width - 64,
+                        MediaQuery.of(context).size.height -
+                            MediaQuery.of(context).padding.bottom - 208,
+                      ),
+                onTap: _openVideoNote,
+                onHide: () => _setVideoNoteEnabled(false),
+                onMoved: (pos) => _videoNoteChipPos = pos,
               ),
           ],
         ),
