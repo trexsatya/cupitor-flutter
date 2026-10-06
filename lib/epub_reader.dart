@@ -45,6 +45,8 @@ import 'tag_filter.dart';
 import 'media_store.dart';
 import 'tag_settings.dart';
 import 'text_transform.dart';
+import 'mac_webview.dart';
+import 'page_cursor.dart';
 
 // ─── Library: previously-opened EPUBs ────────────────────────────────────
 // Persisted in SharedPreferences under `epub_library` as a JSON list. We
@@ -1018,6 +1020,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     _state = await EpubReadingState.load(book.key);
     if (_state.chapterIdx >= book.chapters.length) _state.chapterIdx = 0;
     final ctrl = WebViewController()
+      ..configureForMac()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setBackgroundColor(_themeBg(_state.theme))
       ..addJavaScriptChannel('CupEpub', onMessageReceived: _onJsMessage)
@@ -4419,7 +4422,7 @@ $chapterHtml
                   colorFilter: eink ? einkColorFilter : identityColorFilter,
                   child: child,
                 ),
-                child: WebViewWidget(controller: _controller!),
+                child: pageCursor(WebViewWidget(controller: _controller!)),
               ),
             ),
             if (_chromeVisible) ...[

@@ -43,6 +43,7 @@ class MainActivity : FlutterActivity() {
         // matched against onRequestPermissionsResult so we route the answer
         // back to the correct pending MethodChannel.Result.
         private const val PERM_REQ_MIC = 4001
+        private const val PERM_REQ_CAMERA = 4002
         private const val PREFS_NAME = "cupitor_adblock"
         private const val PREFS_CUSTOM_HOSTS = "custom_ad_hosts"
 
@@ -146,10 +147,11 @@ class MainActivity : FlutterActivity() {
     // Whether network-level ad blocking is active (toggled from Dart).
     @Volatile var adBlockEnabled = true
 
-    // Pending result for an in-flight RECORD_AUDIO request. Only one can be
-    // outstanding at a time — a second request while one is pending is
-    // resolved to false immediately so the caller can retry.
-    private var pendingMicPermResult: MethodChannel.Result? = null
+    // Pending result per in-flight permission request, keyed by request code.
+    // Only one per permission can be outstanding at a time — a second request
+    // while one is pending is resolved to false immediately so the caller can
+    // retry.
+    private val pendingPermResults = mutableMapOf<Int, MethodChannel.Result>()
 
     // Native MediaRecorder session for the manual-entry recorder. We capture
     // through this path (instead of WebView's getUserMedia) because the
@@ -286,7 +288,12 @@ class MainActivity : FlutterActivity() {
         this.permsChannel = permsChannel
         permsChannel.setMethodCallHandler { call, result ->
             when (call.method) {
-                "requestMicrophone" -> requestMicPermission(result)
+                "requestMicrophone" -> requestRuntimePermission(
+                    android.Manifest.permission.RECORD_AUDIO, PERM_REQ_MIC, result
+                )
+                "requestCamera" -> requestRuntimePermission(
+                    android.Manifest.permission.CAMERA, PERM_REQ_CAMERA, result
+                )
                 "startNativeRecording" -> {
                     // New API: caller passes `pathStem` (no extension) and the
                     // recorder picks .ogg / .m4a based on the OS's Opus support.
@@ -307,6 +314,7 @@ class MainActivity : FlutterActivity() {
                 "installFrameScript" -> installFrameScript(
                     call.argument<String>("script") ?: "", result
                 )
+                "frameScriptStatus" -> frameScriptStatus(result)
                 "installRenderGuard" -> installRenderGuard(result)
                 "attachLocalMedia" -> attachLocalMedia(call.argument<String>("dir"), result)
                 "stopNativeRecording" -> stopNativeRecording(result)
@@ -490,6 +498,11 @@ class MainActivity : FlutterActivity() {
         // child process that went away.
         android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "DEPENDENCY_DIED"
         android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "EXCESSIVE_RESOURCE_USAGE"
+        // API 31+. Killed over the app freezer, e.g. a synchronous binder call
+        // made to us while we were frozen in the background. Named here rather
+        // than left to the `else` branch because it is not rare on modern
+        // Android and "reason=14" says nothing to anyone reading the log.
+        android.app.ApplicationExitInfo.REASON_FREEZER -> "FREEZER"
         android.app.ApplicationExitInfo.REASON_EXIT_SELF -> "EXIT_SELF"
         android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "INITIALIZATION_FAILURE"
         android.app.ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY"
@@ -576,53 +589,109 @@ class MainActivity : FlutterActivity() {
     // the frame's own scripts.
     //
     // Handlers are kept so a re-install replaces rather than stacks.
-    private val frameScriptHandlers = mutableListOf<androidx.webkit.ScriptHandler>()
+    /// The agent itself, remembered so a WebView built later can still get it.
+    private var frameScript: String? = null
+
+    /// One handler per WebView we have registered on. Weak, because a WebView
+    /// that has gone away must not be held alive by this map, and identity
+    /// keyed because View does not override equals.
+    private val frameScriptHandlers =
+        java.util.WeakHashMap<android.webkit.WebView, androidx.webkit.ScriptHandler>()
+
+    private var frameScriptWatching = false
+    private var lastFrameScriptScan = 0L
+
+    private fun documentStartSupported(): Boolean =
+        androidx.webkit.WebViewFeature.isFeatureSupported(
+            androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)
+
+    /**
+     * Register the remembered script on every WebView that does not have it.
+     *
+     * Returns how many were newly registered. Views already carrying it are
+     * skipped, so this is cheap to call repeatedly — which is the point, since
+     * it runs from a layout listener.
+     */
+    private fun applyFrameScript(): Int {
+        val script = frameScript ?: return 0
+        if (!documentStartSupported()) return 0
+        val views = mutableListOf<android.webkit.WebView>()
+        try {
+            collectWebViews(window.decorView, views)
+        } catch (_: Exception) { return 0 }
+        var added = 0
+        for (v in views) {
+            if (frameScriptHandlers.containsKey(v)) continue
+            try {
+                // "*" because an embedded reader can live on any host, and the
+                // script itself decides whether a given frame is interesting.
+                frameScriptHandlers[v] =
+                    androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
+                        v, script, setOf("*")
+                    )
+                added++
+            } catch (_: Exception) { /* this view misses out; others may not */ }
+        }
+        return added
+    }
+
+    /**
+     * Register on each WebView the moment it enters the view tree.
+     *
+     * A document-start script only applies to documents that BEGIN after it is
+     * registered, so registering has to beat the first navigation. Polling
+     * cannot promise that. Layout runs before the first frame is drawn, and
+     * again when a dialog adds its own WebView, so this is the earliest point
+     * available — and it covers the dialog WebViews, which are built long
+     * after startup and which a one-shot install never reached at all.
+     */
+    private fun watchForNewWebViews() {
+        if (frameScriptWatching) return
+        frameScriptWatching = true
+        try {
+            window.decorView.viewTreeObserver.addOnGlobalLayoutListener {
+                // Layout is frequent and the scan walks the view tree, so it is
+                // throttled. The window is short enough that a WebView added in
+                // one layout pass is registered in the next.
+                val now = android.os.SystemClock.uptimeMillis()
+                if (now - lastFrameScriptScan < 100) return@addOnGlobalLayoutListener
+                lastFrameScriptScan = now
+                applyFrameScript()
+            }
+        } catch (_: Exception) { frameScriptWatching = false }
+    }
 
     private fun installFrameScript(script: String, result: MethodChannel.Result) {
         if (script.isBlank()) { result.success("skipped: empty script"); return }
-        if (!androidx.webkit.WebViewFeature.isFeatureSupported(
-                androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
+        if (!documentStartSupported()) {
             // Ships with the WebView, not the OS, so an old system WebView on a
             // new Android is possible.
             result.success("unsupported: this WebView has no DOCUMENT_START_SCRIPT")
             return
         }
-        val views = mutableListOf<android.webkit.WebView>()
-        try {
-            collectWebViews(window.decorView, views)
-        } catch (e: Exception) {
-            result.success("failed to scan views: " + (e.message ?: ""))
-            return
-        }
-        if (views.isEmpty()) {
-            // Flutter builds the platform view lazily; the caller retries.
-            result.success("no-webview")
-            return
-        }
-        for (h in frameScriptHandlers) {
-            try { h.remove() } catch (_: Exception) {}
-        }
-        frameScriptHandlers.clear()
-        var installed = 0
-        var failed = ""
-        for (v in views) {
-            try {
-                // "*" because an embedded reader can live on any host, and the
-                // script itself decides whether a given frame is interesting.
-                frameScriptHandlers.add(
-                    androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
-                        v, script, setOf("*")
-                    )
-                )
-                installed++
-            } catch (e: Exception) {
-                failed = e.message ?: e.toString()
+        if (script != frameScript) {
+            // A different script makes every existing registration stale.
+            for (h in frameScriptHandlers.values) {
+                try { h.remove() } catch (_: Exception) {}
             }
+            frameScriptHandlers.clear()
+            frameScript = script
         }
+        watchForNewWebViews()
+        val added = applyFrameScript()
+        val total = frameScriptHandlers.size
         result.success(
-            if (installed > 0) "installed into $installed webview(s)"
-            else "failed: $failed"
+            if (total > 0) "registered on $added new webview(s), $total total"
+            else "armed: no webview yet, will register as one is attached"
         )
+    }
+
+    /** How many WebViews currently carry the frame script. */
+    private fun frameScriptStatus(result: MethodChannel.Result) {
+        // Scan first: the caller is asking because it is waiting to navigate,
+        // and a WebView attached since the last layout should count now.
+        applyFrameScript()
+        result.success(frameScriptHandlers.size)
     }
 
     private fun collectWebViews(view: android.view.View, out: MutableList<android.webkit.WebView>) {
@@ -890,22 +959,22 @@ class MainActivity : FlutterActivity() {
         try { startActivity(chooser) } catch (_: Exception) { /* no chooser available — silent no-op */ }
     }
 
-    // Returns true via `result` if RECORD_AUDIO is granted (now or after the
+    // Returns true via `result` if `permission` is granted (now or after the
     // user accepts the prompt). The OS prompt is async — we stash the result
     // until onRequestPermissionsResult fires and then deliver the answer.
-    private fun requestMicPermission(result: MethodChannel.Result) {
+    private fun requestRuntimePermission(
+        permission: String, requestCode: Int, result: MethodChannel.Result
+    ) {
         val alreadyGranted = androidx.core.content.ContextCompat.checkSelfPermission(
-            this, android.Manifest.permission.RECORD_AUDIO
+            this, permission
         ) == android.content.pm.PackageManager.PERMISSION_GRANTED
         if (alreadyGranted) { result.success(true); return }
         // Another request is in flight — bounce. The caller can retry once
         // the first prompt resolves.
-        if (pendingMicPermResult != null) { result.success(false); return }
-        pendingMicPermResult = result
+        if (pendingPermResults.containsKey(requestCode)) { result.success(false); return }
+        pendingPermResults[requestCode] = result
         androidx.core.app.ActivityCompat.requestPermissions(
-            this,
-            arrayOf(android.Manifest.permission.RECORD_AUDIO),
-            PERM_REQ_MIC
+            this, arrayOf(permission), requestCode
         )
     }
 
@@ -915,12 +984,10 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == PERM_REQ_MIC) {
-            val ok = grantResults.isNotEmpty() &&
-                     grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
-            pendingMicPermResult?.success(ok)
-            pendingMicPermResult = null
-        }
+        val pending = pendingPermResults.remove(requestCode) ?: return
+        val ok = grantResults.isNotEmpty() &&
+                 grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
+        pending.success(ok)
     }
 
     // ---------------------------------------------------------------------------
@@ -1457,17 +1524,27 @@ class MainActivity : FlutterActivity() {
     }
 
     /** Depth-first search for ALL WebViews in a view tree. */
-    private fun findAllWebViews(view: View, result: MutableList<WebView>) {
+    private fun findAllWebViews(view: View, result: MutableCollection<WebView>) {
         if (view is WebView) { result.add(view); return }
         if (view is ViewGroup) {
             for (i in 0 until view.childCount) findAllWebViews(view.getChildAt(i), result)
         }
     }
 
-    /** Collect WebViews from the Activity window and any Dialog windows. */
+    /**
+     * Collect WebViews from the Activity window and any Dialog windows.
+     *
+     * A set, because the two sources overlap: the Activity's decorView is
+     * itself one of WindowManagerGlobal's views, so every WebView in the
+     * Activity window is reached twice. View does not override equals, so
+     * this dedupes by identity, which is what we want. Callers only ever
+     * wrap-if-not-already, so duplicates did no harm — but they doubled the
+     * counts in the messages those callers report, which is actively
+     * misleading when the count is the thing you are trying to read.
+     */
     private fun allWebViews(): List<WebView> {
-        val result = mutableListOf<WebView>()
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return result
+        val result = LinkedHashSet<WebView>()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return result.toList()
         // Activity window
         findAllWebViews(window.decorView, result)
         // Dialog windows — accessible via the WindowManager's internal list using reflection
@@ -1479,10 +1556,10 @@ class MainActivity : FlutterActivity() {
             val viewsField = wmGlobalClass.getDeclaredField("mViews")
             viewsField.isAccessible = true
             @Suppress("UNCHECKED_CAST")
-            val views = viewsField.get(wmGlobal) as? ArrayList<View> ?: return result
+            val views = viewsField.get(wmGlobal) as? ArrayList<View> ?: return result.toList()
             for (v in views) findAllWebViews(v, result)
         } catch (_: Exception) { /* reflection unavailable — activity window WebViews only */ }
-        return result
+        return result.toList()
     }
 
     // ---------------------------------------------------------------------------

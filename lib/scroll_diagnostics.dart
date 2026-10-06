@@ -97,9 +97,10 @@ const String _installer = r'''
   }
   S.scrollableY = scrollableY;
 
+  // All the way up: app UIs (ChatGPT's thread, say) nest the text well over a
+  // dozen levels below the box that actually scrolls.
   function nearestScrollable(el) {
-    var n = 0;
-    while (el && n++ < 15) {
+    while (el) {
       if (scrollableY(el)) return el;
       el = el.parentElement;
     }
@@ -207,11 +208,14 @@ const String _installer = r'''
       var se = document.scrollingElement || document.documentElement;
       var sc = nearestScrollable(el);
       g = {
-        id: ++S.seq, el: el, y0: y,
+        id: ++S.seq, el: el, y0: y, tid: t.identifier,
         root0: se.scrollTop, sc: sc, sc0: sc ? sc.scrollTop : null,
         moves: 0, dy: 0, prevented: false, cancelable: null,
       };
+      // touch id + finger count: a second DOWN for the same id with no UP in
+      // between means the host delivered the press twice.
       post('DOWN #' + g.id + ' at (' + x + ',' + y + ') on ' + desc(el)
+        + ' touch:' + t.identifier + ' fingers:' + (e.touches ? e.touches.length : '?')
         + ' nearestScrollable:' + (sc ? desc(sc) : 'NONE'));
     } catch (err) { post('touchstart probe failed: ' + err); }
   }, { capture: true, passive: true });

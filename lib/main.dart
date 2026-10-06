@@ -24,9 +24,11 @@ import 'package:speech_to_text/speech_recognition_error.dart' as stt;
 import 'speech_hub.dart';
 import 'caption_capture.dart';
 import 'video_note.dart';
+import 'page_cursor.dart';
 import 'translate_detail.dart';
 import 'ai_prompt.dart';
 import 'youtube_urls.dart';
+import 'mac_webview.dart';
 import 'history_store.dart';
 import 'history_screen.dart';
 import 'speech_session.dart';
@@ -57,6 +59,7 @@ import 'notif/notification_manager.dart';
 import 'playlist_service.dart';
 import 'profile_service.dart';
 import 'tag_browser.dart';
+import 'capture_meta.dart';
 import 'media_store.dart';
 import 'tag_capture.dart';
 import 'tag_filter.dart';
@@ -252,6 +255,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _macPageFullscreen || _androidFullscreenView != null;
   bool _videoNoteHasVideo = false;
   Offset _videoNoteChipPos = const Offset(-1, -1);
+  // Floating button that opens the study dialog straight into fullscreen.
+  // Shown unless switched off (Tools drawer, or a long press on it).
+  bool _studyFsChipEnabled = true;
+  // Where the exit-fullscreen button sits inside the fullscreen study dialog.
+  Offset _dialog1FsExitPos = const Offset(-1, -1);
+  Offset _studyFsChipPos = const Offset(-1, -1);
   late final VideoPresencePoller _videoNotePoller = VideoPresencePoller(
     probe: () => _controller.runJavaScriptReturningResult(kHasVideoJs),
     onChange: (has) {
@@ -460,6 +469,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       'Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36';
 
+  // The main browser on macOS identifies as desktop Safari instead: the
+  // Android UA above gets sites' touch-first mobile layouts, and YouTube's
+  // mobile player treats every mouse click as play/pause, with no theater
+  // mode. Safari's UA carries no WebView marker, so Google sign-in still works.
+  static const String _macUserAgent =
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 '
+      '(KHTML, like Gecko) Version/18.0 Safari/605.1.15';
+
 
   static const List<String> _youtubeFrontendInstances = [
     'piped.video',
@@ -476,6 +493,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     WidgetsBinding.instance.removeObserver(this);
     SpeechHub.release(_speechHubListener);
     _videoNotePoller.dispose();
+    HardwareKeyboard.instance.removeHandler(_onMacFullscreenEscape);
     _notifTimer.stop();
     WakelockPlus.disable();
     _adBlockChannel.setMethodCallHandler(null); // stop receiving callbacks
@@ -576,6 +594,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     WakelockPlus.enable();
+    onMacWindowExitedFullscreen(() => _setMacPageFullscreen(false));
+    HardwareKeyboard.instance.addHandler(_onMacFullscreenEscape);
     // Record why we died last time — a system kill leaves no crash report at
     // all, so this log is the only evidence such a death ever happened. Runs
     // un-awaited, so the lines land once the platform channel answers rather
@@ -590,6 +610,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         if (mounted) _showAppBarWithTimer();
       });
     }
+    // If the webapp was mid-session when we died, put its dialog back so its
+    // own restore can run. After the first frame, because opening a dialog
+    // needs a built tree.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _reopenWebappViewIfAny();
+    });
     // Listen for auto-detected ad hosts coming from the native layer
     if (Platform.isAndroid) {
       _adBlockChannel.setMethodCallHandler((call) async {
@@ -671,6 +697,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _scrollDiagEnabled = prefs.getBool('scrollDiag') ?? false;
       _savePageStrip = prefs.getBool('savePageStripCupitor') ?? false;
       _videoNoteEnabled = prefs.getBool('videoNoteButton') ?? false;
+      _studyFsChipEnabled = prefs.getBool('studyFullscreenButton') ?? true;
       if (_videoNoteEnabled) _videoNotePoller.start();
       final yf = prefs.getString('youtubeFrontend');
       _youtubeFrontend = (yf != null && yf.isNotEmpty) ? yf : null;
@@ -710,9 +737,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // instance. Same shape as dialog2Controller.
       late final WebViewController c;
       c = WebViewController()
+        ..configureForMac()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
-        ..setUserAgent(_userAgent)
+        ..setUserAgent(Platform.isMacOS ? _macUserAgent : _userAgent)
         ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) => _openDialogWithWebview(msg.message.toString().replaceAll('"', '')))
+        ..addJavaScriptChannel('FullscreenChannel', onMessageReceived: (msg) {
+          if (identical(c, _controller)) _onWebFullscreenChange(msg);
+        })
         // Caption lines the user ticked in snippet.js's subtitle sidebar,
         // on their way to the language webapp as manual playlist item(s).
         // Contract: docs/superpowers/specs/2026-09-06-caption-capture-design.md
@@ -821,6 +852,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               return NavigationDecision.navigate;
             },
             onPageStarted: (url) {
+              // A page torn down mid-fullscreen never reports leaving it.
+              if (Platform.isAndroid) _setVideoLandscape(false);
+              _hideAndroidFullscreen?.call();
+              if (_macPageFullscreen) _setMacPageFullscreen(false);
               if (_isShowingOurHtml) return; // our own HTML page, don't reset state
               // Save scroll position of the page we're leaving
               if (_prevPageUrl != null) _saveScrollPosition(_prevPageUrl!);
@@ -886,6 +921,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _injectJs();
               _injectAdBlocker();
               c.runJavaScript(_linkLongPressJs);
+              if (Platform.isAndroid) c.runJavaScript(_fullscreenWatcherJs);
+              if (Platform.isMacOS) c.runJavaScript(kInPageFullscreenJs);
               _injectSpaHook();
               _injectPageZoom();
               _injectSelectionWatcher();
@@ -903,12 +940,36 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _injectScrollDiag(c, 'main');
             },
           ),
-        )
-        ..loadRequest(Uri.parse(initialUrl));
+        );
       // Published only once fully built, so nothing can observe a half-wired
       // controller through the field.
       _controller = c;
       _enableThirdPartyCookies(c);
+      final platform = c.platform;
+      if (platform is AndroidWebViewController) {
+        platform.setCustomWidgetCallbacks(
+          onShowCustomWidget: (view, hide) {
+            if (!identical(c, _controller) || !mounted) return hide();
+            setState(() {
+              _androidFullscreenView = view;
+              _hideAndroidFullscreen = hide;
+            });
+          },
+          onHideCustomWidget: () {
+            if (!identical(c, _controller) || !mounted) return;
+            setState(() {
+              _androidFullscreenView = null;
+              _hideAndroidFullscreen = null;
+            });
+          },
+        );
+      }
+      // Navigating is deliberately the last thing, and it waits. The WebView
+      // has to be in the view tree before the frame agent can be registered on
+      // it, and the agent has to be registered before a document starts or it
+      // misses that document entirely. Loading here rather than in the cascade
+      // above is what puts those three in the right order.
+      _loadWhenFrameScriptReady(c, initialUrl);
       };
       _rebuildMainController!(savedUrl);
       setState(() {
@@ -1168,6 +1229,44 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         window.addEventListener('blur', cancelLp);
       })();
     ''');
+  }
+
+  /// Posted when the page enters or leaves fullscreen. macOS: 'mac-enter' /
+  /// 'mac-exit' from [kInPageFullscreenJs]. Android: from
+  /// [_fullscreenWatcherJs]; only 'landscape' locks rotation, anything else
+  /// hands it back.
+  void _onWebFullscreenChange(JavaScriptMessage msg) {
+    if (Platform.isMacOS) _setMacPageFullscreen(msg.message == 'mac-enter');
+    if (Platform.isAndroid) _setVideoLandscape(msg.message == 'landscape');
+  }
+
+  /// Esc while a Flutter widget (a floating chip, say) holds keyboard focus;
+  /// with the page focused, the page's own handler in [kInPageFullscreenJs]
+  /// sees it and Flutter never does.
+  bool _onMacFullscreenEscape(KeyEvent e) {
+    if (!_macPageFullscreen || e is! KeyDownEvent) return false;
+    if (e.logicalKey != LogicalKeyboardKey.escape) return false;
+    _setMacPageFullscreen(false);
+    return true;
+  }
+
+  void _setMacPageFullscreen(bool on) {
+    if (on == _macPageFullscreen || !mounted) return;
+    setState(() => _macPageFullscreen = on);
+    setMacWindowFullscreen(on);
+    // The page-side state must follow when the app leaves (navigation, or the
+    // window dropping out of fullscreen); a no-op when the page itself left.
+    if (!on) {
+      _controller
+          .runJavaScript('window.__cupExitFakeFs && window.__cupExitFakeFs()')
+          .catchError((_) {});
+    }
+  }
+
+  void _setVideoLandscape(bool landscape) {
+    SystemChrome.setPreferredOrientations(landscape
+        ? const [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]
+        : const []);
   }
 
   // Scaling is done with CSS `zoom`, not `transform: scale()` — see
@@ -2502,43 +2601,169 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// the WebView itself and then runs in EVERY frame of every page — including
   /// cross-origin ones no page script can touch. That is what makes an e-book
   /// reader served from a different subdomain reachable at all.
+  /// Where the last good copy of the frame agent is kept between launches.
+  static const String _kFrameScriptCachePref = 'frameScriptCache';
+
+  /// Registers the frame agent, stored copy first and network second.
+  ///
+  /// A document-start script only applies to documents that begin loading
+  /// after it is registered. Fetching before registering therefore loses the
+  /// agent on any page that starts during the fetch — and restoring the
+  /// previous session's page is exactly when the page wins, because it comes
+  /// back from cache in milliseconds while the fetch is still in flight.
+  /// Registering from preferences turns that wait into a file read.
   Future<void> _warmAndInstallFrameScript() async {
     if (!Platform.isAndroid) return;
-    // Logged rather than kept in state: nothing on screen reports it, so a
-    // failed install is only ever diagnosed from the log.
-    debugPrint('[frame-agent] ${await _installFrameScript()}');
+    try {
+      await _warmAndInstallFrameScriptInner();
+    } finally {
+      // The first navigation waits on this. Anything that got us here without
+      // completing it — a preferences failure, a channel that threw — must
+      // still let the page load.
+      if (!_frameScriptReady.isCompleted) _frameScriptReady.complete();
+    }
   }
 
-  Future<String> _installFrameScript() async {
-    String script;
+  /// The newest copy of the frame agent we hold, cached or fetched.
+  ///
+  /// Kept so the agent can also be run straight into the main frame. The
+  /// document-start registration is the better route where it works, but it is
+  /// not the only one, and this is the same source either way — one script to
+  /// maintain rather than a second copy in Dart drifting away from it.
+  String? _frameScriptSource;
+
+  Future<void> _warmAndInstallFrameScriptInner() async {
+    String? cached;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      cached = prefs.getString(_kFrameScriptCachePref);
+    } catch (_) {}
+    if (cached != null && cached.trim().isNotEmpty) {
+      _frameScriptSource = cached;
+      _reportFrameAgent('stored copy -> ${await _registerFrameScript(cached)}');
+    }
+
+    final fresh = await _fetchFrameScript();
+    if (fresh == null) {
+      if (cached == null || cached.trim().isEmpty) {
+        _reportFrameAgent('no stored copy, and the fetch failed');
+      }
+      return;
+    }
+    if (fresh == cached) return; // registered above, and unchanged
+    _frameScriptSource = fresh;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kFrameScriptCachePref, fresh);
+    } catch (_) {}
+    // Registered now as well as stored. It only takes effect from the next
+    // navigation, which is still worth having in this session rather than
+    // waiting for the next launch.
+    _reportFrameAgent('fetched -> ${await _registerFrameScript(fresh)}');
+  }
+
+  /// Reported rather than kept in state: nothing on screen shows it, so a
+  /// failed install is only ever diagnosed from the log. Into the snippet log
+  /// as well as logcat, because logcat needs a cable — without it, an agent
+  /// that never installed and one that installed and found nothing to do are
+  /// the same silence on the device.
+  void _reportFrameAgent(String msg) {
+    debugPrint('[frame-agent] $msg');
+    _appendSnippetLog('log', '[frame-agent] $msg');
+  }
+
+  /// The agent's source, or null when it could not be fetched.
+  Future<String?> _fetchFrameScript() async {
     try {
       final r = await http
           .get(Uri.parse(_frameBootUrl))
           .timeout(const Duration(seconds: 8));
-      if (r.statusCode != 200 || r.body.trim().isEmpty) {
-        return 'fetch failed: HTTP ${r.statusCode}';
-      }
-      script = r.body;
+      if (r.statusCode != 200 || r.body.trim().isEmpty) return null;
+      return r.body;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Completes once the frame agent is registered on at least one WebView.
+  ///
+  /// The first navigation waits on this. A document-start script only applies
+  /// to documents that begin after it is registered, so "register soon" is not
+  /// good enough — a page restored from cache starts in milliseconds and would
+  /// be missed. Waiting is what turns that from likely into certain.
+  final Completer<void> _frameScriptReady = Completer<void>();
+
+  /// Arms the native side with [script] and waits for it to take.
+  ///
+  /// Arming is one call: the native side remembers the script and registers it
+  /// on each WebView as that WebView enters the view tree, which is earlier
+  /// than anything reachable from here. This then polls a cheap status call
+  /// rather than re-sending the script, which is 40KB a time over the channel.
+  Future<String> _registerFrameScript(String script) async {
+    String armed;
+    try {
+      armed = await _permsChannel.invokeMethod<String>(
+            'installFrameScript',
+            {'script': script},
+          ) ??
+          'no reply';
     } catch (e) {
-      return 'fetch failed: $e';
+      return 'install failed: $e';
     }
-    // Flutter builds the platform view lazily, so early attempts can land
-    // before any WebView exists to attach to.
-    for (var attempt = 0; attempt < 12; attempt++) {
+    // Nothing to wait for: either it is already on, or this WebView will never
+    // support it and waiting would only delay the page for nothing.
+    if (!armed.startsWith('armed')) {
+      if (!_frameScriptReady.isCompleted) _frameScriptReady.complete();
+      return armed;
+    }
+    var waitMs = 10;
+    for (var attempt = 0; attempt < 20; attempt++) {
+      await Future<void>.delayed(Duration(milliseconds: waitMs));
+      if (waitMs < 200) waitMs *= 2;
+      int count;
       try {
-        final res = await _permsChannel.invokeMethod<String>(
-          'installFrameScript',
-          {'script': script},
-        );
-        if (res == null || !res.startsWith('no-webview')) {
-          return res ?? 'no reply';
-        }
-      } catch (e) {
-        return 'install failed: $e';
+        count = await _permsChannel.invokeMethod<int>('frameScriptStatus') ?? 0;
+      } catch (_) {
+        break;
       }
-      await Future<void>.delayed(const Duration(milliseconds: 600));
+      if (count > 0) {
+        if (!_frameScriptReady.isCompleted) _frameScriptReady.complete();
+        return 'registered on $count webview(s) after ${attempt + 1} check(s)';
+      }
     }
-    return 'no WebView found after 12 attempts';
+    // Give up waiting rather than hold the page hostage to a feature that is
+    // only ever an improvement on it.
+    if (!_frameScriptReady.isCompleted) _frameScriptReady.complete();
+    return 'armed, but no webview took it in time';
+  }
+
+  /// Issues [c]'s first navigation once the frame agent is registered.
+  void _loadWhenFrameScriptReady(WebViewController c, String url) {
+    final target = Uri.parse(url);
+    if (!Platform.isAndroid) {
+      c.loadRequest(target);
+      return;
+    }
+    _awaitFrameScript().then((_) {
+      if (!mounted) return;
+      try {
+        c.loadRequest(target);
+      } catch (_) {
+        // A malformed saved URL must not leave the app on a blank page with
+        // no way back; the bar still holds the text for the user to fix.
+      }
+    });
+  }
+
+  /// Holds the first navigation until the frame agent is in place.
+  ///
+  /// Bounded, because a page that never loads is a worse failure than a page
+  /// that loads without the agent.
+  Future<void> _awaitFrameScript() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _frameScriptReady.future.timeout(const Duration(seconds: 3));
+    } catch (_) {}
   }
 
   /// Wrap every live WebView's client on the Android side so a dead renderer
@@ -2629,7 +2854,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // Prefer the last URL that actually loaded.
     final target = _firstLoadableUrl([_lastLoadedUrl, _urlController.text.trim()])
         ?? 'https://google.com';
-    setState(() => _isControllerReady = false);
+    setState(() {
+      _isControllerReady = false;
+      // A dead WebView never reports leaving fullscreen.
+      _androidFullscreenView = null;
+      _hideAndroidFullscreen = null;
+    });
+    if (Platform.isAndroid) _setVideoLandscape(false);
     try {
       rebuild(target);
     } catch (e) {
@@ -2999,16 +3230,19 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       platform.setUseWideViewPort(true);
       // Grant requested resource permissions. `protectedMediaId` is needed
       // for Widevine DRM (Spotify Web Player); `microphone` is needed for
-      // the manual-entry audio recorder. For mic specifically we ALSO have
-      // to make sure Android's runtime `RECORD_AUDIO` is granted to the
-      // host app — granting the WebView resource without the OS-level
+      // the manual-entry audio recorder. For mic and camera we ALSO have
+      // to make sure Android's runtime `RECORD_AUDIO` / `CAMERA` is granted
+      // to the host app — granting the WebView resource without the OS-level
       // permission still results in `getUserMedia` rejecting silently.
       platform.setOnPlatformPermissionRequest((request) {
         final needsMic = request.types.contains(WebViewPermissionResourceType.microphone);
-        if (needsMic) {
+        final needsCamera = request.types.contains(WebViewPermissionResourceType.camera);
+        if (needsMic || needsCamera) {
           // Fire-and-forget — grant() / deny() are themselves async.
           () async {
-            final ok = await _ensureMicPermission();
+            // One at a time: Android shows a single permission prompt at once.
+            final ok = (!needsMic || await _ensureMicPermission())
+                && (!needsCamera || await _ensureCameraPermission());
             try {
               if (ok) await request.grant();
               else    await request.deny();
@@ -3033,6 +3267,18 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       return ok ?? false;
     } catch (e) {
       debugPrint('mic permission request failed: $e');
+      return false;
+    }
+  }
+
+  /// Android `CAMERA` counterpart of [_ensureMicPermission].
+  Future<bool> _ensureCameraPermission() async {
+    if (!Platform.isAndroid) return true;
+    try {
+      final ok = await _permsChannel.invokeMethod<bool>('requestCamera');
+      return ok ?? false;
+    } catch (e) {
+      debugPrint('camera permission request failed: $e');
       return false;
     }
   }
@@ -3288,20 +3534,69 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   ///
   /// CSS hiding and the skip-button click observer are kept as defence in
   /// depth (in case YouTube renames the ad fields and pruning breaks).
+  /// Runs the frame agent straight into the main frame of [ctrl].
+  ///
+  /// The document-start registration reaches every frame and runs before the
+  /// page's own scripts, which is strictly better — but on a device where that
+  /// registration does not take, it leaves nothing at all. The agent guards
+  /// itself with `window.__cupFrameBoot`, so where both routes work the second
+  /// one does nothing, and where only this one works the page still gets the
+  /// ad pruning. It returns immediately in a top frame after that, so none of
+  /// the frame-agent machinery runs twice.
+  void _injectFrameAgentIntoMainFrame([WebViewController? ctrl]) {
+    final src = _frameScriptSource;
+    if (src == null || src.trim().isEmpty) return;
+    try {
+      (ctrl ?? _controller).runJavaScript(src);
+    } catch (_) {
+      // A page that rejects it keeps whatever the injected blocker below gives
+      // it; this is the better copy, not the only one.
+    }
+  }
+
   void _injectYouTubeAdBlocker([WebViewController? ctrl]) {
+    // Before the copy below, so the flag it sets makes that copy stand its
+    // pruning down. This one covers the mobile site's get_watch endpoint and
+    // XHR, which the copy below does not.
+    _injectFrameAgentIntoMainFrame(ctrl);
     const js = r'''
       (function() {
         if (!location.hostname.includes('youtube.com')) return;
         if (window._ytAdBlockerInjected) return;
         window._ytAdBlockerInjected = true;
 
+        // Says which of the two copies is doing the work. Without it, a page
+        // the frame agent missed and a page nothing ran on at all read the
+        // same in the log — silence.
+        try {
+          SnippetLogChannel.postMessage('log|[yt] host injection ran, prune ' +
+            (window._ytAdPruneInstalled ? 'already up (frame agent)' : 'installing here'));
+        } catch (_) {}
+
         // ---- 1. JSON pruning (the actual ad killer) ----
-        const AD_KEYS = ['playerAds', 'adPlacements', 'adSlots', 'adServingData'];
+        // Stood down when the frame agent installed the same prune first. It
+        // runs at document start in every frame, so where it is present it is
+        // strictly the better copy — and wrapping fetch twice would parse and
+        // re-serialise every player response for nothing. The DOM defences
+        // below still run either way; the frame agent has no equivalent.
+        if (!window._ytAdPruneInstalled) {
+        window._ytAdPruneInstalled = 1;
+
+        const AD_KEYS = [
+          'playerAds', 'adPlacements', 'adSlots', 'adServingData',
+          'adBreakHeartbeatParams', 'importantForAds',
+        ];
         function prune(obj) {
           if (!obj || typeof obj !== 'object') return;
           for (const k of AD_KEYS) {
             if (k in obj) try { delete obj[k]; } catch (_) {}
           }
+          // Responses to /next and the reel endpoint carry the player response
+          // one level down rather than at the top, and that copy holds its own
+          // ad keys. Descend by name rather than walking the whole tree: the
+          // payload is large, and deleting a key called adSlots wherever it
+          // happens to appear risks taking a part of the page with it.
+          if (obj.playerResponse) prune(obj.playerResponse);
         }
 
         // Best-effort: prune anything already assigned by an inline <script>
@@ -3320,14 +3615,22 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           });
         } catch (_) { /* property may already be non-configurable */ }
 
-        // Wrap fetch so /youtubei/v1/player responses (issued for every SPA
-        // video navigation) get the same treatment. This is the path that
-        // catches every video after the first one on a session.
+        // Wrap fetch so the innertube responses that carry ad data (issued for
+        // every SPA video navigation) get the same treatment. This is the path
+        // that catches every video after the first one on a session.
+        const AD_ENDPOINTS = [
+          '/youtubei/v1/player',
+          '/youtubei/v1/next',
+          '/youtubei/v1/reel/reel_item_watch',
+        ];
+        function carriesAds(url) {
+          return AD_ENDPOINTS.some((p) => url.includes(p));
+        }
         const _origFetch = window.fetch;
         window.fetch = async function(input, init) {
           const url = typeof input === 'string' ? input : (input && input.url) || '';
           const response = await _origFetch.call(this, input, init);
-          if (url.includes('/youtubei/v1/player')) {
+          if (carriesAds(url)) {
             try {
               const text = await response.clone().text();
               const json = JSON.parse(text);
@@ -3341,6 +3644,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           }
           return response;
         };
+        } // end of the prune install
 
         // ---- 2. Defensive CSS + skip-button click observer ----
         // Runs after DOMContentLoaded so we don't fail when injected at
@@ -3373,6 +3677,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           function clickSkip() {
             const btn = document.querySelector(
               '.ytp-skip-ad-button, .ytp-ad-skip-button, ' +
+              '.ytp-skip-ad-button-modern, .ytp-ad-skip-button-modern, ' +
               '.ytp-ad-skip-button-slot button, .ytp-ad-overlay-close-button'
             );
             if (btn) btn.click();
@@ -3387,7 +3692,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 for (const node of m.addedNodes) {
                   if (node.nodeType !== 1) continue;
                   if (node.matches && node.matches(
-                    '.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-slot'
+                    '.ytp-skip-ad-button, .ytp-ad-skip-button, ' +
+                    '.ytp-skip-ad-button-modern, .ytp-ad-skip-button-modern, ' +
+                    '.ytp-ad-skip-button-slot'
                   )) { clickSkip(); return; }
                 }
               }
@@ -4015,6 +4322,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       value: _videoNoteEnabled,
                       onChanged: (val) async {
                         await _setVideoNoteEnabled(val);
+                        setModalState(() {});
+                      },
+                    ),
+                    SwitchListTile(
+                      secondary: const Icon(Icons.fullscreen),
+                      title: const Text('Fullscreen study button'),
+                      subtitle: const Text(
+                          'Floating button that opens the study dialog in fullscreen'),
+                      value: _studyFsChipEnabled,
+                      onChanged: (val) async {
+                        await _setStudyFsChipEnabled(val);
                         setModalState(() {});
                       },
                     ),
@@ -4689,6 +5007,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final String dialogIdForBridge = dialogId;
     late final WebViewController dialog2Controller;
     dialog2Controller = WebViewController()
+      ..configureForMac()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setUserAgent(_userAgent)
       ..addJavaScriptChannel('FilmotBridge', onMessageReceived: (msg) => _handleFilmotMessage(dialogIdForBridge, msg.message))
@@ -5025,7 +5344,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         colorFilter: eink ? einkColorFilter : identityColorFilter,
                         child: child,
                       ),
-                      child: WebViewWidget(controller: controller),
+                      child: pageCursor(WebViewWidget(controller: controller)),
                     ),
             ),
           ),
@@ -6985,6 +7304,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         var titleEl = document.querySelector('#divVideoDetails .col-6');
         if (titleEl) videoTitle = (titleEl.textContent || '').trim().split(/\s*[\r\n]+/)[0].slice(0, 200);
         if (!videoTitle) videoTitle = (document.title || '').trim();
+        // Filmot links the uploader as /channel/<id>, next to the title.
+        var chEl = document.querySelector('#divVideoDetails a[href*="/channel/"]');
+        var videoChannel = chEl ? (chEl.textContent || '').trim().slice(0, 100) : '';
         var divs = document.querySelectorAll('#subtitlesIn > div[id^="s"]');
         var lines = [];
         for (var i = 0; i < divs.length; i++) {
@@ -7084,7 +7406,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           matchReason: matchReason,
           videoId: videoId || '',
           videoUrl: videoId ? ('https://www.youtube.com/watch?v=' + videoId) : '',
-          videoTitle: videoTitle
+          videoTitle: videoTitle,
+          videoChannel: videoChannel
         });
       })();
     ''';
@@ -7119,7 +7442,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final matchReason = (data['matchReason'] ?? '').toString();
     final videoUrl = (data['videoUrl'] ?? '').toString();
     final videoId = (data['videoId'] ?? '').toString();
-    final videoTitle = (data['videoTitle'] ?? '').toString();
+    final videoTitle = cleanCapturedTitle((data['videoTitle'] ?? '').toString());
     if (linesRaw.isEmpty) {
       _showCaptureError(
         'No subtitle lines',
@@ -7164,6 +7487,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       videoUrl: videoUrl,
       videoId: videoId,
       videoTitle: videoTitle,
+      videoChannel: (data['videoChannel'] ?? '').toString(),
     );
   }
 
@@ -7175,6 +7499,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     required String videoUrl,
     required String videoId,
     required String videoTitle,
+    String videoChannel = '',
   }) {
     // matchIdx is mutable — the user can change the anchor line manually
     // via the picker below.
@@ -7444,6 +7769,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     'videoUrl': videoUrl,
                     'videoId': videoId,
                     'videoTitle': videoTitle,
+                    if (videoChannel.isNotEmpty) 'channel': videoChannel,
                   });
                 },
                 child: const Text('Send to lookup'),
@@ -7850,6 +8176,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     } else {
       _dialog1Loaded = false;
       dialogController = WebViewController()
+        ..configureForMac()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(_userAgent)
         ..addJavaScriptChannel('GitHubProxy', onMessageReceived: _handleGitHubProxyRequest)
@@ -8026,7 +8353,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // covers the full screen height; otherwise the system insets clip
       // about ~50 px off the top + bottom on Android.
       useSafeArea: false,
-      builder: (ctx) => ValueListenableBuilder<bool>(
+      builder: (ctx) {
+        // Captured here because this is the only place the route object is
+        // reachable; showDialog does not hand it back.
+        _dialog1Route = ModalRoute.of(ctx);
+        return ValueListenableBuilder<bool>(
         // Fullscreen toggle lives outside the outer State's setState scope
         // (this is a separate Navigator route), so we drive it from a notifier.
         valueListenable: _dialog1FullscreenNotifier,
@@ -8042,7 +8373,23 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             shape: fullscreen
                 ? const RoundedRectangleBorder(borderRadius: BorderRadius.zero)
                 : null,
-            child: _buildDialog1Content(ctx, screenWidth, screenHeight),
+            child: fullscreen
+                ? Stack(children: [
+                    _buildDialog1Content(ctx, screenWidth, screenHeight),
+                    // The only control left on screen: back to the normal
+                    // dialog, toolbar and all. Draggable, so it can be moved
+                    // off whatever part of the page it covers.
+                    TagCaptureFloatingChip(
+                      armed: false,
+                      idleIcon: Icons.fullscreen_exit,
+                      idleColor: const Color(0xCCE0E0E0),
+                      initialPos: _dialog1FsExitPos,
+                      onTap: () => _dialog1FullscreenNotifier.value = false,
+                      onHide: () => _dialog1FullscreenNotifier.value = false,
+                      onMoved: (p) => _dialog1FsExitPos = p,
+                    ),
+                  ])
+                : _buildDialog1Content(ctx, screenWidth, screenHeight),
           );
           if (!hasBeenMinimized) return dialog;
           // Custom barrier tap handler — minimizes instead of closing.
@@ -8063,12 +8410,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             ),
           );
         },
-      ),
+        );
+      },
     ).then((_) {
       // Dialog closed - but keep controller alive to avoid reloading.
       // Controller will be cleaned up only when app is disposed or language changes.
       // This prevents unnecessary reloads when reopening the dialog.
       _dialog1Visible = false;
+      _dialog1Route = null;
       _dialog1FullscreenNotifier.value = false;
       // Release the mic, and ANSWER the page rather than tearing down
       // silently: the controller deliberately outlives the dialog (and this
@@ -8096,12 +8445,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   Widget _buildDialog1Content(BuildContext ctx, double screenWidth, double screenHeight) {
+    // Fullscreen gives the page the toolbar's row too; the toolbar comes back
+    // with the exit button laid over the page (see _showDialog1).
+    final fullscreen = _dialog1FullscreenNotifier.value;
     return Container(
       width: screenWidth,
       height: screenHeight,
       child: Column(
         children: [
-          Container(
+          if (!fullscreen) Container(
             padding: const EdgeInsets.symmetric(horizontal: 4),
             child: Theme(
               // Compact the icon row so the title bar takes less vertical space.
@@ -8252,7 +8604,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       // force-unwrap turned that recovery into a crash.
                       child: dialogController == null
                           ? const SizedBox.shrink()
-                          : WebViewWidget(controller: dialogController!),
+                          : pageCursor(WebViewWidget(controller: dialogController!)),
                     ),
             ),
           ),
@@ -8573,6 +8925,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       builder: (dctx) {
         late final WebViewController ctrl;
         ctrl = WebViewController()
+          ..configureForMac()
           ..setJavaScriptMode(JavaScriptMode.unrestricted)
           ..setUserAgent(_userAgent)
           ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) {
@@ -8617,7 +8970,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   ),
                 ),
                 const Divider(height: 1),
-                Expanded(child: WebViewWidget(controller: ctrl)),
+                Expanded(child: pageCursor(WebViewWidget(controller: ctrl))),
               ],
             ),
           ),
@@ -9062,6 +9415,30 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// produces no Dart callback at all once partials have been seen — so
   /// without this the page would wait on the watchdog. Answer it now instead;
   /// 'cancelled' is silent in the webapp and restores the field.
+  Future<void> _setStudyFsChipEnabled(bool on) async {
+    setState(() => _studyFsChipEnabled = on);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('studyFullscreenButton', on);
+    if (!on && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Fullscreen button hidden — turn it back on in Tools'),
+      ));
+    }
+  }
+
+  /// Opens the study dialog (dialog1) filling the screen. Fullscreen lasts
+  /// until the dialog is closed or minimized, which put it back to normal, so
+  /// every other way of opening it is unchanged. Over a fullscreen page (a
+  /// video) it opens at its normal size, so the video stays in view around it.
+  void _openStudyFullscreen() {
+    if (!_webFullscreen) _dialog1FullscreenNotifier.value = true;
+    if (dialogController == null) {
+      _openDialogWithWebview('');
+    } else {
+      _showDialog1();
+    }
+  }
+
   Future<void> _setVideoNoteEnabled(bool on) async {
     setState(() => _videoNoteEnabled = on);
     on ? _videoNotePoller.start() : _videoNotePoller.stop();
@@ -9553,6 +9930,30 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 })();
 ''';
 
+  // Fullscreen → FullscreenChannel. 'landscape' when the fullscreen element is
+  // (or holds) a wider-than-tall video, or is an iframe whose video we can't
+  // see; 'other' for portrait video (Shorts) or non-video content; 'exit'
+  // when leaving fullscreen. Idempotent — safe to re-run on every page-finished.
+  static const String _fullscreenWatcherJs = r'''
+(function() {
+  if (window.__cupFullscreenWatcher) return;
+  window.__cupFullscreenWatcher = true;
+  function onChange() {
+    var el = document.fullscreenElement || document.webkitFullscreenElement;
+    var msg = 'exit';
+    if (el) {
+      var v = el.tagName === 'VIDEO' ? el : el.querySelector('video');
+      // videoWidth is 0 until metadata loads: shape unknown, don't force it.
+      if (v) msg = v.videoWidth > v.videoHeight ? 'landscape' : 'other';
+      else msg = el.tagName === 'IFRAME' ? 'landscape' : 'other';
+    }
+    try { FullscreenChannel.postMessage(msg); } catch (e) {}
+  }
+  document.addEventListener('fullscreenchange', onChange, true);
+  document.addEventListener('webkitfullscreenchange', onChange, true);
+})();
+''';
+
   // Long-press on a link → "Copy Link". Android dispatches a 'contextmenu'
   // event on long-press; when it lands on (or inside) an <a href> we suppress
   // the native selection menu and hand the absolute URL to Dart via the
@@ -9766,6 +10167,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   ///  * `globalSearch` — full-text search across every EPUB in the
   ///    library. `{op:'globalSearch', query:'cat|dog'}`. Result set
   ///    dispatched as `cupitorGlobalSearchResults` CustomEvent.
+  ///  * `viewState` — the webapp's player/practice view opened or closed.
+  ///    `{op:'viewState', view:'player'|'practice'|''}`. Persisted so the
+  ///    dialog can be reopened at launch; the webapp restores the view itself
+  ///    once its page is running.
+  ///  * `captureFiled` — a sent capture has been written into a playlist,
+  ///    so close dialog1 and give the user back what they sent it from.
+  ///    `{op:'captureFiled', playlist:'Swedish'}`. The webapp withholds this
+  ///    while more blocks are queued, so the next picker isn't hidden.
   Future<void> _handlePlaylistBridge(String raw) async {
     Map<String, dynamic>? m;
     try {
@@ -9800,6 +10209,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
     if (op == 'cancelSearch') {
       _cancelGlobalSearch();
+      return;
+    }
+    if (op == 'captureFiled') {
+      _onCaptureFiled((m['message'] as String?) ?? '');
+      return;
+    }
+    if (op == 'viewState') {
+      await _rememberWebappView((m['view'] as String?) ?? '');
       return;
     }
   }
@@ -10182,7 +10599,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // event is then fired in onPageFinished, after the page is ready to listen.
   Map<String, dynamic>? _pendingCapturedSubtitle;
 
-  void _sendCapturedSubtitleToDialog1(Map<String, dynamic> payload) {
+  /// Fills in the video's channel and a clean title first: the webapp files
+  /// the capture under them, and a capture path that lacks them would file a
+  /// known video under a new name.
+  Future<void> _sendCapturedSubtitleToDialog1(Map<String, dynamic> payload) async {
+    _dispatchCapturedSubtitle(await withCaptureMeta(payload, fetchYouTubeOembed));
+  }
+
+  void _dispatchCapturedSubtitle(Map<String, dynamic> payload) {
     if (dialogController != null) {
       dialogController!.runJavaScript(_jsCodeForCapturedSubtitle(payload));
       _showDialog1();
@@ -10207,6 +10631,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// produce, and the second overwriting the first loses the user's text with
   /// nothing said about it.
   final List<Map<String, dynamic>> _pendingCaptionCaptures = [];
+
+  /// dialog1's own route while it is on screen.
+  ///
+  /// Kept so a programmatic close can remove exactly that route. Popping the
+  /// navigator would take whatever is on top instead, and a dialog2 panel is
+  /// pushed above dialog1 on the same navigator.
+  ModalRoute<dynamic>? _dialog1Route;
 
   /// True once dialog1's page has finished loading, which is when its
   /// listeners exist. Dispatching an event before that drops it silently.
@@ -10281,6 +10712,84 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     } catch (_) {
       return ('', '');
     }
+  }
+
+  /// SharedPreferences key holding the webapp view that was on screen when we
+  /// last heard from it: 'player', 'practice', or absent for none.
+  static const String _kOpenWebappViewPref = 'openWebappView';
+
+  /// Records what the webapp says it has open.
+  ///
+  /// The webapp keeps its own copy and restores the view itself — but only
+  /// once it is running, and it only runs inside dialog1. Nothing reopens that
+  /// dialog at launch, so without this the page never loads and its own
+  /// restore never gets the chance to fire.
+  Future<void> _rememberWebappView(String view) async {
+    final v = (view == 'player' || view == 'practice') ? view : '';
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (v.isEmpty) {
+        await prefs.remove(_kOpenWebappViewPref);
+      } else {
+        await prefs.setString(_kOpenWebappViewPref, v);
+      }
+    } catch (_) {
+      // Losing this costs one auto-reopen, never the session itself.
+    }
+  }
+
+  /// Brings dialog1 back at launch when the webapp was mid-session.
+  ///
+  /// Only opens the dialog. Which view comes back, at which card, and whether
+  /// it makes any sound are all the webapp's business — it has the queue and
+  /// the position, and it restores them as soon as its page runs.
+  Future<void> _reopenWebappViewIfAny() async {
+    String view = '';
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      view = prefs.getString(_kOpenWebappViewPref) ?? '';
+    } catch (_) {
+      return;
+    }
+    if (view.isEmpty || !mounted) return;
+    // Already up — the user beat us to it during startup.
+    if (dialogController != null) return;
+    _openDialogWithWebview('');
+  }
+
+  /// Puts dialog1 away once the webapp reports a capture filed, and says here
+  /// what happened.
+  ///
+  /// The send is what brought the webapp on screen; with the block written
+  /// there is nothing left there to look at, so the user goes back to the page
+  /// or book they sent it from.
+  ///
+  /// [message] is reported from here rather than by the page, because a toast
+  /// drawn inside dialog1 is torn down with it — the confirmation would flash
+  /// and vanish with the thing confirming it.
+  void _onCaptureFiled(String message) {
+    // Remove dialog1's own route rather than popping the navigator, which
+    // takes whatever is topmost. Pressing Add means dialog1 WAS topmost, so a
+    // pop would land right today — but that is a property of the webapp's
+    // button, not of this code, and naming the route costs nothing.
+    // Skipping it once the route has gone is the safe branch — a capture filed
+    // with dialog1 already closed has nothing left to close, and the message
+    // below is still worth showing.
+    final route = _dialog1Route;
+    if (mounted && _dialog1Visible && route != null && route.isActive) {
+      // Asking the route which navigator owns it beats assuming: no guess to
+      // get wrong if dialog1 is ever shown from somewhere else.
+      route.navigator?.removeRoute(route);
+    }
+    final text = message.trim();
+    if (text.isEmpty || !mounted) return;
+    // The root messenger, which is right because dialog1 has just gone and
+    // nothing else is covering the page. A dialog2 owns a nested messenger and
+    // would hide this (see _showDialog2SnackBar), but one cannot be on top
+    // here: the Add button that sends this is inside dialog1.
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(content: Text(text)),
+    );
   }
 
   /// Pushes ONE sentence from the tagging sheet to the language webapp, which
@@ -10654,6 +11163,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       canPop: false,
       onPopInvokedWithResult: (didPop, result) async {
         if (didPop) return;
+        final hideFullscreen = _hideAndroidFullscreen;
+        if (hideFullscreen != null) {
+          hideFullscreen();
+          return;
+        }
         if (_currentPdfUrl != null) {
           // Dismiss PDF overlay — the WebView still holds the previous page
           // since PDF navigation was prevented (NavigationDecision.prevent).
@@ -10677,7 +11191,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               colorFilter: _isEinkMode ? einkColorFilter : identityColorFilter,
               child: Stack(
                 children: [
-                  WebViewWidget(controller: _controller),
+                  pageCursor(WebViewWidget(controller: _controller)),
                   if (_currentPdfUrl != null && !_isTextView)
                     Positioned.fill(
                       child: PdfViewer.uri(
@@ -10743,8 +11257,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
                 ),
               ),
+            // The WebView's own fullscreen view (Android), under the chips.
+            if (_androidFullscreenView != null)
+              Positioned.fill(
+                child: ColoredBox(
+                  color: Colors.black,
+                  child: _androidFullscreenView,
+                ),
+              ),
             // App bar overlay — auto-hides on Android + macOS, always visible elsewhere
-            if (_showAppBar || !_autoHideAppBar)
+            if ((_showAppBar || !_autoHideAppBar) && !_webFullscreen)
               Positioned(
                 top: 0, left: 0, right: 0,
                 child: SafeArea(
@@ -10753,7 +11275,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 ),
               ),
             // Find-in-page bar
-            if (_showFindBar)
+            if (_showFindBar && !_webFullscreen)
               Positioned(
                 top: _showAppBar ? kToolbarHeight + MediaQuery.of(context).padding.top : 0,
                 left: 0, right: 0,
@@ -10841,6 +11363,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 onTap: _openVideoNote,
                 onHide: () => _setVideoNoteEnabled(false),
                 onMoved: (pos) => _videoNoteChipPos = pos,
+              ),
+            // Over a fullscreen video too, like the other floating buttons.
+            if (_studyFsChipEnabled)
+              TagCaptureFloatingChip(
+                armed: true,
+                armedIcon: Icons.fullscreen,
+                armedColor: Colors.teal,
+                armedBorderColor: const Color(0xFF004D40),
+                // Above the video-note button's starting place, so none of
+                // the chips start stacked on another.
+                initialPos: _studyFsChipPos.dx >= 0
+                    ? _studyFsChipPos
+                    : Offset(
+                        MediaQuery.of(context).size.width - 64,
+                        MediaQuery.of(context).size.height -
+                            MediaQuery.of(context).padding.bottom - 272,
+                      ),
+                onTap: _openStudyFullscreen,
+                onHide: () => _setStudyFsChipEnabled(false),
+                onMoved: (pos) => _studyFsChipPos = pos,
               ),
           ],
         ),
