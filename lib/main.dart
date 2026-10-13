@@ -8272,7 +8272,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('NotifBridge',
             onMessageReceived: (msg) => _notifBridge.handle(msg.message))
         // Language-app ↔ Cupitor bridge for the account feature
-        // (spec: docs/superpowers/specs/2026-10-13-multi-user-design.md).
+        // (docs/webapp-integration-spec.md §3.9).
         // Ops signIn / signOut / getStatus, acks via cupitorAccountAck.
         ..addJavaScriptChannel('AccountBridge',
             onMessageReceived: (msg) => _accountBridge.handle(msg.message))

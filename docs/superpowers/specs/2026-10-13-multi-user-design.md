@@ -107,9 +107,9 @@ load data from" picker (none or one listed user), and the guest banner.
   message. GitHub requests already go through the app's `GitHubProxy`
   channel, which attaches the token, so the webapp never holds it.
 - **In a browser:** the panel asks for a classic token with `public_repo`
-  scope, linking to GitHub's token page with that scope pre-filled. Kept in
-  memory by default, with an opt-in "remember on this device"
-  (localStorage).
+  scope, linking to GitHub's token page with that scope pre-filled. Kept for the
+  browser tab (sessionStorage) by default, with an opt-in "remember on this
+  device" (localStorage).
 
 Fine-grained tokens cannot open pull requests on repos the user does not
 own, so the browser path asks for a classic token.
