@@ -34,6 +34,7 @@ class _DeviceSignInDialogState extends State<DeviceSignInDialog> {
   DeviceCode? _code;
   String? _error;
   bool _cancelled = false;
+  bool _launchFailed = false;
 
   @override
   void initState() {
@@ -42,7 +43,7 @@ class _DeviceSignInDialogState extends State<DeviceSignInDialog> {
   }
 
   Future<void> _start() async {
-    setState(() { _code = null; _error = null; });
+    setState(() { _code = null; _error = null; _launchFailed = false; });
     try {
       final code = await widget.flow.requestCode();
       if (!mounted || _cancelled) return;
@@ -63,6 +64,23 @@ class _DeviceSignInDialogState extends State<DeviceSignInDialog> {
       if (!mounted || _cancelled) return;
       setState(() => _error = 'Sign-in failed: $e');
     }
+  }
+
+  @override
+  void dispose() {
+    // A dialog closed any other way (back button, route pop) stops polling too.
+    _cancelled = true;
+    super.dispose();
+  }
+
+  Future<void> _openGitHub(String uri) async {
+    bool opened;
+    try {
+      opened = await widget.launch(Uri.parse(uri));
+    } catch (_) {
+      opened = false;
+    }
+    if (!opened && mounted) setState(() => _launchFailed = true);
   }
 
   void _cancel() {
@@ -98,7 +116,7 @@ class _DeviceSignInDialogState extends State<DeviceSignInDialog> {
           FilledButton.icon(
             icon: const Icon(Icons.open_in_new),
             label: const Text('Open GitHub'),
-            onPressed: () => widget.launch(Uri.parse(code.verificationUri)),
+            onPressed: () => _openGitHub(code.verificationUri),
           ),
           OutlinedButton.icon(
             icon: const Icon(Icons.copy),
@@ -106,6 +124,10 @@ class _DeviceSignInDialogState extends State<DeviceSignInDialog> {
             onPressed: () => Clipboard.setData(ClipboardData(text: code.userCode)),
           ),
         ]),
+        if (_launchFailed) ...[
+          const SizedBox(height: 12),
+          SelectableText("Couldn't open the browser. Go to ${code.verificationUri} and enter the code."),
+        ],
         const SizedBox(height: 12),
         const Row(mainAxisSize: MainAxisSize.min, children: [
           SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),

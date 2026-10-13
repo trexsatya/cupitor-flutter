@@ -15,10 +15,11 @@ const _code = {
 
 /// A GitHub that hands out the code, then answers the token endpoint with
 /// `tokenReplies` in order (repeating the last).
-http.Client github(List<Map<String, Object?>> tokenReplies) {
+http.Client github(List<Map<String, Object?>> tokenReplies, {void Function()? onTokenRequest}) {
   var i = 0;
   return MockClient((req) async {
     if (req.url.path == '/login/device/code') return http.Response(jsonEncode(_code), 200);
+    onTokenRequest?.call();
     final r = tokenReplies[i < tokenReplies.length ? i : tokenReplies.length - 1];
     i++;
     return http.Response(jsonEncode(r), 200);
@@ -36,14 +37,15 @@ Future<void> pumps(WidgetTester tester, [int n = 6]) async {
 
 /// Pumps a page with one button that opens the dialog; returns the dialog's
 /// future and the URIs the dialog asked to open.
-Future<({Future<String?> result, List<Uri> opened})> open(WidgetTester tester, GitHubDeviceSignIn flow) async {
+Future<({Future<String?> result, List<Uri> opened})> open(WidgetTester tester, GitHubDeviceSignIn flow,
+    {Future<bool> Function(Uri)? launch}) async {
   final opened = <Uri>[];
   final done = Completer<String?>();
   await tester.pumpWidget(MaterialApp(
     home: Builder(
       builder: (ctx) => TextButton(
         onPressed: () async {
-          done.complete(await showDeviceSignInDialog(ctx, flow: flow, launch: (u) async { opened.add(u); return true; }));
+          done.complete(await showDeviceSignInDialog(ctx, flow: flow, launch: (u) async { opened.add(u); return launch == null ? true : await launch(u); }));
         },
         child: const Text('go'),
       ),
@@ -73,13 +75,17 @@ void main() {
 
   testWidgets('Cancel closes with null', (tester) async {
     final gate = Completer<void>();
-    final flow = GitHubDeviceSignIn(client: github([{'error': 'authorization_pending'}]), sleep: (_) => gate.future);
+    var tokenRequests = 0;
+    final flow = GitHubDeviceSignIn(
+        client: github([{'error': 'authorization_pending'}], onTokenRequest: () => tokenRequests++),
+        sleep: (_) => gate.future);
     final o = await open(tester, flow);
     await tester.tap(find.text('Cancel'));
     await pumps(tester);
     expect(await o.result, isNull);
     gate.complete(); // lets the abandoned poll finish (it sees _cancelled and stops)
     await pumps(tester);
+    expect(tokenRequests, 0);
   });
 
   testWidgets('a declined sign-in shows the reason and offers Retry', (tester) async {
@@ -106,4 +112,40 @@ void main() {
     await tester.tap(find.text('Cancel'));
     await pumps(tester, 20);
   });
+
+  testWidgets('a dialog removed without Cancel (back button, route pop) stops polling', (tester) async {
+    final gate = Completer<void>();
+    var tokenRequests = 0;
+    final flow = GitHubDeviceSignIn(
+        // Ends in a token so a poll that wrongly keeps going still finishes.
+        client: github([{'error': 'authorization_pending'}, {'access_token': 'ghu_x'}], onTokenRequest: () => tokenRequests++),
+        sleep: (_) => gate.future);
+    await open(tester, flow);
+    expect(find.text('ABCD-1234'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox()); // tears the dialog down; only dispose() sees it
+    gate.complete();
+    await pumps(tester);
+    expect(tokenRequests, 0);
+  });
+
+  const browserHelp = "Couldn't open the browser. Go to https://github.com/login/device and enter the code.";
+
+  for (final (name, launch) in <(String, Future<bool> Function(Uri))>[
+    ('returns false', (_) async => false),
+    ('throws', (_) async => throw Exception('no browser')),
+  ]) {
+    testWidgets('when opening the browser $name, the dialog says where to go', (tester) async {
+      final gate = Completer<void>();
+      final flow = GitHubDeviceSignIn(client: github([{'error': 'authorization_pending'}]), sleep: (_) => gate.future);
+      await open(tester, flow, launch: launch);
+      expect(find.text(browserHelp), findsNothing);
+      await tester.tap(find.text('Open GitHub'));
+      await pumps(tester);
+      expect(find.text(browserHelp), findsOneWidget);
+      expect(find.text('ABCD-1234'), findsOneWidget); // the code stays up
+      await tester.tap(find.text('Cancel'));
+      gate.complete();
+      await pumps(tester, 20);
+    });
+  }
 }
