@@ -28,14 +28,14 @@ class DeviceCode {
         deviceCode: j['device_code'] as String,
         userCode: j['user_code'] as String,
         verificationUri: (j['verification_uri'] as String?) ?? 'https://github.com/login/device',
-        interval: Duration(seconds: positiveSeconds(j['interval']) ?? 5),
-        expiresIn: Duration(seconds: positiveSeconds(j['expires_in']) ?? 900),
+        interval: Duration(seconds: _positiveSeconds(j['interval']) ?? 5),
+        expiresIn: Duration(seconds: _positiveSeconds(j['expires_in']) ?? 900),
       );
 }
 
 /// A positive whole number of seconds from a JSON value, or null when the
 /// value is missing, not a number, or not above zero.
-int? positiveSeconds(Object? v) => v is num && v >= 1 ? v.toInt() : null;
+int? _positiveSeconds(Object? v) => v is num && v >= 1 ? v.toInt() : null;
 
 /// `code` is one of: `denied` (the user declined), `expired` (the code ran
 /// out), `cancelled` (the caller gave up), `network`, `error` (anything else
@@ -120,7 +120,7 @@ class GitHubDeviceSignIn {
         case 'authorization_pending':
           continue;
         case 'slow_down':
-          interval = Duration(seconds: positiveSeconds(j['interval']) ?? (interval.inSeconds + 5));
+          interval = Duration(seconds: _positiveSeconds(j['interval']) ?? (interval.inSeconds + 5));
           continue;
         case 'expired_token':
           throw const DeviceSignInException('expired', 'the code expired');

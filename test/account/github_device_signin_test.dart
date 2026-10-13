@@ -171,6 +171,16 @@ void main() {
         w.flow.pollForToken(code, cancelled: () => ++asked > 1),
         throwsA(isA<DeviceSignInException>().having((e) => e.code, 'code', 'cancelled')),
       );
+      expect(w.posts, isEmpty);
+    });
+
+    test('cancelled() turning true after a pending reply stops before the next post', () async {
+      final w = world([{'error': 'authorization_pending'}]);
+      await expectLater(
+        w.flow.pollForToken(code, cancelled: () => w.posts.isNotEmpty),
+        throwsA(isA<DeviceSignInException>().having((e) => e.code, 'code', 'cancelled')),
+      );
+      expect(w.posts.length, 1);
     });
 
     test('a thrown client is network', () async {
