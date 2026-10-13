@@ -25,6 +25,7 @@ import 'speech_hub.dart';
 import 'caption_capture.dart';
 import 'video_note.dart';
 import 'lookup_video_hold.dart';
+import 'page_loading.dart';
 import 'page_cursor.dart';
 import 'translate_detail.dart';
 import 'ai_prompt.dart';
@@ -302,6 +303,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   static const int _kSnippetLogCap = 500;
   bool _showToolbar = false;
   bool _showAppBar = true;
+  // Drives the toolbar's spinner while the main page loads.
+  final PageLoading _pageLoading = PageLoading();
   // Platforms whose top app bar auto-hides on a timer and toggles via
   // double-tap / long-press. Mac mirrors Android so both feel identical.
   bool get _autoHideAppBar => Platform.isAndroid || Platform.isMacOS;
@@ -515,6 +518,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _findController.dispose();
     _dialogErrorNotifier.dispose();
     _snippetLogVersion.dispose();
+    _pageLoading.dispose();
     // Clean up all dialog controllers on app dispose
     dialogController = null;
     _dialog1Loaded = false;
@@ -834,6 +838,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     final ct = response.headers['content-type'] ?? '';
                     if (ct.contains('application/pdf') && mounted) {
                       HistoryStore.record(url);
+                      // The navigation started but is prevented here, so it
+                      // never reports finishing.
+                      if (identical(c, _controller)) _pageLoading.finished();
                       setState(() {
                         _urlController.text = url;
                         _currentPdfUrl = url;
@@ -858,7 +865,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               }
               return NavigationDecision.navigate;
             },
+            onProgress: (percent) {
+              if (identical(c, _controller)) _pageLoading.progress(percent);
+            },
+            onWebResourceError: (error) {
+              if (identical(c, _controller)) {
+                _pageLoading.failed(isMainFrame: error.isForMainFrame ?? true);
+              }
+            },
             onPageStarted: (url) {
+              if (identical(c, _controller)) _pageLoading.started();
               // A page torn down mid-fullscreen never reports leaving it.
               if (Platform.isAndroid) _setVideoLandscape(false);
               _hideAndroidFullscreen?.call();
@@ -910,6 +926,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _injectRemoteSnippetEarly();
             },
             onPageFinished: (url) {
+              if (identical(c, _controller)) _pageLoading.finished();
               if (_isShowingOurHtml) {
                 _injectJs(); // only need word-click JS on our own text page
                 c.runJavaScript(_linkLongPressJs);
@@ -2861,6 +2878,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // Prefer the last URL that actually loaded.
     final target = _firstLoadableUrl([_lastLoadedUrl, _urlController.text.trim()])
         ?? 'https://google.com';
+    // Nor does it finish the load it was in the middle of.
+    _pageLoading.finished();
     setState(() {
       _isControllerReady = false;
       // A dead WebView never reports leaving fullscreen.
@@ -11063,6 +11082,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ),
       ),
       actions: _urlBarFocused ? null : [
+        ValueListenableBuilder<bool>(
+          valueListenable: _pageLoading,
+          builder: (context, loading, __) => loading
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: SizedBox(
+                    width: 20, height: 20,
+                    // The toolbar's icon colour, so it reads on any app bar.
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: IconTheme.of(context).color),
+                  ),
+                )
+              : const SizedBox.shrink(),
+        ),
         IconButton(
           icon: Icon(Icons.tune_outlined),
           tooltip: 'Tools',
