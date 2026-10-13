@@ -52,6 +52,7 @@ import 'page_zoom.dart';
 import 'scroll_diagnostics.dart';
 import 'search_index.dart';
 import 'notif/notif_bridge.dart';
+import 'account/device_signin_dialog.dart';
 import 'notif/notif_channel.dart';
 import 'notif/notification_channel.dart';
 import 'notif/notif_runtime.dart';
@@ -1065,6 +1066,32 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     );
   }
 
+  /// The one place the GitHub token is written: memory for the proxy and
+  /// SharedPreferences `githubToken` for the next launch. Null or empty
+  /// clears it.
+  Future<void> _setGithubToken(String? token) async {
+    final t = (token ?? '').trim();
+    if (mounted) setState(() => _githubToken = t.isEmpty ? null : t);
+    final prefs = await SharedPreferences.getInstance();
+    if (t.isEmpty) {
+      await prefs.remove('githubToken');
+    } else {
+      await prefs.setString('githubToken', t);
+    }
+  }
+
+  /// Device-flow sign-in from the Tools sheet. The paste-token dialog stays
+  /// as the fallback.
+  Future<void> _showDeviceSignIn() async {
+    final token = await showDeviceSignInDialog(context);
+    if (token == null) return;
+    await _setGithubToken(token);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Signed in to GitHub')),
+    );
+  }
+
   void _showTokenDialog() {
     final ctrl = TextEditingController(text: _githubToken ?? '');
     showDialog(
@@ -1083,24 +1110,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           TextButton(
             child: Text('Clear'),
             onPressed: () async {
-              setState(() => _githubToken = null);
-              final prefs = await SharedPreferences.getInstance();
-              await prefs.remove('githubToken');
-              Navigator.of(ctx).pop();
+              await _setGithubToken(null);
+              if (ctx.mounted) Navigator.of(ctx).pop();
             },
           ),
           TextButton(
             child: Text('Save'),
             onPressed: () async {
-              final token = ctrl.text.trim();
-              setState(() => _githubToken = token.isEmpty ? null : token);
-              final prefs = await SharedPreferences.getInstance();
-              if (token.isEmpty) {
-                await prefs.remove('githubToken');
-              } else {
-                await prefs.setString('githubToken', token);
-              }
-              Navigator.of(ctx).pop();
+              await _setGithubToken(ctrl.text);
+              if (ctx.mounted) Navigator.of(ctx).pop();
             },
           ),
         ],
@@ -4289,6 +4307,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     // ── Advanced ───────────────────────────────────────
                     _toolsSectionDivider(),
                     _toolsSectionHeader('Advanced'),
+                    ListTile(
+                      leading: const Icon(Icons.login),
+                      title: const Text('Sign in with GitHub'),
+                      subtitle: Text(_githubToken != null ? 'Signed in' : 'Needed to save to your repo'),
+                      onTap: () {
+                        Navigator.of(ctx).pop();
+                        _showDeviceSignIn();
+                      },
+                    ),
                     ListTile(
                       leading: Icon(_githubToken != null ? Icons.key : Icons.key_off_outlined),
                       title: const Text('GitHub token'),
