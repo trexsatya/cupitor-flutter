@@ -24,6 +24,7 @@ import 'package:speech_to_text/speech_recognition_error.dart' as stt;
 import 'speech_hub.dart';
 import 'caption_capture.dart';
 import 'video_note.dart';
+import 'lookup_video_hold.dart';
 import 'page_cursor.dart';
 import 'translate_detail.dart';
 import 'ai_prompt.dart';
@@ -216,6 +217,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // fired from inside the open dialog already updates the live WebView via
   // runJavaScript, so it must not also push a fresh dialog route on top.
   bool _dialog1Visible = false;
+  // The page whose videos were paused for the open dialog1 (see
+  // _holdVideosForLookup); they play again when dialog1 closes.
+  WebViewController? _lookupHoldController;
 
   // Multiple dialog2 instances - each link opens a new dialog
   Map<String, WebViewController> _dialog2Controllers = {};
@@ -740,14 +744,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..configureForMac()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(Platform.isMacOS ? _macUserAgent : _userAgent)
-        ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) => _openDialogWithWebview(msg.message.toString().replaceAll('"', '')))
+        ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) {
+          _holdVideosForLookup(c);
+          _openDialogWithWebview(msg.message.toString().replaceAll('"', ''));
+        })
         ..addJavaScriptChannel('FullscreenChannel', onMessageReceived: (msg) {
           if (identical(c, _controller)) _onWebFullscreenChange(msg);
         })
         // Caption lines the user ticked in snippet.js's subtitle sidebar,
         // on their way to the language webapp as manual playlist item(s).
         // Contract: docs/superpowers/specs/2026-09-06-caption-capture-design.md
-        ..addJavaScriptChannel('CaptionCollector', onMessageReceived: _handleCaptionCollector)
+        ..addJavaScriptChannel('CaptionCollector', onMessageReceived: (msg) => _handleCaptionCollector(c, msg))
         ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
         ..addJavaScriptChannel('AdHostDetector', onMessageReceived: (msg) => _onJsAdHostDetected(msg.message))
@@ -8419,6 +8426,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _dialog1Visible = false;
       _dialog1Route = null;
       _dialog1FullscreenNotifier.value = false;
+      _releaseVideosAfterLookup();
       // Release the mic, and ANSWER the page rather than tearing down
       // silently: the controller deliberately outlives the dialog (and this
       // also runs on minimize), so the webapp is still alive holding a
@@ -10643,7 +10651,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// listeners exist. Dispatching an event before that drops it silently.
   bool _dialog1Loaded = false;
 
-  void _handleCaptionCollector(JavaScriptMessage msg) {
+  void _handleCaptionCollector(WebViewController page, JavaScriptMessage msg) {
     Object? raw;
     try {
       raw = jsonDecode(msg.message);
@@ -10654,7 +10662,30 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // Nothing usable in the payload — say nothing rather than opening dialog1
     // on an empty capture.
     if (detail == null) return;
-    _sendCaptionCaptureToDialog1(detail);
+    _holdVideosForLookup(page);
+    // A failed send never shows dialog1, so nothing would ever release.
+    _sendCaptionCaptureToDialog1(detail)
+        .catchError((_) => _releaseVideosAfterLookup());
+  }
+
+  /// Pauses the videos playing in [page] while dialog1 opens over it; they
+  /// play again when dialog1 closes (or is minimized). Only what was playing
+  /// is held, so a video the user had paused stays paused.
+  void _holdVideosForLookup(WebViewController page) {
+    // A second page holding while the first is still held would leave the
+    // first one paused for good, so let it go first.
+    final previous = _lookupHoldController;
+    if (previous != null && !identical(previous, page)) {
+      previous.runJavaScript(kReleaseVideosAfterLookupJs).catchError((_) {});
+    }
+    _lookupHoldController = page;
+    page.runJavaScript(kHoldVideosForLookupJs).catchError((_) {});
+  }
+
+  void _releaseVideosAfterLookup() {
+    final page = _lookupHoldController;
+    _lookupHoldController = null;
+    page?.runJavaScript(kReleaseVideosAfterLookupJs).catchError((_) {});
   }
 
   /// Deliberately a different event from `capturedSubtitle`, which drives the
