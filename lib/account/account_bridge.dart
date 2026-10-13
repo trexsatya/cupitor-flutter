@@ -30,6 +30,10 @@ class AccountBridge {
 
   bool _signingIn = false;
 
+  /// Bumped by every signOut. A signIn whose token arrives after a signOut
+  /// that started later than it does not keep that token.
+  int _generation = 0;
+
   AccountBridge({
     required this.signIn,
     required this.storeToken,
@@ -38,14 +42,18 @@ class AccountBridge {
     required this.emit,
   });
 
+  /// A throwing [emit] (e.g. the webview went away) is swallowed: the ack is
+  /// lost either way, and letting it propagate would trigger a second ack.
   void _ack(String? reqId, String op, bool ok, {String? error, Map<String, Object?>? data}) {
-    emit(ackEvent, {
-      'request_id': reqId,
-      'op': op,
-      'ok': ok,
-      if (error != null) 'error': error,
-      if (data != null) 'data': data,
-    });
+    try {
+      emit(ackEvent, {
+        'request_id': reqId,
+        'op': op,
+        'ok': ok,
+        if (error != null) 'error': error,
+        if (data != null) 'data': data,
+      });
+    } catch (_) {}
   }
 
   Future<void> handle(String raw) async {
@@ -63,6 +71,7 @@ class AccountBridge {
         case 'signIn':
           await _signIn(reqId);
         case 'signOut':
+          _generation++;
           await signOut();
           _ack(reqId, op, true, data: {'signed_in': false});
         case 'getStatus':
@@ -82,13 +91,20 @@ class AccountBridge {
       return;
     }
     _signingIn = true;
+    final gen = _generation;
     try {
       final token = await signIn();
-      if (token == null || token.isEmpty) {
+      if (token == null || token.isEmpty || gen != _generation) {
         _ack(reqId, op, false, error: 'cancelled');
         return;
       }
       await storeToken(token);
+      if (gen != _generation) {
+        // A signOut ran while the token was being stored; it must win.
+        await signOut();
+        _ack(reqId, op, false, error: 'cancelled');
+        return;
+      }
       _ack(reqId, op, true, data: {'signed_in': true});
     } on DeviceSignInException catch (e) {
       _ack(reqId, op, false,

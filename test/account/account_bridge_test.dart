@@ -63,6 +63,8 @@ void main() {
     final gate = Completer<String?>();
     signIn = () => gate.future;
     final bridge = make();
+    // Not awaited: handle runs synchronously up to its first await, so the
+    // busy flag is already set when the second signIn arrives.
     final first = bridge.handle('{"op":"signIn","request_id":"a"}');
     await bridge.handle('{"op":"signIn","request_id":"b"}');
     expect(lastAck(), {'request_id': 'b', 'op': 'signIn', 'ok': false, 'error': 'busy'});
@@ -111,5 +113,80 @@ void main() {
     expect(lastAck(), {'request_id': 'u', 'op': 'dance', 'ok': false, 'error': 'unknown_op'});
     await bridge.handle('{"request_id":"v"}');
     expect(lastAck(), {'request_id': 'v', 'op': 'unknown', 'ok': false, 'error': 'unknown_op'});
+    // Valid JSON that is not an object is still bad_json.
+    for (final raw in ['[]', '5']) {
+      await bridge.handle(raw);
+      expect(lastAck(), {'request_id': null, 'op': 'unknown', 'ok': false, 'error': 'bad_json'});
+    }
+    // A non-string op is treated as unknown.
+    await bridge.handle('{"op":5,"request_id":"w"}');
+    expect(lastAck(), {'request_id': 'w', 'op': 'unknown', 'ok': false, 'error': 'unknown_op'});
+  });
+
+  test('signOut during a pending signIn wins: the late token is dropped', () async {
+    final gate = Completer<String?>();
+    signIn = () => gate.future;
+    hasToken = true;
+    final bridge = make();
+    final pending = bridge.handle('{"op":"signIn","request_id":"in"}');
+    await bridge.handle('{"op":"signOut","request_id":"out"}');
+    expect(lastAck(), {'request_id': 'out', 'op': 'signOut', 'ok': true, 'data': {'signed_in': false}});
+    gate.complete('ghu_late');
+    await pending;
+    expect(stored, isEmpty);
+    expect(lastAck(), {'request_id': 'in', 'op': 'signIn', 'ok': false, 'error': 'cancelled'});
+    // A fresh signIn afterwards stores normally.
+    signIn = () async => 'ghu_new';
+    await bridge.handle('{"op":"signIn","request_id":"again"}');
+    expect(stored, ['ghu_new']);
+  });
+
+  test('signOut while the token is being stored still wins', () async {
+    final storing = Completer<void>();
+    final bridge = AccountBridge(
+      signIn: () async => 'ghu_mid',
+      storeToken: (t) async {
+        stored.add(t);
+        hasToken = true;
+        await storing.future;
+      },
+      signOut: () async { signOuts++; hasToken = false; },
+      hasToken: () => hasToken,
+      emit: (e, d) => events.add((e, d)),
+    );
+    final pending = bridge.handle('{"op":"signIn","request_id":"in"}');
+    await pumpEventQueue();
+    expect(stored, ['ghu_mid']);
+    await bridge.handle('{"op":"signOut","request_id":"out"}');
+    storing.complete();
+    await pending;
+    expect(hasToken, false);
+    expect(signOuts, 2);
+    expect(lastAck(), {'request_id': 'in', 'op': 'signIn', 'ok': false, 'error': 'cancelled'});
+  });
+
+  test('a throwing emit never escapes handle and never double-acks', () async {
+    final ops = [
+      '{"op":"signIn","request_id":"1"}',
+      '{"op":"signOut","request_id":"2"}',
+      '{"op":"getStatus","request_id":"3"}',
+      '{"op":"dance","request_id":"4"}',
+      '{nope',
+    ];
+    for (final raw in ops) {
+      var calls = 0;
+      final bridge = AccountBridge(
+        signIn: () async => 'ghu_x',
+        storeToken: (t) async {},
+        signOut: () async {},
+        hasToken: () => false,
+        emit: (e, d) {
+          calls++;
+          throw StateError('webview gone');
+        },
+      );
+      await expectLater(bridge.handle(raw), completes);
+      expect(calls, 1, reason: raw);
+    }
   });
 }
