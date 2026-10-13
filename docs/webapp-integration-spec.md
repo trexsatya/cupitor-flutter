@@ -43,7 +43,7 @@ if (window.PlaylistBridge && typeof window.PlaylistBridge.postMessage === 'funct
 
 ## 3. JS → Dart Channels
 
-Each channel is a global object with a single method: `postMessage(payload: string)`. Payloads are always JSON-encoded strings. Non-JSON payloads are silently dropped.
+Each channel is a global object with a single method: `postMessage(payload: string)`. Payloads are always JSON-encoded strings. Non-JSON payloads are dropped without a reply, except on `AccountBridge`, which answers `bad_json` (§3.9).
 
 ### 3.1 `PlaylistBridge`
 
@@ -172,6 +172,24 @@ Report a long-press on an `<a>` element so the host can show a "Copy link / Open
 
 Send an authenticated GitHub API request through the host (avoids CORS for gh:// endpoints). Used by the dictionary lookup flow — not typically consumed by webapp code.
 
+### 3.9 `AccountBridge`
+
+GitHub account for the language webapp's multi-user feature. The app holds the token; the page only asks for sign-in/sign-out and reads who it is via `GET /user` through `GitHubProxy`.
+
+```js
+AccountBridge.postMessage(JSON.stringify({ op: 'signIn', request_id: 'acct-1' }));
+// → CustomEvent 'cupitorAccountAck' { request_id: 'acct-1', op: 'signIn', ok: true, data: { signed_in: true } }
+```
+
+| op | Effect | `ok:true` data | `ok:false` error |
+|---|---|---|---|
+| `signIn` | Native GitHub device-flow dialog (scope `public_repo`); stores the token | `{signed_in:true}` | `cancelled`, `denied`, `expired`, `network`, `busy`, `internal` |
+| `signOut` | Clears the stored token | `{signed_in:false}` | `internal` |
+| `getStatus` | — | `{signed_in:<bool>}` | — |
+| other | — | — | `unknown_op`; unparsable JSON → `bad_json` with `request_id: null` |
+
+Every message gets exactly one ack. `request_id` is echoed; the ack detail is also stored on `window.__cupitorAccountAck` before the dispatch. A sign-in can take as long as GitHub's code is valid (about 15 minutes); the page should wait at least that long before giving up.
+
 ---
 
 ## 4. Dart → JS Events
@@ -185,6 +203,7 @@ The host pushes state changes as `CustomEvent`s on `window`. State-carrying even
 | `cupitorDialog1Closed` | — | Dialog1 was dismissed (webapp about to be torn down) |
 | `cupitorMediaKey` | — | Headset/media key pressed (`{ detail: { key: 'play' \| 'pause' \| 'next' \| 'prev' } }`) |
 | `cupitorNotifAck` | payload-dependent | Response to a `NotifBridge` op |
+| `cupitorAccountAck` | `window.__cupitorAccountAck` | ack for an `AccountBridge` op (§3.9) |
 | `capturedSubtitle` | — | Host has a subtitle chunk to inject into your current view |
 | `cupitorCaptionCapture` | — | User sent selected caption lines from a video in the main WebView — see [caption-capture-integration-spec.md](caption-capture-integration-spec.md) |
 

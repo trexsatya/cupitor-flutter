@@ -52,6 +52,7 @@ import 'page_zoom.dart';
 import 'scroll_diagnostics.dart';
 import 'search_index.dart';
 import 'notif/notif_bridge.dart';
+import 'account/account_bridge.dart';
 import 'account/device_signin_dialog.dart';
 import 'notif/notif_channel.dart';
 import 'notif/notification_channel.dart';
@@ -394,6 +395,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     window: () => NotifSettings.window,
     now: () => tz.TZDateTime.now(tz.local),
     onMutated: () => notifService.rearm(),
+  );
+  // Language-app ↔ Cupitor bridge for the account feature: GitHub device
+  // sign-in / sign-out on the page's request. Contract:
+  // docs/webapp-integration-spec.md §3 "AccountBridge". The token never
+  // crosses; the page asks GET /user through GitHubProxy afterwards.
+  late final AccountBridge _accountBridge = AccountBridge(
+    signIn: () => showDeviceSignInDialog(context),
+    storeToken: _setGithubToken,
+    signOut: () => _setGithubToken(null),
+    hasToken: () => _githubToken != null && _githubToken!.isNotEmpty,
+    emit: _emitNotifEvent,
   );
   // Best-effort desktop/web delivery: no OS wake there, so an in-process
   // timer periodically sweeps while the app is open (spec §Platform
@@ -8259,6 +8271,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // Ops + events: spec §Bridge. Acks via cupitorNotifAck.
         ..addJavaScriptChannel('NotifBridge',
             onMessageReceived: (msg) => _notifBridge.handle(msg.message))
+        // Language-app ↔ Cupitor bridge for the account feature
+        // (spec: docs/superpowers/specs/2026-10-13-multi-user-design.md).
+        // Ops signIn / signOut / getStatus, acks via cupitorAccountAck.
+        ..addJavaScriptChannel('AccountBridge',
+            onMessageReceived: (msg) => _accountBridge.handle(msg.message))
         // Same log sink as the main WebView, so the scroll probe (and any
         // other page-side diagnostic) can report from inside dialog1.
         ..addJavaScriptChannel('SnippetLogChannel',
