@@ -28,10 +28,14 @@ class DeviceCode {
         deviceCode: j['device_code'] as String,
         userCode: j['user_code'] as String,
         verificationUri: (j['verification_uri'] as String?) ?? 'https://github.com/login/device',
-        interval: Duration(seconds: (j['interval'] as num?)?.toInt() ?? 5),
-        expiresIn: Duration(seconds: (j['expires_in'] as num?)?.toInt() ?? 900),
+        interval: Duration(seconds: positiveSeconds(j['interval']) ?? 5),
+        expiresIn: Duration(seconds: positiveSeconds(j['expires_in']) ?? 900),
       );
 }
+
+/// A positive whole number of seconds from a JSON value, or null when the
+/// value is missing, not a number, or not above zero.
+int? positiveSeconds(Object? v) => v is num && v >= 1 ? v.toInt() : null;
 
 /// `code` is one of: `denied` (the user declined), `expired` (the code ran
 /// out), `cancelled` (the caller gave up), `network`, `error` (anything else
@@ -92,5 +96,39 @@ class GitHubDeviceSignIn {
     return DeviceCode.fromJson(j);
   }
 
-  // pollForToken is added in Task 2.
+  /// Polls until GitHub returns the token. Waits `interval` before every
+  /// attempt (GitHub rate-limits the first one too), grows it on
+  /// `slow_down`, and gives up at `expiresIn`. `cancelled` is checked before
+  /// each attempt so a closed dialog stops the loop.
+  Future<String> pollForToken(DeviceCode code, {bool Function()? cancelled}) async {
+    var interval = code.interval;
+    final deadline = _now().add(code.expiresIn);
+    while (true) {
+      if (cancelled?.call() ?? false) throw const DeviceSignInException('cancelled', 'cancelled');
+      if (_now().isAfter(deadline)) throw const DeviceSignInException('expired', 'the code expired');
+      await _sleep(interval);
+      if (cancelled?.call() ?? false) throw const DeviceSignInException('cancelled', 'cancelled');
+      if (_now().isAfter(deadline)) throw const DeviceSignInException('expired', 'the code expired');
+      final j = await _post(tokenUrl, {
+        'client_id': clientId,
+        'device_code': code.deviceCode,
+        'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
+      });
+      final token = j['access_token'];
+      if (token is String && token.isNotEmpty) return token;
+      switch (j['error']) {
+        case 'authorization_pending':
+          continue;
+        case 'slow_down':
+          interval = Duration(seconds: positiveSeconds(j['interval']) ?? (interval.inSeconds + 5));
+          continue;
+        case 'expired_token':
+          throw const DeviceSignInException('expired', 'the code expired');
+        case 'access_denied':
+          throw const DeviceSignInException('denied', 'sign-in was declined');
+        default:
+          throw DeviceSignInException('error', '${j['error'] ?? 'no token in the reply'}');
+      }
+    }
+  }
 }
