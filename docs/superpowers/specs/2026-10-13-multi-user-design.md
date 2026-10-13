@@ -126,8 +126,8 @@ source owner in their names, so two users' data on one device never mixes.
   answer with the result.
 - The existing "paste token" dialog stays as a fallback.
 
-One-time setup by the owner: register the "Cupitor" GitHub OAuth app with
-device flow enabled; create `cupitor-data-template` and `cupitor-users`.
+The "Cupitor" GitHub OAuth app has device flow enabled, no client secret and
+non-expiring user tokens. Client ID: `Ov23linnANScOoh6elAJ`.
 
 ## Errors
 
