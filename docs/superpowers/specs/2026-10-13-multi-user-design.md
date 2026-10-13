@@ -38,14 +38,18 @@ Each user has a **self** source (their own repo, editable) and optionally one
 
 | File under `db/language/<lang>/` | Read from other? |
 |---|---|
-| `srts/` (subtitle library and its index) | Yes |
+| `srts/index.json`, `srts/categorisation.txt` and the subtitle files | Yes |
 | `recordings.json` (clip collections) | Yes |
-| `vocabulary.txt`, `idioms`, `jokes`, `metaphors`, `poems`, `sayings` | Yes |
-| `settings.json`, `word_history.json`, `srt_revision.json`, `words-missing.txt` | No — self only |
+| `vocabulary.txt` | Yes |
+| `practice-log.json`, `srts/srt_favorites.json` | No — self only |
 
-Layered data is merged by key (subtitle index entry, collection name,
-vocabulary line). On a clash, self wins. Items from other are marked
-read-only: edit and delete controls are hidden for them.
+Other files in a data repo are not read by the language webapp.
+
+Layered data is merged by key (subtitle index entry, category entry,
+collection name, vocabulary line). A missing file in either repo reads as
+empty, so a new repo made from the template needs no starter files. On a
+clash, self wins. Items from other are marked read-only: edit and delete
+controls are hidden for them.
 
 Writes always go to self.
 
