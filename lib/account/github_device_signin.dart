@@ -68,7 +68,7 @@ class GitHubDeviceSignIn {
       r = await _client
           .post(url, headers: const {'Accept': 'application/json'}, body: form)
           .timeout(_timeout);
-    } catch (e) {
+    } on Exception catch (e) {
       throw DeviceSignInException('network', '$e');
     }
     Map<String, dynamic> j;
@@ -86,6 +86,9 @@ class GitHubDeviceSignIn {
   Future<DeviceCode> requestCode() async {
     final j = await _post(codeUrl, {'client_id': clientId, 'scope': scope});
     if (j['error'] != null) throw DeviceSignInException('error', '${j['error']}');
+    if (j['device_code'] is! String || j['user_code'] is! String) {
+      throw const DeviceSignInException('error', 'reply lacks device_code or user_code');
+    }
     return DeviceCode.fromJson(j);
   }
 
