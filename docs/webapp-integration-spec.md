@@ -190,6 +190,23 @@ AccountBridge.postMessage(JSON.stringify({ op: 'signIn', request_id: 'acct-1' })
 
 Every message gets exactly one ack. `request_id` is echoed; the ack detail is also stored on `window.__cupitorAccountAck` before the dispatch. A sign-in can take as long as GitHub's code is valid (about 15 minutes); the page should wait at least that long before giving up.
 
+### 3.10 `window.cupitorKnownVideos` (Dart → JS query)
+
+Not a channel: a function the page defines and the host calls with `runJavaScriptReturningResult` to mark rows in its Saved videos dialog. It must be synchronous and return a JSON **string**.
+
+```js
+window.cupitorKnownVideos('["dQw4w9WgXcQ","aaaaaaaaaaa"]')
+// → '{"ready":true,"library":["dQw4w9WgXcQ"],"pending":[]}'
+```
+
+| Field | Meaning |
+|---|---|
+| `ready` | `false` until the subtitle index (`srts/index.json`, all layers) has loaded; `library`/`pending` are then empty |
+| `library` | Asked-for ids with an entry read from the index layers (own and other user's). Entries that a buffered capture only added locally do not count |
+| `pending` | Asked-for ids waiting in Review Captured (the account-scoped captured-subtitles buffer, `detail.videoId`). An id listed here is never also in `library` |
+
+The host loads the study page in the background if dialog1 has none (dialog1 stays hidden); if dialog1 is on another page it does not ask. It polls every 0.5 s until `ready` (a missing function is asked again) and gives up after 15 s or on a malformed answer; it then shows every row as not known. Rows the page knows start unticked and are skipped by "select all", but can still be ticked.
+
 ---
 
 ## 4. Dart → JS Events
@@ -204,7 +221,7 @@ The host pushes state changes as `CustomEvent`s on `window`. State-carrying even
 | `cupitorMediaKey` | — | Headset/media key pressed (`{ detail: { key: 'play' \| 'pause' \| 'next' \| 'prev' } }`) |
 | `cupitorNotifAck` | payload-dependent | Response to a `NotifBridge` op |
 | `cupitorAccountAck` | `window.__cupitorAccountAck` | ack for an `AccountBridge` op (§3.9) |
-| `capturedSubtitle` | — | Host has a subtitle chunk to inject into your current view |
+| `capturedSubtitle` | — | Host has a subtitle chunk to inject into your current view. `sourceLang` is a base language code (`sv`, never `sv-orig`/`sv-SE`); `targetLang` is present only when `translation` has entries, and `translation` holds only translated lines |
 | `cupitorCaptionCapture` | — | User sent selected caption lines from a video in the main WebView — see [caption-capture-integration-spec.md](caption-capture-integration-spec.md) |
 
 Idempotency: a `cupitor*` event may fire multiple times with the same content — always render off `event.detail`, never off transient state.

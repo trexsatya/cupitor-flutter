@@ -41,6 +41,7 @@ import 'package:timezone/data/latest.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 import 'package:workmanager/workmanager.dart';
 import 'yt_dlp_service.dart';
+import 'saved_videos_subtitles.dart';
 import 'eink_mode.dart';
 import 'epub_reader.dart';
 import 'db.dart';
@@ -6767,24 +6768,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return lines;
   }
 
-  /// Picks the default caption track to highlight in the picker. Preference
-  /// order: manual track for current `_selectedLanguage` → any manual track
-  /// → auto-generated track for current `_selectedLanguage` → first track.
-  int _defaultCaptionTrackIndex(List<Map<String, dynamic>> tracks) {
-    bool isManual(Map<String, dynamic> t) => (t['kind'] as String? ?? '') != 'asr';
-    bool matchesLang(Map<String, dynamic> t) =>
-        (t['languageCode'] as String? ?? '').toLowerCase() == _selectedLanguage.toLowerCase();
-    for (var i = 0; i < tracks.length; i++) {
-      if (isManual(tracks[i]) && matchesLang(tracks[i])) return i;
-    }
-    for (var i = 0; i < tracks.length; i++) {
-      if (isManual(tracks[i])) return i;
-    }
-    for (var i = 0; i < tracks.length; i++) {
-      if (matchesLang(tracks[i])) return i;
-    }
-    return 0;
-  }
+  /// Default caption track for the current `_selectedLanguage`; see
+  /// [defaultCaptionTrackIndex] for the preference order.
+  int _defaultCaptionTrackIndex(List<Map<String, dynamic>> tracks) =>
+      defaultCaptionTrackIndex(tracks, _selectedLanguage);
 
   /// Modal busy overlay used while awaiting an HTTP/parse step. The progress
   /// indicator is shown alongside `message`; the dialog isn't dismissible so
@@ -6919,7 +6906,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _showFullSubtitleDialog(
       ctx,
       lines: lines,
-      sourceLang: (picked['languageCode'] as String?) ?? _selectedLanguage,
+      sourceLang: baseLanguageCode(
+          (picked['languageCode'] as String?) ?? _selectedLanguage),
       videoUrl: 'https://www.youtube.com/watch?v=$videoId',
       videoId: videoId,
       videoTitle: (meta['title'] as String?) ?? '',
@@ -7173,7 +7161,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   // expects: parallel `lines` + `translation` arrays keyed by
                   // index/start/end.
                   final outLines = <Map<String, dynamic>>[];
-                  final outTr = <Map<String, dynamic>>[];
                   for (var i = 0; i < lines.length; i++) {
                     outLines.add({
                       'index': i,
@@ -7181,21 +7168,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       'end': lines[i]['end'],
                       'text': originals[i],
                     });
-                    outTr.add({
-                      'index': i,
-                      'start': lines[i]['start'],
-                      'end': lines[i]['end'],
-                      'text': i < translation.length ? translation[i] : '',
-                    });
                   }
                   Navigator.of(dctx).pop();
                   _sendCapturedSubtitleToDialog1(<String, dynamic>{
                     'query': '',
                     'sourceLang': sourceLang,
-                    'targetLang': 'en',
                     'matchIndex': 0,
                     'lines': outLines,
-                    'translation': outTr,
+                    ...captureTranslationFields(outLines, translation),
                     'videoUrl': videoUrl,
                     'videoId': videoId,
                     'videoTitle': videoTitle,
@@ -7812,25 +7792,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               TextButton(
                 onPressed: captured.isEmpty ? null : () {
                   Navigator.of(dctx).pop();
-                  // Build a translation array parallel to `captured` so the
-                  // page can zip them positionally — empty strings preserve
-                  // the alignment when a line wasn't translatable.
-                  final translationArr = <Map<String, dynamic>>[];
-                  for (var i = 0; i < captured.length; i++) {
-                    translationArr.add({
-                      'index': captured[i]['index'],
-                      'start': captured[i]['start'],
-                      'end': captured[i]['end'],
-                      'text': i < translation.length ? translation[i] : '',
-                    });
-                  }
                   _sendCapturedSubtitleToDialog1(<String, dynamic>{
                     'query': query,
                     'sourceLang': _selectedLanguage,
-                    'targetLang': 'en',
                     'matchIndex': currentMatchIdx - start,
                     'lines': captured,
-                    'translation': translationArr,
+                    ...captureTranslationFields(captured, translation),
                     'videoUrl': videoUrl,
                     'videoId': videoId,
                     'videoTitle': videoTitle,
@@ -8065,91 +8032,288 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   void _showSavedVideosDialog(BuildContext ctx) {
+    // Checked rows, by URL so deleting another row doesn't shift the ticks.
+    final selected = <String>{};
+    bool running = false;
+    bool cancelRequested = false;
+    String? progress;
+    bool isYouTube(Map<String, String> v) =>
+        _extractYouTubeVideoId(v['url'] ?? '') != null;
+    // What the lookup page already has: null while asking, and also when it
+    // couldn't say — then every row is offered as usual.
+    KnownVideos? known;
+    bool checking = true;
+    bool listening = false;
+    final knownFuture = _askKnownVideos(_savedVideos
+        .map((v) => _extractYouTubeVideoId(v['url'] ?? ''))
+        .whereType<String>()
+        .toSet()
+        .toList());
+
     showDialog(
       context: ctx,
       builder: (dctx) => StatefulBuilder(
-        builder: (dctx2, setStateDialog) => AlertDialog(
-          title: Text('Saved videos (${_savedVideos.length})'),
-          content: SizedBox(
-            width: double.maxFinite,
-            child: _savedVideos.isEmpty
-                ? Text('Nothing saved yet.')
-                : ListView.builder(
-                    shrinkWrap: true,
-                    itemCount: _savedVideos.length,
-                    itemBuilder: (_, i) {
-                      final v = _savedVideos[i];
-                      final title = v['title']?.isNotEmpty == true ? v['title']! : v['url']!;
-                      final subtitle = [v['channel'], v['url']].where((s) => s != null && s.isNotEmpty).join(' · ');
-                      return ListTile(
-                        dense: true,
-                        title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
-                        subtitle: Text(subtitle, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 11)),
-                        trailing: IconButton(
-                          icon: Icon(Icons.delete_outline, size: 20),
-                          onPressed: () {
-                            setState(() => _savedVideos.removeAt(i));
-                            _saveSavedVideos();
-                            setStateDialog(() {});
-                          },
-                        ),
-                      );
-                    },
-                  ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: _savedVideos.isEmpty ? null : () {
-                final urls = _savedVideos.map((v) => v['url']).whereType<String>().join('\n');
-                Clipboard.setData(ClipboardData(text: urls));
-                ScaffoldMessenger.of(ctx).showSnackBar(
-                  SnackBar(content: Text('Copied ${_savedVideos.length} URLs'), duration: const Duration(seconds: 2)),
-                );
-              },
-              child: Text('Copy URLs'),
-            ),
-            TextButton(
-              onPressed: _savedVideos.isEmpty ? null : () {
-                final lines = _savedVideos.map((v) {
-                  return [v['title'] ?? '', v['channel'] ?? '', v['url'] ?? '', v['savedAt'] ?? '']
-                      .map((s) => s.replaceAll('"', '""'))
-                      .map((s) => '"$s"')
-                      .join(',');
-                }).join('\n');
-                final header = '"title","channel","url","savedAt"\n';
-                Clipboard.setData(ClipboardData(text: header + lines));
-                ScaffoldMessenger.of(ctx).showSnackBar(
-                  SnackBar(content: Text('Copied CSV'), duration: const Duration(seconds: 2)),
-                );
-              },
-              child: Text('Copy CSV'),
-            ),
-            TextButton(
-              onPressed: _savedVideos.isEmpty ? null : () {
-                showDialog(
-                  context: dctx,
-                  builder: (cctx) => AlertDialog(
-                    title: Text('Clear all saved videos?'),
-                    actions: [
-                      TextButton(onPressed: () => Navigator.of(cctx).pop(), child: Text('Cancel')),
-                      TextButton(
-                        onPressed: () {
-                          setState(() => _savedVideos.clear());
-                          _saveSavedVideos();
-                          setStateDialog(() {});
-                          Navigator.of(cctx).pop();
-                        },
-                        child: Text('Clear'),
+        builder: (dctx2, setStateDialog) {
+          if (!listening) {
+            listening = true;
+            knownFuture.then((k) {
+              if (!dctx2.mounted) return;
+              setStateDialog(() {
+                known = k;
+                checking = false;
+              });
+            });
+          }
+          String? knownLabel(String url) =>
+              known?.labelFor(_extractYouTubeVideoId(url));
+          final eligible = _savedVideos
+              .where(isYouTube)
+              .map((v) => v['url']!)
+              .toSet();
+          selected.retainAll(eligible);
+          final selectAll = selectAllUrls(
+            _savedVideos.map((v) => v['url'] ?? '').toList(),
+            selectable: eligible.contains,
+            alreadyKnown: (u) => knownLabel(u) != null,
+          );
+          final allChecked =
+              selectAll.isNotEmpty && selected.containsAll(selectAll);
+          final atCap = selected.length >= kSavedVideosBatchCap;
+          final String? note = checking
+              ? 'Checking…'
+              : known == null
+                  ? "Couldn't check which videos are already in the webapp"
+                  : atCap
+                      ? 'Up to $kSavedVideosBatchCap at a time'
+                      : null;
+
+          Future<void> downloadSelected() async {
+            final seen = <String>{};
+            final videos = <SavedVideoRef>[
+              for (final v in _savedVideos)
+                if (selected.contains(v['url']) && seen.add(v['url']!))
+                  (url: v['url']!, title: v['title'] ?? ''),
+            ];
+            setStateDialog(() {
+              running = true;
+              cancelRequested = false;
+              progress = 'Checking yt-dlp…';
+            });
+            final ready = <Map<String, dynamic>>[];
+            SavedVideosSubtitlesOutcome outcome;
+            try {
+              outcome = await downloadSavedVideoSubtitles(
+                videos: videos,
+                videoIdOf: _extractYouTubeVideoId,
+                toolMissing: () async => await YtDlpService.isAvailable()
+                    ? null
+                    : YtDlpService.installHint(),
+                listTracks: _fetchYouTubeCaptionTracks,
+                pickIndex: _defaultCaptionTrackIndex,
+                download: (videoId, track) => _fetchCaptionsJson3(
+                  baseUrl: (track['baseUrl'] as String?) ?? '',
+                  videoId: videoId,
+                  languageCode: (track['languageCode'] as String?) ?? '',
+                  kind: (track['kind'] as String?) ?? '',
+                ),
+                // Collected and dispatched together at the end, so dialog1
+                // opens once, over this dialog's place, after the last video.
+                send: (payload) async =>
+                    ready.add(await withCaptureMeta(payload, fetchYouTubeOembed)),
+                fallbackLang: _selectedLanguage,
+                onProgress: (pos, total, v) {
+                  if (!dctx2.mounted) return;
+                  setStateDialog(() => progress =
+                      'Downloading $pos of $total: ${v.title.isNotEmpty ? v.title : v.url}');
+                },
+                isCancelled: () => cancelRequested,
+              );
+            } catch (e) {
+              outcome = SavedVideosSubtitlesOutcome(
+                  results: const [], total: videos.length, stoppedReason: '$e');
+            } finally {
+              if (dctx2.mounted) {
+                setStateDialog(() {
+                  running = false;
+                  progress = null;
+                });
+              }
+            }
+            if (!mounted) return;
+            if (ready.isNotEmpty) {
+              if (dctx2.mounted) {
+                final route = ModalRoute.of(dctx2);
+                if (route != null && route.isCurrent) Navigator.of(dctx2).pop();
+              }
+              for (final p in ready) {
+                _dispatchCapturedSubtitle(p);
+              }
+            }
+            _showCaptureError(
+              outcome.stoppedReason != null
+                  ? 'Could not download subtitles'
+                  : 'Subtitles',
+              describeSavedVideosSubtitlesOutcome(outcome),
+            );
+          }
+
+          return PopScope(
+            canPop: !running,
+            child: AlertDialog(
+              title: Text('Saved videos (${_savedVideos.length})'),
+              content: SizedBox(
+                width: double.maxFinite,
+                child: _savedVideos.isEmpty
+                    ? Text('Nothing saved yet.')
+                    : Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          CheckboxListTile(
+                            dense: true,
+                            controlAffinity: ListTileControlAffinity.leading,
+                            title: Text('Select all not yet in the webapp '
+                                '(first $kSavedVideosBatchCap)'),
+                            value: allChecked,
+                            // Not while checking: it would tick rows the page
+                            // turns out to have.
+                            onChanged: running || checking || selectAll.isEmpty
+                                ? null
+                                : (on) => setStateDialog(() {
+                                      selected.clear();
+                                      if (on == true) selected.addAll(selectAll);
+                                    }),
+                          ),
+                          if (note != null)
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 4),
+                              child: Text(note, style: TextStyle(fontSize: 12)),
+                            ),
+                          if (progress != null)
+                            Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 4),
+                              child: Row(children: [
+                                const SizedBox(width: 16, height: 16,
+                                    child: CircularProgressIndicator(strokeWidth: 2)),
+                                const SizedBox(width: 8),
+                                Expanded(child: Text(progress!,
+                                    maxLines: 1, overflow: TextOverflow.ellipsis)),
+                              ]),
+                            ),
+                          Flexible(
+                            child: ListView.builder(
+                              shrinkWrap: true,
+                              itemCount: _savedVideos.length,
+                              itemBuilder: (_, i) {
+                                final v = _savedVideos[i];
+                                final title = v['title']?.isNotEmpty == true ? v['title']! : v['url']!;
+                                final subtitle = [v['channel'], v['url']].where((s) => s != null && s.isNotEmpty).join(' · ');
+                                final url = v['url'] ?? '';
+                                final youTube = isYouTube(v);
+                                final label = youTube ? knownLabel(url) : null;
+                                final ticked = youTube && selected.contains(url);
+                                return ListTile(
+                                  dense: true,
+                                  leading: Checkbox(
+                                    value: ticked,
+                                    onChanged: running || !youTube || (atCap && !ticked)
+                                        ? null
+                                        : (on) => setStateDialog(() {
+                                              if (on == true) {
+                                                selected.add(url);
+                                              } else {
+                                                selected.remove(url);
+                                              }
+                                            }),
+                                  ),
+                                  title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                  subtitle: Text(label == null ? subtitle : '$label · $subtitle', maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 11)),
+                                  trailing: IconButton(
+                                    icon: Icon(Icons.delete_outline, size: 20),
+                                    onPressed: running ? null : () {
+                                      setState(() => _savedVideos.removeAt(i));
+                                      _saveSavedVideos();
+                                      setStateDialog(() {});
+                                    },
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                        ],
                       ),
-                    ],
+              ),
+              actions: [
+                if (running)
+                  TextButton(
+                    onPressed: cancelRequested
+                        ? null
+                        : () => setStateDialog(() => cancelRequested = true),
+                    child: Text(cancelRequested ? 'Stopping…' : 'Cancel'),
+                  )
+                else
+                  TextButton(
+                    onPressed: selected.isEmpty ? null : downloadSelected,
+                    child: Text('Download subtitles (${selected.length}/$kSavedVideosBatchCap)'),
                   ),
-                );
-              },
-              child: Text('Clear'),
+                TextButton(
+                  onPressed: _savedVideos.isEmpty ? null : () {
+                    final urls = _savedVideos.map((v) => v['url']).whereType<String>().join('\n');
+                    Clipboard.setData(ClipboardData(text: urls));
+                    ScaffoldMessenger.of(ctx).showSnackBar(
+                      SnackBar(content: Text('Copied ${_savedVideos.length} URLs'), duration: const Duration(seconds: 2)),
+                    );
+                  },
+                  child: Text('Copy URLs'),
+                ),
+                TextButton(
+                  onPressed: _savedVideos.isEmpty ? null : () {
+                    final lines = _savedVideos.map((v) {
+                      return [v['title'] ?? '', v['channel'] ?? '', v['url'] ?? '', v['savedAt'] ?? '']
+                          .map((s) => s.replaceAll('"', '""'))
+                          .map((s) => '"$s"')
+                          .join(',');
+                    }).join('\n');
+                    final header = '"title","channel","url","savedAt"\n';
+                    Clipboard.setData(ClipboardData(text: header + lines));
+                    ScaffoldMessenger.of(ctx).showSnackBar(
+                      SnackBar(content: Text('Copied CSV'), duration: const Duration(seconds: 2)),
+                    );
+                  },
+                  child: Text('Copy CSV'),
+                ),
+                TextButton(
+                  onPressed: running || _savedVideos.isEmpty ? null : () {
+                    showDialog(
+                      context: dctx,
+                      builder: (cctx) => AlertDialog(
+                        title: Text('Clear all saved videos?'),
+                        actions: [
+                          TextButton(onPressed: () => Navigator.of(cctx).pop(), child: Text('Cancel')),
+                          TextButton(
+                            onPressed: () {
+                              setState(() => _savedVideos.clear());
+                              selected.clear();
+                              _saveSavedVideos();
+                              setStateDialog(() {});
+                              Navigator.of(cctx).pop();
+                            },
+                            child: Text('Clear'),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                  child: Text('Clear'),
+                ),
+                TextButton(
+                  onPressed: running ? null : () => Navigator.of(dctx).pop(),
+                  child: Text('Close'),
+                ),
+              ],
             ),
-            TextButton(onPressed: () => Navigator.of(dctx).pop(), child: Text('Close')),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
@@ -8233,14 +8397,22 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     dialogController?.runJavaScript(js);
   }
 
-  void _openDialogWithWebview(String text) {
+  /// [show] false builds and loads dialog1's page without putting dialog1 on
+  /// screen (a background load, e.g. to ask the page something).
+  void _openDialogWithWebview(String text, {bool show = true}) {
     _currentDialogText = text;
     if (text.isNotEmpty) Clipboard.setData(ClipboardData(text: text));
     if (dialogController != null) {
       dialogController?.runJavaScript(jsCodeToFilterData(text));
     } else {
       _dialog1Loaded = false;
-      dialogController = WebViewController()
+      _dialog1Loading = true;
+      _dialog1LoadFailed = false;
+      _dialog1BackgroundOnly = !show;
+      // Callbacks compare against this to ignore a controller that has since
+      // been replaced (page reclaim): its late events must not touch the new one.
+      late final WebViewController ctrl;
+      ctrl = dialogController = WebViewController()
         ..configureForMac()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(_userAgent)
@@ -8293,13 +8465,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // otherwise be left waiting on a promise nothing can settle.
               // 'cancelled' is silent on that side, and a reply to a page
               // that really is gone costs nothing.
-              _sttCancelForMicHandoff();
-              _stopNativeRecordingIfAny();
+              // A page only loaded in the background was never shown, so it
+              // owns no dictation or recording to cancel.
+              if (!_dialog1BackgroundOnly) {
+                _sttCancelForMicHandoff();
+                _stopNativeRecordingIfAny();
+              }
               _injectYouTubeAdBlocker(dialogController);
+              if (identical(ctrl, dialogController)) {
+                _dialog1Loaded = false;
+                _dialog1Loading = true;
+                _dialog1LoadFailed = false;
+              }
             },
             onWebResourceError: (error) {
               if (error.isForMainFrame == true) {
                 _dialogErrorNotifier.value = '[${error.errorCode}] ${error.description}\n${error.url ?? ''}';
+                if (identical(ctrl, dialogController)) {
+                  _dialog1Loading = false;
+                  _dialog1LoadFailed = true;
+                }
               }
             },
             onNavigationRequest: (request) {
@@ -8321,6 +8506,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               return NavigationDecision.navigate;
             },
             onPageFinished: (url) {
+              if (!identical(ctrl, dialogController)) return;
               _injectAdBlocker(dialogController);
               // Let this WebView answer its own requests for the background
               // music files. Attached per page load because a fresh dialog
@@ -8339,15 +8525,24 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // (where the YT iframe lives). Other hosts deactivate so we
               // don't steal media keys from other apps in the background.
               final onLanguagePage = url.startsWith(_dialogUrl);
-              _setMediaSessionActive(onLanguagePage);
+              // A hidden background page doesn't take the media keys;
+              // _showDialog1 hands them over when it first appears.
+              if (!_dialog1BackgroundOnly) _setMediaSessionActive(onLanguagePage);
               dialogController?.runJavaScript(jsCodeToFilterData(_currentDialogText));
-              final pending = _pendingCapturedSubtitle;
-              if (pending != null) {
-                _pendingCapturedSubtitle = null;
-                dialogController?.runJavaScript(_jsCodeForCapturedSubtitle(pending));
+              _dialog1Loading = false;
+              // Captures are only heard by the study page; on any other page
+              // — or an error page Android still reports as finished on the
+              // study URL — they stay queued (see _awaitDialog1StudyPage).
+              _dialog1Loaded = onLanguagePage && !_dialog1LoadFailed;
+              if (_dialog1Loaded && _pendingCapturedSubtitles.isNotEmpty) {
+                final queued =
+                    List<Map<String, dynamic>>.from(_pendingCapturedSubtitles);
+                _pendingCapturedSubtitles.clear();
+                for (final p in queued) {
+                  dialogController?.runJavaScript(_jsCodeForCapturedSubtitle(p));
+                }
               }
-              _dialog1Loaded = true;
-              if (_pendingCaptionCaptures.isNotEmpty) {
+              if (_dialog1Loaded && _pendingCaptionCaptures.isNotEmpty) {
                 final queued =
                     List<Map<String, dynamic>>.from(_pendingCaptionCaptures);
                 _pendingCaptionCaptures.clear();
@@ -8375,7 +8570,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
 
     // Always show the dialog (it may have been dismissed previously)
-    _showDialog1();
+    if (show) _showDialog1();
     // dialog1 adds a WebView the startup pass could not have seen.
     _installRenderGuardSoon();
   }
@@ -8409,6 +8604,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
     setState(() => _dialog1Minimized = false);
     _bumpMinimizedVersion();
+    if (_dialog1BackgroundOnly) {
+      _dialog1BackgroundOnly = false;
+      _setMediaSessionActive(_dialog1Loaded);
+    }
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
 
@@ -10652,11 +10851,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// ```
   /// {
   ///   query:       "<the matched search word>",
-  ///   sourceLang:  "sv" | "es" | ...,
-  ///   targetLang:  "en",
+  ///   sourceLang:  "sv" | "es" | ...,           // base code, no region/-orig
+  ///   targetLang:  "en",                         // only when translation is non-empty
   ///   matchIndex:  <int — index into `lines` of the matched line>,
   ///   lines:       [ { index, start, end, text }, ... ],
-  ///   translation: [ { index, start, end, text }, ... ]   // same length, parallel
+  ///   translation: [ { index, start, end, text }, ... ]   // translated lines only
   /// }
   /// ```
   /// `start` and `end` are seconds (doubles). The page can format them to
@@ -10666,9 +10865,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return "window.dispatchEvent(new CustomEvent('capturedSubtitle', { detail: $detail }));";
   }
 
-  // Set when capture happens before dialog1 has ever been initialized — the
-  // event is then fired in onPageFinished, after the page is ready to listen.
-  Map<String, dynamic>? _pendingCapturedSubtitle;
+  // Captures waiting for dialog1's page to finish loading; fired in order
+  // from onPageFinished, once the page is ready to listen. A list so several
+  // sends in a row (the saved-videos batch) all arrive.
+  final List<Map<String, dynamic>> _pendingCapturedSubtitles = [];
 
   /// Fills in the video's channel and a clean title first: the webapp files
   /// the capture under them, and a capture path that lacks them would file a
@@ -10678,15 +10878,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   void _dispatchCapturedSubtitle(Map<String, dynamic> payload) {
-    if (dialogController != null) {
+    if (dialogController != null && _dialog1Loaded) {
       dialogController!.runJavaScript(_jsCodeForCapturedSubtitle(payload));
       _showDialog1();
       return;
     }
-    // No dialog1 controller yet — let _openDialogWithWebview spin one up,
-    // then dispatch from onPageFinished once the listener is alive.
-    _pendingCapturedSubtitle = payload;
-    _openDialogWithWebview('');
+    // The page isn't there to receive it yet — hold it and dispatch from
+    // onPageFinished once the listener is alive.
+    _pendingCapturedSubtitles.add(payload);
+    _awaitDialog1StudyPage();
   }
 
   // ---------------------------------------------------------------------
@@ -10694,7 +10894,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // Contract: docs/superpowers/specs/2026-09-06-caption-capture-design.md
   // ---------------------------------------------------------------------
 
-  /// Its own slot rather than sharing `_pendingCapturedSubtitle`: the two
+  /// Its own list rather than sharing `_pendingCapturedSubtitles`: the two
   /// events are independent and either could be waiting on dialog1.
   /// Captures waiting for dialog1's page to exist.
   ///
@@ -10710,9 +10910,61 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// pushed above dialog1 on the same navigator.
   ModalRoute<dynamic>? _dialog1Route;
 
-  /// True once dialog1's page has finished loading, which is when its
+  /// True while dialog1 shows the study page fully loaded, which is when its
   /// listeners exist. Dispatching an event before that drops it silently.
   bool _dialog1Loaded = false;
+
+  /// True between dialog1's page starting and finishing (or failing) a load.
+  bool _dialog1Loading = false;
+
+  /// The current load hit a main-frame error.
+  bool _dialog1LoadFailed = false;
+
+  /// dialog1's page was loaded in the background and dialog1 hasn't been
+  /// shown since, so the page has no user activity of its own.
+  bool _dialog1BackgroundOnly = false;
+
+  /// For a capture just queued because dialog1's study page isn't ready:
+  /// make sure a study-page load is on its way, since only that drains the
+  /// queue, and bring dialog1 up unless [show] is false.
+  void _awaitDialog1StudyPage({bool show = true}) {
+    if (dialogController == null) {
+      _openDialogWithWebview('', show: show);
+      return;
+    }
+    // Idle on another page, or a load that failed: nothing would ever
+    // deliver the queue.
+    if (!_dialog1Loading) {
+      _dialog1Loading = true;
+      dialogController!.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+    }
+    if (show) _showDialog1();
+  }
+
+  /// Which of [videoIds] the lookup page already has (library or Review
+  /// Captured). Loads the study page in the background when it isn't there,
+  /// never showing dialog1. Null when the page can't say within ~15 s.
+  Future<KnownVideos?> _askKnownVideos(List<String> videoIds) {
+    if (videoIds.isEmpty) {
+      return Future.value(const KnownVideos(library: {}, pending: {}));
+    }
+    if (dialogController == null) {
+      _awaitDialog1StudyPage(show: false);
+    } else if (!_dialog1Loaded && !_dialog1Loading) {
+      // dialog1 is on some other page; don't navigate it away just to ask.
+      return Future.value(null);
+    }
+    final js = 'window.cupitorKnownVideos ? '
+        'window.cupitorKnownVideos(${jsonEncode(jsonEncode(videoIds))}) : ""';
+    return pollKnownVideos(ask: () async {
+      if (!mounted) throw StateError('gone');
+      final c = dialogController;
+      if (c == null || !_dialog1Loaded) return null;
+      return c
+          .runJavaScriptReturningResult(js)
+          .timeout(const Duration(seconds: 3));
+    });
+  }
 
   void _handleCaptionCollector(WebViewController page, JavaScriptMessage msg) {
     Object? raw;
@@ -10771,11 +11023,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // The page is not there to receive it yet. Hold it until it is, rather
     // than firing into a document with no listener registered.
     _pendingCaptionCaptures.add(detail);
-    if (dialogController == null) {
-      _openDialogWithWebview('');
-    } else {
-      _showDialog1();
-    }
+    _awaitDialog1StudyPage();
   }
 
   /// The page's address as every other capture path sees it: with whatever
