@@ -11,6 +11,15 @@ dictionary lookup, text-to-speech, themes, highlights, tags and saved reading
 position. Cupitor bundle export/import keeps the original document and its
 reading state; DOCX bundles require a version of Cupitor with DOCX support.
 
+Select text to use the reader toolbar: **Lookup**, **Search**, **Highlight**,
+**Note** or **Copy**. Search opens dialog1 with the selected text through the
+same flow as **Open lookup dialog**. On Android the reader supplies this single
+toolbar while keeping the native selection handles available.
+
+In **Tools → View snippet logs**, use **Save log** in the top bar to save a
+UTF-8 `.txt` snapshot through the system file picker. Messages arriving while
+the picker is open remain in the app for the next export.
+
 DOCX is read locally with the existing ZIP/XML dependencies. Headings become
 chapters. Paragraphs, direct bold/italic/underline formatting, basic numbered
 and bulleted lists, tables, embedded PNG/JPEG/GIF/WebP/BMP images and safe web

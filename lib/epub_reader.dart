@@ -48,6 +48,7 @@ import 'tag_settings.dart';
 import 'text_transform.dart';
 import 'mac_webview.dart';
 import 'page_cursor.dart';
+import 'reader_selection_menu.dart';
 
 // ─── Library: previously-opened EPUBs ────────────────────────────────────
 // Persisted in SharedPreferences under `epub_library` as a JSON list. We
@@ -1196,6 +1197,9 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
               _selectionAnchor = Offset(x, y);
             });
           }
+          break;
+        case 'selectionCleared':
+          _clearSelection(clearDom: false);
           break;
         case 'scroll':
           // Throttled in JS — we still debounce the prefs write.
@@ -3445,13 +3449,15 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     }
   }
 
-  void _clearSelection() {
+  void _clearSelection({bool clearDom = true}) {
     _selectionAnchor = null;
     _selectionText = '';
     _selectionPrefix = '';
     _selectionSuffix = '';
     if (mounted) setState(() {});
-    _controller?.runJavaScript('window.getSelection && window.getSelection().removeAllRanges();');
+    if (clearDom) {
+      _controller?.runJavaScript('window.getSelection && window.getSelection().removeAllRanges();');
+    }
   }
 
   // ─── TTS ───────────────────────────────────────────────────────────────
@@ -4132,7 +4138,7 @@ $chapterHtml
   // The user dragging a selection no longer auto-fires a lookup. Instead
   // we report the selection (with ~32 chars of prefix/suffix so the host
   // can persist a robust highlight if asked) and let Dart pop a menu
-  // (Translate / Highlight / Note / Copy). 'selectionchange' fires often
+  // (Lookup / Search / Highlight / Note / Copy). 'selectionchange' fires often
   // during drag — debounce so we only act on the final selection.
   function fullText() {
     // The plain text of the chapter body. Cached on the function for the
@@ -4148,7 +4154,12 @@ $chapterHtml
     selTimer = setTimeout(function() {
       var sel = window.getSelection();
       var t = sel ? sel.toString().trim() : '';
-      if (!t || t === lastSel) return;
+      if (!t) {
+        if (lastSel) post({ type: 'selectionCleared' });
+        lastSel = '';
+        return;
+      }
+      if (t === lastSel) return;
       lastSel = t;
       // Compute prefix/suffix from the chapter's plain text so highlight
       // restoration can locate this exact occurrence later, even if the
@@ -5076,83 +5087,39 @@ $chapterHtml
   // Floating menu over a selected range. Positioned just above the
   // selection's bounding box (or below it if the selection is near the
   // top of the screen). Tapping outside dismisses it.
-  Widget _buildSelectionMenu(_ThemeColors theme) {
-    final anchor = _selectionAnchor!;
-    // We've been given client coords (CSS pixels in the WebView). The
-    // WebView is the full content area inside SafeArea, so anchor +/-
-    // the menu height places it just above the selection.
-    final size = MediaQuery.of(context).size;
-    const menuW = 320.0;
-    final left = (anchor.dx - menuW / 2).clamp(8.0, size.width - menuW - 8);
-    final top = anchor.dy > 80 ? anchor.dy - 64 : anchor.dy + 32;
-    return Stack(
-      children: [
-        Positioned.fill(
-          child: GestureDetector(
-            behavior: HitTestBehavior.translucent,
-            onTap: _clearSelection,
-          ),
-        ),
-        Positioned(
-          left: left,
-          top: top.clamp(8.0, size.height - 60),
-          width: menuW,
-          child: Material(
-            elevation: 6,
-            borderRadius: BorderRadius.circular(8),
-            color: theme.chromeBg,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceAround,
-                children: [
-                  _selMenuBtn(theme, Icons.translate, 'Lookup', () {
-                    final word = _selectionText;
-                    _clearSelection();
-                    widget.onLookup(word, '');
-                  }),
-                  _selMenuBtn(theme, Icons.brush, 'Highlight', () {
-                    _addHighlightFromSelection();
-                  }),
-                  _selMenuBtn(theme, Icons.sticky_note_2_outlined, 'Note', () async {
-                    final note = await _promptForNote();
-                    if (note == null) { _clearSelection(); return; }
-                    _addHighlightFromSelection(note: note.isEmpty ? null : note);
-                  }),
-                  _selMenuBtn(theme, Icons.copy, 'Copy', () async {
-                    final text = _selectionText;
-                    await Clipboard.setData(ClipboardData(text: text));
-                    if (!mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Copied'), duration: Duration(seconds: 1)),
-                    );
-                    _clearSelection();
-                  }),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
+  Widget _buildSelectionMenu(_ThemeColors theme) => ReaderSelectionMenu(
+    anchor: _selectionAnchor!,
+    background: theme.chromeBg,
+    foreground: theme.chromeFg,
+    onDismiss: _clearSelection,
+    onLookup: () {
+      final text = _selectionText;
+      _clearSelection();
+      widget.onLookup(text, '');
+    },
+    onSearch: _searchSelection,
+    onHighlight: _addHighlightFromSelection,
+    onNote: () async {
+      final note = await _promptForNote();
+      if (note == null) { _clearSelection(); return; }
+      _addHighlightFromSelection(note: note.isEmpty ? null : note);
+    },
+    onCopy: () async {
+      final text = _selectionText;
+      await Clipboard.setData(ClipboardData(text: text));
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Copied'), duration: Duration(seconds: 1)),
+      );
+      _clearSelection();
+    },
+  );
 
-  Widget _selMenuBtn(_ThemeColors theme, IconData icon, String label, VoidCallback onTap) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(6),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, color: theme.chromeFg, size: 22),
-            const SizedBox(height: 2),
-            Text(label, style: TextStyle(color: theme.chromeFg, fontSize: 11)),
-          ],
-        ),
-      ),
-    );
+  void _searchSelection() {
+    final text = _selectionText;
+    if (text.isEmpty) return;
+    _clearSelection();
+    widget.onLookup(text, '');
   }
 
   Widget _buildBookSearchOverlay(_ThemeColors theme) {
