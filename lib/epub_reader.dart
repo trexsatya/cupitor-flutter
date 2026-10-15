@@ -948,7 +948,6 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
   String? _pendingHighlight;
   bool _findBarVisible = false;
   final _findController = TextEditingController();
-  final _bookSearchController = TextEditingController();
 
   // Cross-chapter full-text search results. The user types in the search
   // bar, we scan all chapters (regex-free, lower-cased substring), and
@@ -5120,9 +5119,7 @@ $chapterHtml
     final text = _selectionText;
     if (text.isEmpty) return;
     _clearSelection();
-    _bookSearchController.text = text;
-    _runBookSearch(text);
-    setState(() => _bookSearchVisible = true);
+    widget.onLookup(text, '');
   }
 
   Widget _buildBookSearchOverlay(_ThemeColors theme) {
@@ -5150,7 +5147,6 @@ $chapterHtml
                           const SizedBox(width: 8),
                           Expanded(
                             child: TextField(
-                              controller: _bookSearchController,
                               autofocus: true,
                               decoration: const InputDecoration(
                                 hintText: 'Search inside book',
@@ -5221,7 +5217,6 @@ $chapterHtml
     _saveDebounce?.cancel();
     _state.save(book.key);
     _findController.dispose();
-    _bookSearchController.dispose();
     // Stop the TTS pipeline cleanly — otherwise speech can continue
     // playing after the user has navigated away from the reader.
     _ttsActive = false;

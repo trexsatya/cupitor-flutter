@@ -49,7 +49,7 @@ class ReaderSelectionMenu extends StatelessWidget {
             child: Row(
               children: [
                 _button(Icons.translate, 'Lookup', onLookup),
-                _button(Icons.search, 'Search', onSearch),
+                _button(Icons.travel_explore, 'Search', onSearch),
                 _button(Icons.brush, 'Highlight', onHighlight),
                 _button(Icons.sticky_note_2_outlined, 'Note', onNote),
                 _button(Icons.copy, 'Copy', onCopy),
