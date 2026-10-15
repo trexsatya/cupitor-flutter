@@ -163,6 +163,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
+        ReaderSelectionHost.install(this)
         loadCustomHosts()
     }
 

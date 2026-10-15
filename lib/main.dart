@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'local_music.dart';
 import 'save_file.dart';
+import 'snippet_log_export.dart';
 import 'package:flutter/foundation.dart'
     show compute, debugPrint, defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
@@ -3180,12 +3181,35 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
   }
 
+  Future<void> _saveSnippetLogs(BuildContext logContext) async {
+    try {
+      final path = await saveSnippetLog(_snippetLogs);
+      if (path == null || !logContext.mounted) return;
+      ScaffoldMessenger.of(logContext).showSnackBar(
+        SnackBar(content: Text('Log saved: $path')),
+      );
+    } catch (e) {
+      if (!logContext.mounted) return;
+      ScaffoldMessenger.of(logContext).showSnackBar(
+        SnackBar(content: Text('Could not save log: $e')),
+      );
+    }
+  }
+
   void _showSnippetLogs() {
     Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => Scaffold(
+      builder: (logContext) => Scaffold(
         appBar: AppBar(
           title: const Text('Snippet logs'),
           actions: [
+            ValueListenableBuilder<int>(
+              valueListenable: _snippetLogVersion,
+              builder: (_, __, ___) => IconButton(
+                icon: const Icon(Icons.save_alt),
+                tooltip: 'Save log',
+                onPressed: _snippetLogs.isEmpty ? null : () => _saveSnippetLogs(logContext),
+              ),
+            ),
             IconButton(
               icon: const Icon(Icons.delete_outline),
               tooltip: 'Clear',
