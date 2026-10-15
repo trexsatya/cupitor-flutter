@@ -4132,7 +4132,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     _toolsSectionHeader('Books'),
                     ListTile(
                       leading: const Icon(Icons.menu_book_outlined),
-                      title: const Text('Open EPUB'),
+                      title: const Text('Open EPUB / DOCX'),
                       subtitle: const Text('From device storage or a URL'),
                       onTap: () {
                         Navigator.of(ctx).pop();
@@ -4141,7 +4141,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     ),
                     ListTile(
                       leading: const Icon(Icons.history_edu_outlined),
-                      title: const Text('EPUB library'),
+                      title: const Text('Book library'),
                       subtitle: const Text('Resume a recent book'),
                       onTap: () {
                         Navigator.of(ctx).pop();
@@ -4152,7 +4152,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       leading: const Icon(Icons.search),
                       title: const Text('Global search…'),
                       subtitle: const Text(
-                        'Across every EPUB · use `|` for OR (e.g. cat|dog)',
+                        'Across every EPUB and DOCX · use `|` for OR (e.g. cat|dog)',
                       ),
                       trailing: const Icon(Icons.chevron_right),
                       onTap: () {
@@ -4467,9 +4467,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   // ─── EPUB reader integration ────────────────────────────────────────────
-  // The reader lives in [lib/epub_reader.dart]. We pull EPUB files from
+  // The reader lives in [lib/epub_reader.dart]. We pull EPUB/DOCX files from
   // three sources (device storage, an HTTP/HTTPS URL, a link in the main
-  // WebView that ends in .epub), cache them under <docs>/epubs/, and push
+  // WebView that ends in .epub or .docx), cache them under <docs>/epubs/, and push
   // the reader screen. Word-tap and selection callbacks from the reader
   // route into the existing dictionary flow via [_openDialogWithWebview],
   // so the EPUB inherits all of Cupitor's lookup machinery for free.
@@ -4509,13 +4509,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           children: [
             const Padding(
               padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
-              child: Text('Open EPUB',
+              child: Text('Open EPUB / DOCX',
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             ),
             ListTile(
               leading: const Icon(Icons.folder_open),
               title: const Text('From device storage'),
-              subtitle: const Text('Pick a .epub file'),
+              subtitle: const Text('Pick an .epub or .docx file'),
               onTap: () async {
                 Navigator.of(ctx).pop();
                 try {
@@ -4549,7 +4549,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final url = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Open EPUB from URL'),
+        title: const Text('Open EPUB / DOCX from URL'),
         content: TextField(
           controller: ctrl,
           autofocus: true,
@@ -4587,7 +4587,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             children: [
               CircularProgressIndicator(strokeWidth: 2),
               SizedBox(width: 16),
-              Text('Downloading EPUB…'),
+              Text('Downloading book…'),
             ],
           ),
         ),
@@ -4602,7 +4602,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       if (!mounted) return;
       Navigator.of(context, rootNavigator: true).pop();
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not download EPUB: $e')),
+        SnackBar(content: Text('Could not download book: $e')),
       );
     }
   }
@@ -4625,7 +4625,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                 child: Row(
                   children: const [
-                    Text('EPUB library',
+                    Text('Book library',
                         style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                   ],
                 ),
@@ -4636,7 +4636,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     ? const Center(
                         child: Padding(
                           padding: EdgeInsets.all(24),
-                          child: Text('No books yet. Use Open EPUB to add one.'),
+                          child: Text('No books yet. Open an EPUB or DOCX to add one.'),
                         ),
                       )
                     : ListView.separated(
@@ -4715,14 +4715,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         child: const Icon(Icons.menu_book_outlined, size: 22, color: Colors.grey),
       );
 
-  // True if a URL likely points to an EPUB. Cheap path-extension check —
+  // True if a URL likely points to an EPUB or DOCX. Cheap path-extension check —
   // mirrors `_looksLikePdfUrl` so the navigation delegate can short-circuit
   // before WebView opens the file as a download.
   bool _looksLikeEpubUrl(String url) {
-    final lower = url.toLowerCase();
-    final qPos = lower.indexOf('?');
-    final path = qPos >= 0 ? lower.substring(0, qPos) : lower;
-    return path.endsWith('.epub');
+    final path = Uri.tryParse(url)?.path.toLowerCase() ?? '';
+    return path.endsWith('.epub') || path.endsWith('.docx');
   }
 
   void _showYoutubeFrontendPicker() {
@@ -10653,7 +10651,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text(
-            'EPUB not in library on this device.',
+            'Book not in library on this device.',
           )),
         );
         return;
@@ -10662,7 +10660,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       if (!await file.exists()) {
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('EPUB file missing: ${entry.path}')),
+          SnackBar(content: Text('Book file missing: ${entry.path}')),
         );
         return;
       }
@@ -10685,7 +10683,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not open EPUB: $e')),
+        SnackBar(content: Text('Could not open book: $e')),
       );
     }
   }

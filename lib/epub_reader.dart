@@ -1,4 +1,4 @@
-// EPUB reader for Cupitor.
+// EPUB and DOCX reader for Cupitor.
 //
 // Why this file exists separately from main.dart: main.dart is already huge
 // and the reader is a self-contained feature with its own parser, model, and
@@ -32,6 +32,7 @@ import 'package:xml/xml.dart' as xml;
 
 import 'book_transfer.dart';
 import 'db.dart';
+import 'docx_document.dart';
 import 'eink_mode.dart';
 import 'jslog.dart';
 import 'save_file.dart';
@@ -348,6 +349,36 @@ class EpubBook {
     final files = <String, ArchiveFile>{};
     for (final f in archive) {
       if (f.isFile) files[f.name] = f;
+    }
+
+    // DOCX shares the reader, library, search, tags and resume-state model.
+    // Keep the original file's hash/path so renames and bundle transfers do
+    // not change the book identity. No intermediate EPUB is written to disk.
+    if (DocxDocument.isDocx(archive)) {
+      final name = File(filePath).uri.pathSegments.last;
+      final document = DocxDocument.fromArchive(archive,
+          title: name.replaceFirst(RegExp(r'\.docx$', caseSensitive: false), ''));
+      final chapters = <EpubChapter>[
+        for (var i = 0; i < document.chapters.length; i++)
+          EpubChapter(
+            id: 'docx-$i',
+            href: 'docx-$i.xhtml',
+            title: document.chapters[i].title,
+            html: document.chapters[i].html,
+          ),
+      ];
+      return EpubBook(
+        title: document.title,
+        author: document.author,
+        chapters: chapters,
+        toc: [for (var i = 0; i < chapters.length; i++)
+          EpubTocEntry(title: chapters[i].title, chapterIdx: i)],
+        resources: const {},
+        cssText: DocxDocument.css,
+        basePathInZip: '',
+        key: key,
+        filePath: filePath,
+      );
     }
 
     // 1) container.xml → OPF path.
@@ -731,7 +762,7 @@ class _ManifestItem {
   final String properties;
 }
 
-// ─── EPUB acquisition: device storage, URL download ──────────────────────
+// ─── Book acquisition: device storage, URL download ──────────────────────
 // All paths funnel through `cacheEpubFromBytes` so the file lives in a
 // known directory we can prune later if needed.
 
@@ -744,9 +775,11 @@ Future<Directory> _epubCacheDir() async {
 
 Future<File> cacheEpubFromBytes(Uint8List bytes, {String? suggestedName}) async {
   final hash = sha1.convert(bytes).toString();
+  final extension = DocxDocument.isDocx(ZipDecoder().decodeBytes(bytes))
+      ? '.docx' : '.epub';
   final name = (suggestedName == null || suggestedName.isEmpty)
-      ? '$hash.epub'
-      : _safeFileName(suggestedName);
+      ? '$hash$extension'
+      : _safeFileName(suggestedName, extension);
   final dir = await _epubCacheDir();
   final f = File('${dir.path}/$name');
   // If the file with this name exists but contents differ, append the hash.
@@ -754,8 +787,8 @@ Future<File> cacheEpubFromBytes(Uint8List bytes, {String? suggestedName}) async 
     final existing = await f.readAsBytes();
     final existingHash = sha1.convert(existing).toString();
     if (existingHash != hash) {
-      final stem = name.endsWith('.epub') ? name.substring(0, name.length - 5) : name;
-      final f2 = File('${dir.path}/${stem}_${hash.substring(0, 8)}.epub');
+      final stem = name.substring(0, name.length - extension.length);
+      final f2 = File('${dir.path}/${stem}_${hash.substring(0, 8)}$extension');
       await f2.writeAsBytes(bytes, flush: true);
       return f2;
     }
@@ -765,22 +798,23 @@ Future<File> cacheEpubFromBytes(Uint8List bytes, {String? suggestedName}) async 
   return f;
 }
 
-String _safeFileName(String name) {
+String _safeFileName(String name, String extension) {
   // Strip directory separators and anything weird. Keep the extension if
-  // it's already .epub, otherwise append.
+  // it matches the actual package contents, otherwise replace/append it.
   var n = name.replaceAll(RegExp(r'[\\/]+'), '_').replaceAll(RegExp(r'[^A-Za-z0-9._\- ]'), '_');
-  if (!n.toLowerCase().endsWith('.epub')) n = '$n.epub';
+  n = n.replaceFirst(RegExp(r'\.(epub|docx)$', caseSensitive: false), '');
+  n = '$n$extension';
   if (n.length > 80) n = n.substring(n.length - 80);
   return n;
 }
 
 /// Public sourcing helpers — called from main.dart's Tools sheet entries
-/// and from the .epub URL interceptor.
+/// and from the .epub/.docx URL interceptor.
 
 Future<File?> pickEpubFromDevice() async {
   final res = await FilePicker.platform.pickFiles(
     type: FileType.custom,
-    allowedExtensions: ['epub'],
+    allowedExtensions: ['epub', 'docx'],
     withData: true,
   );
   if (res == null || res.files.isEmpty) return null;
@@ -815,7 +849,7 @@ Future<File?> downloadEpubFromUrl(String url, {void Function(double)? onProgress
 
 // ─── Public entry point: opens the reader screen ─────────────────────────
 
-/// Open the EPUB reader. The caller supplies an `onLookup` callback that
+/// Open an EPUB or DOCX in the reader. The caller supplies an `onLookup` callback that
 /// receives a tapped/selected word plus a short surrounding context — the
 /// host wires this into its existing dictionary-lookup flow (typically
 /// opening dialog1).
@@ -843,7 +877,7 @@ Future<void> openEpubReader(
     book = await EpubBook.openFile(file);
   } catch (e) {
     if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not open EPUB: $e')));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not open book: $e')));
     return;
   }
   final coverPath = await book.saveCover();
@@ -3186,7 +3220,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     if (!await file.exists()) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('EPUB file missing: ${book.filePath}')),
+        SnackBar(content: Text('Book file missing: ${book.filePath}')),
       );
       return;
     }

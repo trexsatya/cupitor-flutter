@@ -12,7 +12,7 @@ import 'db.dart';
 import 'epub_reader.dart' show EpubLibrary, EpubLibraryEntry;
 import 'media_store.dart';
 
-/// Bundle an EPUB with everything Cupitor knows about it — the book
+/// Bundle an EPUB or DOCX with everything Cupitor knows about it — the book
 /// file, reading state, every profile's tags/sentences/media rows,
 /// playlists — into a portable `.cupitor.zip`. The other side
 /// ([BookImporter]) restores it into a fresh install or a different
@@ -20,7 +20,7 @@ import 'media_store.dart';
 /// per-profile split.
 ///
 /// Layout of the zip:
-///   book.epub            # untouched bytes of the original file
+///   book.epub / book.docx # untouched bytes of the original file
 ///   manifest.json        # everything else, versioned
 ///   media/[sha1].[ext]   # every referenced local media attachment
 class BookExporter {
@@ -46,7 +46,9 @@ class BookExporter {
 
     // 1. Book file itself. Zipped as-is — no re-parse.
     final epubBytes = await epubFile.readAsBytes();
-    archive.addFile(ArchiveFile('book.epub', epubBytes.length, epubBytes));
+    final bookName = epubFile.path.toLowerCase().endsWith('.docx')
+        ? 'book.docx' : 'book.epub';
+    archive.addFile(ArchiveFile(bookName, epubBytes.length, epubBytes));
 
     // 2. Prefs (reading state + mask locale).
     final prefs = await SharedPreferences.getInstance();
@@ -275,11 +277,11 @@ class BookImporter {
       );
     }
 
-    // 2. Book file — extract to app_docs/imported_epubs/<sha>.epub.
+    // 2. Book file — extract to app_docs/imported_epubs/<sha>.<epub|docx>.
     //    Recompute the SHA so we don't trust the exporter's claim.
-    final bookFile = archive.findFile('book.epub');
+    final bookFile = archive.findFile('book.epub') ?? archive.findFile('book.docx');
     if (bookFile == null) {
-      throw const FormatException('book.epub missing from bundle');
+      throw const FormatException('book.epub or book.docx missing from bundle');
     }
     final bookBytes = Uint8List.fromList(bookFile.content as List<int>);
     final freshKey = sha1.convert(bookBytes).toString();
@@ -300,14 +302,15 @@ class BookImporter {
       await MediaStore.instance.deleteOrphans(referenced);
     }
 
-    // 4. Extract EPUB to disk (overwrites any prior copy at the same
+    // 4. Extract the book to disk (overwrites any prior copy at the same
     //    content-addressed path).
     final docs = await getApplicationDocumentsDirectory();
     final booksDir = Directory('${docs.path}/imported_epubs');
     if (!await booksDir.exists()) {
       await booksDir.create(recursive: true);
     }
-    final epubDest = File('${booksDir.path}/$freshKey.epub');
+    final extension = bookFile.name.endsWith('.docx') ? 'docx' : 'epub';
+    final epubDest = File('${booksDir.path}/$freshKey.$extension');
     await epubDest.writeAsBytes(bookBytes, flush: true);
 
     // 5. Register in the library. `touch` removes any prior entry
