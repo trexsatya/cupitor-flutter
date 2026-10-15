@@ -195,7 +195,7 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
     if (!await file.exists()) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('EPUB file missing: ${entry.path}')),
+        SnackBar(content: Text('Book file missing: ${entry.path}')),
       );
       return;
     }
@@ -275,7 +275,7 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
           '${stat.mediaCount} media attachment(s) across every profile. '
           'Playlists that include this book\'s sentences are cleared too. '
           'Tags themselves are preserved (they live across books). '
-          'The EPUB file on disk is NOT deleted — remove it from the '
+          'The Book file on disk is NOT deleted — remove it from the '
           'library separately if you want that too.',
         ),
         actions: [
@@ -330,7 +330,7 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
           : ListView(
               children: [
                 _headerCard(theme, total),
-                _storageRow(theme, 'EPUB library', _libraryBytes,
+                _storageRow(theme, 'Book library', _libraryBytes,
                     subtitle: '${_libraryByKey.length} book(s)',
                     icon: Icons.menu_book_outlined),
                 _storageRow(theme, 'Media store', _mediaStoreBytes,

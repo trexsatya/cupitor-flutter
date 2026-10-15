@@ -198,7 +198,7 @@ class _GlobalSearchScreenState extends State<GlobalSearchScreen> {
           _running || _query.text.trim().isEmpty
               ? _running
                   ? 'Scanning your library…'
-                  : 'Type a phrase to search all EPUBs. Use `|` for OR:\n'
+                  : 'Type a phrase to search all EPUB and DOCX books. Use `|` for OR:\n'
                       '  cat|dog\n  apple pie|orange juice'
               : 'No matches in the library.',
           textAlign: TextAlign.center,
@@ -338,7 +338,7 @@ class _IndexSettingsSheetState extends State<_IndexSettingsSheet> {
             else ...[
               Text(
                 s.capacityBytes == 0
-                    ? 'Index disabled · every search re-parses each EPUB'
+                    ? 'Index disabled · every search re-parses each book'
                     : !s.available
                         ? 'Index unavailable on this device — using linear fallback'
                         : '${_formatBytes(s.usedBytes)} used · '

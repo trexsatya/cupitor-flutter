@@ -46,11 +46,11 @@ dependencies:
   # TTS calls would otherwise no-op. macOS WKWebView supports it natively, but
   # we route through this on every platform for behavior parity.
   flutter_tts: ^4.2.0
-  # EPUB reader stack:
-  #   archive    — unzip the .epub container (EPUB is a renamed zip).
-  #   xml        — parse container.xml / OPF (manifest+spine) / NCX/nav (TOC).
+  # EPUB / DOCX reader stack:
+  #   archive    — unzip EPUB and DOCX containers.
+  #   xml        — parse EPUB metadata/TOC and WordprocessingML content.
   #   crypto     — SHA-1 of file bytes → resume-state key (survives a rename).
-  #   file_picker — device-storage source for "Open EPUB" in the Tools sheet.
+  #   file_picker — device-storage source for "Open EPUB / DOCX" in the Tools sheet.
   archive: ^3.4.0
   xml: ^6.5.0
   crypto: ^3.0.3
