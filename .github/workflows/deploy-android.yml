@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    name: Test and build APK
+    name: Test and build app bundle
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -102,7 +102,7 @@ jobs:
               output.write(f'signed={str(all(configured)).lower()}\n')
           if not all(configured):
               with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-                  summary.write('Signing secrets are unset: a debug-signed test APK will be available '
+                  summary.write('Signing secrets are unset: a debug-signed test AAB will be available '
                                 'in Artifacts. GitHub Release publication is disabled.\n')
               raise SystemExit(0)
 
@@ -126,7 +126,7 @@ jobs:
                                   for key, value in properties.items()), encoding='ascii')
           path.chmod(0o600)
 
-      - name: Prepare APK metadata
+      - name: Prepare app bundle metadata
         id: package
         env:
           SIGNING: ${{ steps.signing.outputs.signed == 'true' && 'release' || 'test' }}
@@ -145,41 +145,41 @@ jobs:
           if not 0 < build_number < 2100000000:
               raise SystemExit('Android build number is out of range')
           artifact = f"cupitor-android-{os.environ['GITHUB_RUN_NUMBER']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
-          filename = f"cupitor-{version}-{build_number}-{os.environ['SIGNING']}.apk"
+          filename = f"cupitor-{version}-{build_number}-{os.environ['SIGNING']}.aab"
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'version={version}\nbuild_number={build_number}\nartifact={artifact}\nfilename={filename}\n')
 
-      - name: Build release-mode APK
+      - name: Build release-mode app bundle
         env:
           BUILD_NUMBER: ${{ steps.package.outputs.build_number }}
-        run: flutter build apk --release --build-number "$BUILD_NUMBER"
+        run: flutter build appbundle --release --build-number "$BUILD_NUMBER"
 
       # flutter build generates the gitignored wrapper and local.properties.
       - name: Run Android unit tests
         working-directory: android
         run: ./gradlew --no-daemon :app:testReleaseUnitTest
 
-      - name: Collect APK
+      - name: Collect app bundle
         env:
-          APK_FILENAME: ${{ steps.package.outputs.filename }}
+          BUNDLE_FILENAME: ${{ steps.package.outputs.filename }}
         run: |
           mkdir -p dist
-          cp build/app/outputs/flutter-apk/app-release.apk "dist/$APK_FILENAME"
+          cp build/app/outputs/bundle/release/app-release.aab "dist/$BUNDLE_FILENAME"
 
-      - name: Upload downloadable APK
+      - name: Upload downloadable app bundle
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.package.outputs.artifact }}
-          path: dist/*.apk
+          path: dist/*.aab
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
 
-      - name: Link APK in run summary
+      - name: Link app bundle in run summary
         env:
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
-        run: printf '[Download Android APK](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
+        run: printf '[Download Android app bundle](%s)\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove signing files
         if: always()
@@ -194,7 +194,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download tested APK
+      - name: Download tested app bundle
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ needs.build.outputs.artifact }}
@@ -209,16 +209,16 @@ jobs:
         shell: bash
         run: |
           tag="android-$GITHUB_RUN_NUMBER"
-          printf 'Android APK for Cupitor %s (build %s).\n\nSource: %s\n' \
+          printf 'Android App Bundle for Cupitor %s (build %s).\n\nSource: %s\n' \
             "$VERSION" "$BUILD_NUMBER" "$GITHUB_SHA" > release-notes.md
           if gh release view "$tag" --json isDraft > existing-release.json 2>/dev/null; then
             # Re-running a published build does not replace immutable assets.
             if python -c 'import json,sys; sys.exit(not json.load(open("existing-release.json"))["isDraft"])'; then
-              gh release upload "$tag" dist/*.apk --clobber
+              gh release upload "$tag" dist/*.aab --clobber
               gh release edit "$tag" --draft=false --latest
             fi
           else
-            gh release create "$tag" dist/*.apk --target "$GITHUB_SHA" \
+            gh release create "$tag" dist/*.aab --target "$GITHUB_SHA" \
               --title "Cupitor Android $VERSION ($BUILD_NUMBER)" \
               --notes-file release-notes.md --latest
           fi
