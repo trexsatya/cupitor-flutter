@@ -38,6 +38,56 @@ Run the document reader tests with:
 flutter test test/docx_document_test.dart test/docx_reader_test.dart
 ```
 
+## Android App Bundle builds and releases
+
+[Build and deploy Android](https://github.com/trexsatya/cupitor-flutter/actions/workflows/deploy-android.yml)
+runs on pushes to `main`, pull requests, and **Actions → Build and deploy Android →
+Run workflow**. It runs the Flutter, reader JavaScript and Android unit tests,
+then builds an Android App Bundle (`.aab`). The bundle is downloadable from the
+run's **Artifacts** section (kept for 30 days), with a link in the run summary.
+
+To publish signed bundles automatically to
+[GitHub Releases](https://github.com/trexsatya/cupitor-flutter/releases),
+add these **repository secrets** under **Settings → Secrets and variables →
+Actions**:
+
+| Secret | Value |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | Base64 contents of your existing Android upload/signing keystore |
+| `ANDROID_KEYSTORE_PASSWORD` | The keystore's `storePassword` |
+| `ANDROID_KEY_ALIAS` | The keystore's `keyAlias` |
+| `ANDROID_KEY_PASSWORD` | The signing key's `keyPassword` |
+
+For Google Play, use the upload key registered for this app in Play Console.
+Keep the keystore backed up outside Git. For example, with GitHub CLI installed
+and authenticated:
+
+```sh
+openssl base64 -A -in /path/to/your-existing-key.jks | gh secret set ANDROID_KEYSTORE_BASE64 --repo trexsatya/cupitor-flutter
+gh secret set ANDROID_KEYSTORE_PASSWORD --repo trexsatya/cupitor-flutter
+gh secret set ANDROID_KEY_ALIAS --repo trexsatya/cupitor-flutter
+gh secret set ANDROID_KEY_PASSWORD --repo trexsatya/cupitor-flutter
+```
+
+After configuration, each successful push to `main` (or manual run on `main`)
+publishes a release tagged `android-<run number>` and marks it as latest. Each
+release includes the source commit and its tested AAB. Re-running a published
+build keeps the existing release assets. The repository is private, so downloads
+require GitHub access to it. Download the signed `*-release.aab` and upload it
+in Play Console. This workflow publishes to GitHub Releases; Play Console
+upload remains manual.
+
+With all four secrets unset, builds still produce a debug-signed `*-test.aab`
+artifact for build verification. Publishing to GitHub Releases is disabled, and
+the test bundle cannot be uploaded as a production Play release. A partial
+signing configuration fails with a setup message. Pull requests and manual
+runs on other branches build test bundles without access to signing secrets.
+
+The workflow pins Flutter 3.32.8, Java 17, Android SDK 36 and NDK 27.0.12077973.
+It adds the workflow run number to the build number in `pubspec.yaml`. When
+uploading to Play, this number must exceed the app's last uploaded version code;
+increase the base build number in `pubspec.yaml` if needed.
+
 ## Getting Started
 
 This project is a starting point for a Flutter application.
