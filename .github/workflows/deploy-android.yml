@@ -33,6 +33,26 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Free hosted runner disk space
+        shell: bash
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          # Unused toolchains and the image's multi-version Android SDK consume
+          # the space needed by Gradle, native libraries and Robolectric SDKs.
+          # setup-android below installs the pinned packages into ANDROID_HOME.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk
+          cupitor_sdk_root="$RUNNER_TEMP/android-sdk"
+          {
+            printf 'ANDROID_HOME=%s\n' "$cupitor_sdk_root"
+            printf 'ANDROID_SDK_ROOT=%s\n' "$cupitor_sdk_root"
+            printf 'ANDROID_NDK=%s/ndk/27.0.12077973\n' "$cupitor_sdk_root"
+            printf 'ANDROID_NDK_HOME=%s/ndk/27.0.12077973\n' "$cupitor_sdk_root"
+            printf 'ANDROID_NDK_ROOT=%s/ndk/27.0.12077973\n' "$cupitor_sdk_root"
+            printf 'ANDROID_NDK_LATEST_HOME=%s/ndk/27.0.12077973\n' "$cupitor_sdk_root"
+          } >> "$GITHUB_ENV"
+          df -h "$GITHUB_WORKSPACE"
+
       - name: Set up Java
         uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
@@ -149,6 +169,16 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'version={version}\nbuild_number={build_number}\nartifact={artifact}\nfilename={filename}\n')
 
+      - name: Check build disk space
+        shell: bash
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          available_kib=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          if (( available_kib < 12 * 1024 * 1024 )); then
+            echo '::error::At least 12 GiB of free disk space is required for the Android build and tests.'
+            exit 1
+          fi
+
       - name: Build release-mode app bundle
         env:
           BUILD_NUMBER: ${{ steps.package.outputs.build_number }}
@@ -156,8 +186,22 @@ jobs:
 
       # flutter build generates the gitignored wrapper and local.properties.
       - name: Run Android unit tests
+        id: android_tests
         working-directory: android
-        run: ./gradlew --no-daemon :app:testReleaseUnitTest
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          ./gradlew --no-daemon :app:testReleaseUnitTest
+
+      - name: Upload Android test failure reports
+        if: failure() && steps.android_tests.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-test-reports-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            build/app/reports/tests/testReleaseUnitTest/
+            build/app/test-results/testReleaseUnitTest/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Collect app bundle
         env:
