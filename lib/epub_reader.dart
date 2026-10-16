@@ -21,7 +21,7 @@ import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:flutter/services.dart' show Clipboard, ClipboardData, MethodChannel;
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
@@ -1097,9 +1097,20 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
         // makes the WebView ignore it and zoom the page out to fit its widest
         // box. See _configureAndroidWebView in main.dart for why that breaks
         // touch scrolling.
-        p.setUseWideViewPort(true);
+        await p.setUseWideViewPort(true);
+        // Register the native instance before showing the reader. Android's
+        // WebView.url can be about:blank for loadHtmlString even with baseUrl.
+        try {
+          await const MethodChannel('cupitor/reader_selection')
+              .invokeMethod<void>('registerReader', {
+            'webViewId': p.webViewIdentifier,
+          });
+        } catch (e) {
+          JsLogSink.add('error', 'Reader selection registration failed: $e');
+        }
       }
     }
+    if (!mounted) return;
     _controller = ctrl;
     setState(() => _ready = true);
     // When opened via a deep-link highlight (global search / webapp
@@ -5509,4 +5520,5 @@ class _PlaylistCaptureSheetState extends State<_PlaylistCaptureSheet> {
     );
   }
 }
+
 

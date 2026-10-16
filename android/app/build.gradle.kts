@@ -145,4 +145,7 @@ dependencies {
     // deciding which file a web request may have, and the Range parser.
     // Run with: ./gradlew :app:testDebugUnitTest
     testImplementation("junit:junit:4.13.2")
+    // Exercise real Android View dispatch and ActionMode callbacks on the JVM.
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }
+

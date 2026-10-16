@@ -22,6 +22,7 @@ import com.yausername.youtubedl_android.YoutubeDLRequest
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugins.webviewflutter.WebViewFlutterAndroidExternalApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -183,6 +184,24 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cupitor/reader_selection")
+            .setMethodCallHandler { call, result ->
+                if (call.method != "registerReader") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val identifier = call.argument<Number>("webViewId")?.toLong()
+                val webView = identifier?.let {
+                    WebViewFlutterAndroidExternalApi.getWebView(flutterEngine, it)
+                }
+                val host = ReaderSelectionHost.install(this)
+                if (webView == null || host == null) {
+                    result.error("reader_unavailable", "Reader WebView or selection host not found", null)
+                } else {
+                    host.registerReader(webView)
+                    result.success(null)
+                }
+            }
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
         adBlockChannel = channel
         channel.setMethodCallHandler { call, result ->
@@ -1738,3 +1757,4 @@ class MainActivity : FlutterActivity() {
             delegate.onScaleChanged(view, oldScale, newScale)
     }
 }
+
