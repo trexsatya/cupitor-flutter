@@ -32,6 +32,8 @@ import 'translate_detail.dart';
 import 'ai_prompt.dart';
 import 'youtube_urls.dart';
 import 'youtube_controls.dart';
+import 'youtube_sidebar_subtitles.dart';
+import 'stable_dialog_chrome.dart';
 import 'mac_webview.dart';
 import 'history_store.dart';
 import 'history_screen.dart';
@@ -375,6 +377,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // Fullscreen toggle for dialog1. Notifier (not bare field) so the showDialog
   // route — which lives outside the outer State's setState scope — rebuilds.
   final ValueNotifier<bool> _dialog1FullscreenNotifier = ValueNotifier(false);
+  final ValueNotifier<int> _dialog1ChromeActivity = ValueNotifier(0);
   // Language-app ↔ Cupitor bridge for the notification feature (spec:
   // docs/superpowers/specs/2026-07-27-notifications-design.md §Bridge).
   // Permission/exact-alarm/action capabilities are backed by the real
@@ -567,6 +570,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _memSampler?.cancel();
     _isListeningNotifier.dispose();
     _dialog1FullscreenNotifier.dispose();
+    _dialog1ChromeActivity.dispose();
     _dialog1Tts?.stop();
     _dialog1Tts = null;
     // Close any open ML Kit translators in the snippet-bridge pool.
@@ -775,6 +779,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // on their way to the language webapp as manual playlist item(s).
         // Contract: docs/superpowers/specs/2026-09-06-caption-capture-design.md
         ..addJavaScriptChannel('CaptionCollector', onMessageReceived: (msg) => _handleCaptionCollector(c, msg))
+        ..addJavaScriptChannel('YouTubeSubtitles',
+            onMessageReceived: (msg) => _downloadYouTubeSubtitlesForPage(c, msg))
         ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
         ..addJavaScriptChannel('AdHostDetector', onMessageReceived: (msg) => _onJsAdHostDetected(msg.message))
@@ -6716,31 +6722,29 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// Pulls a YouTube video id out of any of the URL forms we support
   /// (`/watch?v=…`, `/shorts/…`, `/embed/…`, `/live/…`, `youtu.be/…`). Returns
   /// null if the input doesn't look like a YouTube URL/id at all.
-  String? _extractYouTubeVideoId(String input) {
-    final trimmed = input.trim();
-    if (trimmed.isEmpty) return null;
-    // Bare 11-char id (what users sometimes paste from the share menu).
-    if (RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(trimmed)) return trimmed;
-    final uri = Uri.tryParse(trimmed);
-    if (uri == null) return null;
-    final host = uri.host.toLowerCase();
-    if (host == 'youtu.be') {
-      final seg = uri.pathSegments.isNotEmpty ? uri.pathSegments.first : '';
-      if (RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(seg)) return seg;
-    }
-    if (host.endsWith('youtube.com') || host.endsWith('youtube-nocookie.com')) {
-      final v = uri.queryParameters['v'];
-      if (v != null && RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(v)) return v;
-      // /shorts/<id>, /embed/<id>, /live/<id>, /v/<id>
-      for (final pat in const ['shorts', 'embed', 'live', 'v']) {
-        final idx = uri.pathSegments.indexOf(pat);
-        if (idx >= 0 && idx + 1 < uri.pathSegments.length) {
-          final cand = uri.pathSegments[idx + 1];
-          if (RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(cand)) return cand;
-        }
+  String? _extractYouTubeVideoId(String input) => youtubeSubtitleVideoId(input);
+
+  bool _youtubeSidebarDownloadBusy = false;
+
+  Future<void> _downloadYouTubeSubtitlesForPage(
+      WebViewController page, JavaScriptMessage message) async {
+    if (!mounted || !identical(page, _controller) || _youtubeSidebarDownloadBusy) return;
+    try {
+      final request = jsonDecode(message.message);
+      if (request is! Map || request['op'] != 'download') return;
+      // Read the target from the actual controller, not a URL supplied by JS.
+      final url = await page.currentUrl() ?? '';
+      if (youtubeSubtitleVideoId(url) == null || !mounted ||
+          !identical(page, _controller) || _youtubeSidebarDownloadBusy) return;
+      _youtubeSidebarDownloadBusy = true;
+      try {
+        await _startYouTubeSubtitleDownload(context, sidebarTarget: page);
+      } finally {
+        _youtubeSidebarDownloadBusy = false;
       }
+    } catch (error) {
+      _showCaptureError('Could not load YouTube subtitles', '$error');
     }
-    return null;
   }
 
   // ---------- YouTube subtitle download ----------
@@ -6827,16 +6831,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     Navigator.of(ctx, rootNavigator: true).pop();
   }
 
-  /// Entry point wired to the closed-captions icon in dialog1's header.
-  /// Prompts for a URL → fetches caption tracks → picker → downloads + parses
-  /// the chosen track → opens the full-file dialog. Every long step shows a
-  /// dismissible busy overlay so the rest of the app remains interactive
-  /// (HTTP + parse are awaited, so the UI thread is never blocked).
-  Future<void> _startYouTubeSubtitleDownload(BuildContext ctx) async {
+  /// Shared entry point for dialog1's CC button and the YouTube page sidebar.
+  /// The sidebar supplies its controller and uses that video's URL directly;
+  /// the standalone flow prompts for a URL and keeps its full-file dialog.
+  Future<void> _startYouTubeSubtitleDownload(BuildContext ctx, {
+    WebViewController? sidebarTarget,
+  }) async {
     // Pre-fill from clipboard if it looks like a YouTube URL — common case
     // is the user just copied the link from the YouTube share sheet.
-    String initial = '';
-    try {
+    String initial = sidebarTarget != null ? await sidebarTarget.currentUrl() ?? '' : '';
+    if (sidebarTarget == null) try {
       final clip = await Clipboard.getData('text/plain');
       final t = (clip?.text ?? '').trim();
       if (_extractYouTubeVideoId(t) != null) initial = t;
@@ -6844,7 +6848,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (!mounted) return;
 
     final urlCtrl = TextEditingController(text: initial);
-    final urlInput = await showDialog<String>(
+    final urlInput = sidebarTarget != null ? initial : await showDialog<String>(
       context: ctx,
       builder: (dctx) => AlertDialog(
         title: const Text('YouTube subtitles'),
@@ -6925,6 +6929,23 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       return;
     }
     if (!mounted) return;
+
+    if (sidebarTarget != null) {
+      final payload = youtubeSidebarSubtitlePayload(
+        videoId: videoId,
+        language: baseLanguageCode((picked['languageCode'] as String?) ?? _selectedLanguage),
+        lines: lines,
+      );
+      final accepted = await sidebarTarget.runJavaScriptReturningResult(
+        youtubeSidebarSubtitleImportJs(payload),
+      );
+      if (accepted.toString() != 'true') {
+        _showCaptureError('Could not attach subtitles',
+            'The video changed while downloading, or its subtitle sidebar is out of date. '
+            'Reload the YouTube page and try again.');
+      }
+      return;
+    }
 
     _showFullSubtitleDialog(
       ctx,
@@ -8463,6 +8484,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // it's absent, so registering it is what turns the feature on.
         // Protocol: docs/speech-bridge-spec.md.
         ..addJavaScriptChannel('SpeechBridge', onMessageReceived: _handleSpeechBridge)
+        ..addJavaScriptChannel('DialogChromeActivity', onMessageReceived: (_) {
+          if (mounted && identical(ctrl, dialogController)) _dialog1ChromeActivity.value++;
+        })
         // The study page (trexsatya.github.io/language.html) loads in THIS
         // (dialog) controller, so its 🌐 translate button needs the channel
         // here too. The main _controller registers TranslateRequest as well,
@@ -8544,7 +8568,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               return NavigationDecision.navigate;
             },
             onPageFinished: (url) {
-              if (!identical(ctrl, dialogController)) return;
+              if (!mounted || !identical(ctrl, dialogController)) return;
+              ctrl.runJavaScript(kDialogChromeActivityJs);
+              _dialog1ChromeActivity.value++;
               _injectAdBlocker(dialogController);
               // Let this WebView answer its own requests for the background
               // music files. Attached per page load because a fresh dialog
@@ -8760,9 +8786,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return Container(
       width: screenWidth,
       height: screenHeight,
-      child: Column(
-        children: [
-          if (!fullscreen) Container(
+      child: StableDialogChrome(
+          enabled: !fullscreen,
+          holdVisible: _isListeningNotifier,
+          activity: _dialog1ChromeActivity,
+          toolbar: Container(
             padding: const EdgeInsets.symmetric(horizontal: 4),
             child: Theme(
               // Compact the icon row so the title bar takes less vertical space.
@@ -8886,8 +8914,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               ),
             ),
           ),
-          Expanded(
-            child: ValueListenableBuilder<String?>(
+          child: ValueListenableBuilder<String?>(
               valueListenable: _dialogErrorNotifier,
               builder: (_, error, __) => error != null
                   ? _errorView(error, () {
@@ -8916,8 +8943,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                           : pageCursor(WebViewWidget(controller: dialogController!)),
                     ),
             ),
-          ),
-        ],
       ),
     );
   }
