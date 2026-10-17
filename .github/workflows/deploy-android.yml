@@ -96,7 +96,7 @@ jobs:
       - name: Run reader JavaScript tests
         # The lookup/video integration harness needs a separate website checkout
         # and jsdom. This reader test is self-contained in the Flutter repo.
-        run: node --test test/js/reader_selection.test.mjs test/js/youtube_controls.test.mjs
+        run: node --test test/js/reader_selection.test.mjs test/js/youtube_controls.test.mjs test/js/app_lifecycle.test.mjs
 
       - name: Test YouTube control visibility in Chrome
         # ubuntu-24.04 includes Google Chrome. Use it without downloading

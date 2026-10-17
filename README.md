@@ -38,6 +38,31 @@ Run the document reader tests with:
 flutter test test/docx_document_test.dart test/docx_reader_test.dart
 ```
 
+## YouTube subtitle sidebar
+
+Open a YouTube video in the app's main browser and tap **⤓CC** in the subtitle
+sidebar. Cupitor reuses its existing YouTube download flow: choose a caption
+track, download it, then use the complete transcript beside the player.
+The panel follows playback, supports seeking and previous/next cues, and keeps
+the existing translation, replay strategies and select-lines/send-to-lookup
+controls. A downloaded track replaces the live harvested lines for that video.
+
+The last five downloaded tracks are kept in the page's tab session so returning
+to a video or reloading it can restore its transcript. **Clear transcript**
+also removes that video's saved track. A download finishing after you switch
+videos is rejected rather than attaching captions to the wrong video.
+
+This feature needs both the updated Android/macOS app and the updated remote
+subtitle sidebar (`db/js/src/20-caption-sidebar.js` and
+`db/js/src/70-caption-capture.js`, bundled into `db/js/snippet.js` in
+`trexsatya/trexsatya.github.io`). The button stays hidden in older app versions.
+The CC button in dialog1 still offers the existing standalone download dialog.
+
+Dialog1's top bar now fades after three seconds of inactivity and reappears
+on tap. Its height stays reserved, so the WebView and video do not move or
+resize. Active microphone capture and held touches keep it visible; the
+explicit fullscreen button continues to use its existing layout.
+
 ## YouTube controls in dialog1
 
 On Android, dialog1's webapp can call
@@ -46,6 +71,13 @@ player controls, or pass `true` to show them without reloading the player.
 The webapp owns tap handling and idle timers. See
 [the bridge API](docs/youtube-controls-bridge.md)
 for feature detection, iframe lifecycle handling and integration examples.
+
+Dialog1 also receives `cupitorAppLifecycle` events with
+`{state, isForeground}` when the host app loses focus, enters the background or
+returns. The webapp can use these to suspend its timer. Late listeners can read
+`window.CupitorAppLifecycle` or request a fresh event with
+`window.AppLifecycleBridge?.postMessage('getState')`.
+See [the lifecycle API](docs/dialog-app-lifecycle.md) for an example.
 
 ## Android App Bundle builds and releases
 
