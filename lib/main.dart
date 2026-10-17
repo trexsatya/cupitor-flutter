@@ -34,6 +34,7 @@ import 'youtube_urls.dart';
 import 'youtube_controls.dart';
 import 'youtube_sidebar_subtitles.dart';
 import 'stable_dialog_chrome.dart';
+import 'dialog_app_lifecycle.dart';
 import 'mac_webview.dart';
 import 'history_store.dart';
 import 'history_screen.dart';
@@ -185,6 +186,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// through TYPING, and a rebuild has to navigate somewhere loadable.
   String? _lastLoadedUrl;
   WebViewController? dialogController;
+  late final DialogAppLifecycleBridge _dialogAppLifecycle;
   final TextEditingController _urlController = TextEditingController(text: 'https://google.com');
   /// Owned here rather than left to the TextField, because
   /// [RawAutocomplete] needs the same node to know when to show and hide
@@ -517,6 +519,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _appBarTimer?.cancel();
     ProfileService.active.removeListener(_onProfileChanged);
     WidgetsBinding.instance.removeObserver(this);
+    _dialogAppLifecycle.dispose();
     SpeechHub.release(_speechHubListener);
     _videoNotePoller.dispose();
     HardwareKeyboard.instance.removeHandler(_onMacFullscreenEscape);
@@ -621,6 +624,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _dialogAppLifecycle = DialogAppLifecycleBridge(send: (script) async {
+      final ctrl = dialogController;
+      if (mounted && ctrl != null) await ctrl.runJavaScript(script);
+    });
     WakelockPlus.enable();
     onMacWindowExitedFullscreen(() => _setMacPageFullscreen(false));
     HardwareKeyboard.instance.addHandler(_onMacFullscreenEscape);
@@ -8487,6 +8494,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('DialogChromeActivity', onMessageReceived: (_) {
           if (mounted && identical(ctrl, dialogController)) _dialog1ChromeActivity.value++;
         })
+        ..addJavaScriptChannel('AppLifecycleBridge', onMessageReceived: (msg) {
+          if (msg.message == 'getState' && mounted && identical(ctrl, dialogController)) {
+            _dialogAppLifecycle.sendCurrent();
+          }
+        })
         // The study page (trexsatya.github.io/language.html) loads in THIS
         // (dialog) controller, so its 🌐 translate button needs the channel
         // here too. The main _controller registers TranslateRequest as well,
@@ -8569,6 +8581,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             },
             onPageFinished: (url) {
               if (!mounted || !identical(ctrl, dialogController)) return;
+              _dialogAppLifecycle.sendCurrent();
               ctrl.runJavaScript(kDialogChromeActivityJs);
               _dialog1ChromeActivity.value++;
               _injectAdBlocker(dialogController);

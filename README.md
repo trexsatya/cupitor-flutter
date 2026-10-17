@@ -72,6 +72,13 @@ The webapp owns tap handling and idle timers. See
 [the bridge API](docs/youtube-controls-bridge.md)
 for feature detection, iframe lifecycle handling and integration examples.
 
+Dialog1 also receives `cupitorAppLifecycle` events with
+`{state, isForeground}` when the host app loses focus, enters the background or
+returns. The webapp can use these to suspend its timer. Late listeners can read
+`window.CupitorAppLifecycle` or request a fresh event with
+`window.AppLifecycleBridge?.postMessage('getState')`.
+See [the lifecycle API](docs/dialog-app-lifecycle.md) for an example.
+
 ## Android App Bundle builds and releases
 
 [Build and deploy Android](https://github.com/trexsatya/cupitor-flutter/actions/workflows/deploy-android.yml)
