@@ -38,6 +38,15 @@ Run the document reader tests with:
 flutter test test/docx_document_test.dart test/docx_reader_test.dart
 ```
 
+## YouTube controls in dialog1
+
+On Android, dialog1's webapp can call
+`window.CupitorYouTubeControls?.setVisible(false)` to hide YouTube's embedded
+player controls, or pass `true` to show them without reloading the player.
+The webapp owns tap handling and idle timers. See
+[the bridge API](docs/youtube-controls-bridge.md)
+for feature detection, iframe lifecycle handling and integration examples.
+
 ## Android App Bundle builds and releases
 
 [Build and deploy Android](https://github.com/trexsatya/cupitor-flutter/actions/workflows/deploy-android.yml)

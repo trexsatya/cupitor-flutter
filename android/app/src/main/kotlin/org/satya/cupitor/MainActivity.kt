@@ -184,6 +184,32 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cupitor/youtube_controls")
+            .setMethodCallHandler { call, result ->
+                if (call.method != "install") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val identifier = call.argument<Number>("webViewId")?.toLong()
+                val script = call.argument<String>("script")
+                val webView = identifier?.let {
+                    WebViewFlutterAndroidExternalApi.getWebView(flutterEngine, it)
+                }
+                if (webView == null || script.isNullOrBlank()) {
+                    result.error("youtube_controls_unavailable", "Dialog WebView or script not found", null)
+                } else if (!documentStartSupported()) {
+                    result.success(false)
+                } else {
+                    // Register on this exact controller before navigation;
+                    // dialog1 can load while it is not in the view tree yet.
+                    youtubeControlsScripts.remove(webView)?.remove()
+                    youtubeControlsScripts[webView] =
+                        androidx.webkit.WebViewCompat.addDocumentStartJavaScript(
+                            webView, script, setOf("*")
+                        )
+                    result.success(true)
+                }
+            }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cupitor/reader_selection")
             .setMethodCallHandler { call, result ->
                 if (call.method != "registerReader") {
@@ -611,6 +637,10 @@ class MainActivity : FlutterActivity() {
     // Handlers are kept so a re-install replaces rather than stacks.
     /// The agent itself, remembered so a WebView built later can still get it.
     private var frameScript: String? = null
+
+    // Separate from the general frame agent: only dialog1 is registered.
+    private val youtubeControlsScripts =
+        java.util.WeakHashMap<WebView, androidx.webkit.ScriptHandler>()
 
     /// One handler per WebView we have registered on. Weak, because a WebView
     /// that has gone away must not be held alive by this map, and identity

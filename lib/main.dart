@@ -31,6 +31,7 @@ import 'page_cursor.dart';
 import 'translate_detail.dart';
 import 'ai_prompt.dart';
 import 'youtube_urls.dart';
+import 'youtube_controls.dart';
 import 'mac_webview.dart';
 import 'history_store.dart';
 import 'history_screen.dart';
@@ -4271,7 +4272,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                           setState(() {
                             _selectedLanguage = val!;
                             if (dialogController != null) {
-                              dialogController?.loadRequest(
+                              _loadDialog1Page(
                                   Uri.parse(getUrlForLanguage(_selectedLanguage)));
                             }
                           });
@@ -8419,6 +8420,21 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     dialogController?.runJavaScript(js);
   }
 
+  Future<bool> _dialog1YouTubeControlsReady = Future.value(false);
+  int _dialog1LoadSerial = 0;
+
+  /// Every navigation waits for document-start injection. If a notification
+  /// immediately replaces the initial URL, only its latest request is loaded.
+  Future<void> _loadDialog1Page(Uri uri) async {
+    final ctrl = dialogController;
+    if (ctrl == null) return;
+    final serial = ++_dialog1LoadSerial;
+    await _dialog1YouTubeControlsReady;
+    if (!mounted || !identical(ctrl, dialogController) ||
+        serial != _dialog1LoadSerial) return;
+    await ctrl.loadRequest(uri);
+  }
+
   /// [show] false builds and loads dialog1's page without putting dialog1 on
   /// screen (a background load, e.g. to ask the page something).
   void _openDialogWithWebview(String text, {bool show = true}) {
@@ -8586,8 +8602,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               }
             },
           ),
-        )
-        ..loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+        );
+      _dialog1YouTubeControlsReady = installYouTubeControls(ctrl);
+      _loadDialog1Page(Uri.parse(getUrlForLanguage(_selectedLanguage)));
       _enableThirdPartyCookies(dialogController!);
     }
 
@@ -8612,7 +8629,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _showDialog1();
     }
     if (uri != null && uri.hasScheme) {
-      dialogController?.loadRequest(uri);
+      _loadDialog1Page(uri);
     }
   }
 
@@ -8840,7 +8857,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     final ctrl = dialogController;
                     if (ctrl == null) return;
                     try { await ctrl.clearCache(); } catch (_) {}
-                    await ctrl.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                    await _loadDialog1Page(Uri.parse(getUrlForLanguage(_selectedLanguage)));
                   },
                 ),
                 IconButton(
@@ -8881,7 +8898,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         // panel, so rebuild instead of no-opping.
                         _openDialogWithWebview('');
                       } else {
-                        dialogController!.loadRequest(
+                        _loadDialog1Page(
                             Uri.parse(getUrlForLanguage(_selectedLanguage)));
                       }
                     })
@@ -10958,7 +10975,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // deliver the queue.
     if (!_dialog1Loading) {
       _dialog1Loading = true;
-      dialogController!.loadRequest(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+      _loadDialog1Page(Uri.parse(getUrlForLanguage(_selectedLanguage)));
     }
     if (show) _showDialog1();
   }

@@ -96,7 +96,7 @@ jobs:
       - name: Run reader JavaScript tests
         # The lookup/video integration harness needs a separate website checkout
         # and jsdom. This reader test is self-contained in the Flutter repo.
-        run: node --test test/js/reader_selection.test.mjs
+        run: node --test test/js/reader_selection.test.mjs test/js/youtube_controls.test.mjs
 
       # PRs and manual runs on other branches never receive signing secrets.
       - name: Configure release signing
