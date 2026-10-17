@@ -21,6 +21,22 @@ function browser() {
     const observers = [];
     const listeners = new Map();
     const iframes = [];
+    const controls = [];
+    function control(className, initial = {}) {
+      const values = new Map();
+      const element = {className, isConnected: true, writes: 0, style: {
+        getPropertyValue: name => values.get(name)?.value || '',
+        getPropertyPriority: name => values.get(name)?.priority || '',
+        setProperty(name, value, priority = '') {
+          element.writes++;
+          values.set(name, {value, priority});
+        },
+        removeProperty(name) { element.writes++; values.delete(name); },
+      }};
+      for (const [name, value] of Object.entries(initial)) element.style.setProperty(name, value);
+      controls.push(element);
+      return element;
+    }
     const root = {
       classes: new Set(), children: [],
       classList: {
@@ -31,7 +47,9 @@ function browser() {
     };
     const document = {
       documentElement: beforeHtml ? null : root,
-      querySelectorAll: selector => selector === 'iframe' ? iframes : [],
+      querySelectorAll: selector => selector === 'iframe' ? iframes : controls.filter(element =>
+        element.isConnected && selector.split(',').some(s =>
+          element.className.split(' ').includes(s.trim().slice(1)))),
       createElement: tag => ({tagName: tag.toUpperCase(), isConnected: false}),
     };
     const location = new URL(url);
@@ -61,7 +79,7 @@ function browser() {
         observe() {}
       },
     });
-    const result = {window, document, location, root, iframes, listeners,
+    const result = {window, document, location, root, iframes, listeners, control,
       run: code => enter(result, () => vm.runInContext(code, context)),
       inject: () => enter(result, () => vm.runInContext(script, context)),
       mutate: () => observers.forEach(callback => enter(result, callback)),
@@ -167,9 +185,11 @@ test('only current child windows from an allowed origin receive readiness replie
   const b = browser();
   const spoof = b.frame('https://youtube.com.evil.test/embed/one');
   const detached = b.frame('https://www.youtube.com/embed/one');
+  b.flush();
   b.top.iframes.pop();
   b.top.run('window.CupitorYouTubeControls.setVisible(false)');
   spoof.run("window.parent.postMessage({type: 'cupitor:youtube-controls-ready'}, '*')");
+  detached.run("window.parent.postMessage({type: 'cupitor:youtube-controls-ready'}, '*')");
   b.flush();
   assert.equal(detached.root.classes.has(hiddenClass), false);
 });
@@ -212,4 +232,73 @@ test('explicit show holds bars visible, and the bridge leaves all input handling
     assert.equal(yt.listeners.has(event), false);
     assert.equal(b.top.listeners.has(event), false);
   }
+});
+
+test('playback class and inline style rewrites cannot reveal hidden controls', () => {
+  const b = browser();
+  const yt = b.frame('https://www.youtube.com/embed/one');
+  const chrome = yt.control('ytp-chrome-top');
+  const pause = yt.control('ytp-pause-overlay', {opacity: '0.4', transition: 'opacity 1s'});
+  b.top.run('window.CupitorYouTubeControls.setVisible(false)');
+  b.flush();
+  for (const activity of ['pause', 'resume', 'change-video']) {
+    chrome.className = 'ytp-chrome-top ' + activity;
+    for (const element of [chrome, pause]) {
+      element.style.setProperty('opacity', '1', 'important');
+      element.style.setProperty('visibility', 'visible', 'important');
+      element.style.setProperty('transition', 'opacity 1s', 'important');
+    }
+    yt.mutate();
+    assert.equal(b.top.window.CupitorYouTubeControls.visible, false);
+    for (const element of [chrome, pause]) {
+      assert.equal(element.style.getPropertyValue('opacity'), '0');
+      assert.equal(element.style.getPropertyPriority('opacity'), 'important');
+      assert.equal(element.style.getPropertyValue('visibility'), 'hidden');
+      assert.equal(element.style.getPropertyValue('transition'), 'none');
+    }
+  }
+  b.top.run('window.CupitorYouTubeControls.setVisible(true)');
+  b.flush();
+  assert.equal(chrome.style.getPropertyValue('opacity'), '1');
+  assert.equal(pause.style.getPropertyValue('opacity'), '1', 'restore latest player styles');
+  assert.equal(pause.style.getPropertyValue('transition'), 'opacity 1s');
+});
+
+test('new and replacement controls stay hidden; video and captions retain their styles', () => {
+  const b = browser();
+  const yt = b.frame('https://www.youtube.com/embed/one');
+  const video = yt.control('html5-main-video', {opacity: '1'});
+  const captions = yt.control('ytp-caption-window-container', {visibility: 'visible'});
+  const old = yt.control('ytp-chrome-bottom');
+  b.top.run('window.CupitorYouTubeControls.setVisible(false)');
+  b.flush();
+  old.isConnected = false;
+  const replacement = yt.control('ytp-chrome-bottom');
+  const bezel = yt.control('ytp-bezel');
+  yt.mutate();
+  assert.equal(old.style.getPropertyValue('opacity'), '', 'release detached controls');
+  assert.equal(replacement.style.getPropertyValue('opacity'), '0');
+  assert.equal(bezel.style.getPropertyValue('opacity'), '0');
+  assert.equal(video.style.getPropertyValue('opacity'), '1');
+  assert.equal(captions.style.getPropertyValue('visibility'), 'visible');
+  const style = yt.root.children[0];
+  const css = style.textContent;
+  style.textContent = '';
+  yt.mutate();
+  assert.equal(style.textContent, css, 'restore a stylesheet cleared by player rebuilds');
+});
+
+test('overrides stop when an element no longer represents a control and settle without repeated writes', () => {
+  const b = browser();
+  const yt = b.frame('https://www.youtube.com/embed/one');
+  const chrome = yt.control('ytp-chrome-top', {opacity: '0.8'});
+  b.top.run('window.CupitorYouTubeControls.setVisible(false)');
+  b.flush();
+  const writes = chrome.writes;
+  for (let i = 0; i < 20; i++) yt.mutate();
+  assert.equal(chrome.writes, writes, 'observer callbacks must not produce a write loop');
+  chrome.className = 'unrelated-content';
+  yt.mutate();
+  assert.equal(chrome.style.getPropertyValue('opacity'), '0.8');
+  assert.equal(chrome.style.getPropertyPriority('opacity'), '');
 });

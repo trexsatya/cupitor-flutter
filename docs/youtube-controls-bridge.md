@@ -52,6 +52,14 @@ The requested state defaults to visible on each top-level page load. It is
 sent to existing YouTube iframes immediately and to new/reloaded iframes when
 their injected script announces readiness. Both `youtube.com/embed/…` and
 `youtube-nocookie.com/embed/…` are supported, including their `www` hosts.
+New iframe documents keep controls hidden until that handshake completes, so
+replacing the player while hidden does not briefly reveal its controls.
+
+Once hidden, controls stay hidden through player class/style changes, inline
+`!important` declarations, transitions, and control element replacement. The
+bridge enforces the current state on the controls themselves and restores the
+player's latest styles when they are shown again. Playback feedback icons are
+covered too. Showing/hiding remains exclusively controlled by the webapp API.
 
 Only YouTube embed frames in **dialog1** receive the style override. Video,
 poster images, captions, loading indicators and error messages are preserved.
@@ -64,3 +72,14 @@ Run the self-contained bridge protocol tests with:
 ```sh
 node --test test/js/youtube_controls.test.mjs
 ```
+
+CI also runs Chromium regression tests against cross-origin player fixtures.
+To run them locally with an installed Chrome binary:
+
+```sh
+npm install --prefix /tmp/cupitor-browser-tests --no-package-lock --ignore-scripts playwright-core@1.62.1
+NODE_PATH=/tmp/cupitor-browser-tests/node_modules CUPITOR_CHROME_PATH=/usr/bin/google-chrome node --test test/browser/youtube_controls.test.cjs
+```
+
+These exercise the actual CSS cascade and mutation observer in Chrome;
+physical Android/WebView playback verification is separate.

@@ -98,6 +98,17 @@ jobs:
         # and jsdom. This reader test is self-contained in the Flutter repo.
         run: node --test test/js/reader_selection.test.mjs test/js/youtube_controls.test.mjs
 
+      - name: Test YouTube control visibility in Chrome
+        # ubuntu-24.04 includes Google Chrome. Use it without downloading
+        # another browser; playwright-core does not install browser binaries.
+        env:
+          CUPITOR_CHROME_PATH: /usr/bin/google-chrome
+        shell: bash
+        run: |
+          cupitor_browser_tests="$RUNNER_TEMP/cupitor-browser-tests"
+          npm install --prefix "$cupitor_browser_tests" --no-package-lock --ignore-scripts playwright-core@1.62.1
+          NODE_PATH="$cupitor_browser_tests/node_modules" node --test test/browser/youtube_controls.test.cjs
+
       # PRs and manual runs on other branches never receive signing secrets.
       - name: Configure release signing
         id: signing
