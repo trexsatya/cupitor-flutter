@@ -83,6 +83,38 @@ const test = (name, fn) => tests.push({ name, fn });
 
 // ── hold / release on their own ────────────────────────────────────────────
 
+test('local audio pauses for lookup and resumes on release', async () => {
+  const { window, document } = boot('<audio id="a"></audio>');
+  const a = document.getElementById('a');
+  a.play(); await tick();
+  window.eval(HOLD); await tick();
+  assert.equal(a.paused, true);
+  window.eval(RELEASE); await tick();
+  assert.equal(a.paused, false);
+});
+
+test('Spotify lookup holds its adapter once and resumes through its own player controls', async () => {
+  const {window, document} = boot('<div data-testid="now-playing-widget"><a href="/track/abc123">Track</a></div>' +
+    '<button data-testid="control-button-playpause" aria-label="Pause"></button><audio id="backing"></audio>');
+  const backing = document.getElementById('backing');
+  backing.play(); await tick();
+  const button = document.querySelector('button');
+  let toggles = 0;
+  button.onclick = () => {
+    toggles++;
+    button.setAttribute('aria-label', button.getAttribute('aria-label') === 'Pause' ? 'Play' : 'Pause');
+  };
+  window.eval(fs.readFileSync(path.join(path.dirname(SIDEBAR_SRC), '25-spotify-player.js'), 'utf8'));
+  const adapter = window.__cupShared.createSpotifyPlayer();
+  window.__cupCaptionPlayer = adapter;
+  window.eval(HOLD); await tick();
+  assert.equal(adapter.paused, true);
+  assert.equal(window.__cupLookupHeld.length, 1, 'hidden backing audio is not held a second time');
+  window.eval(RELEASE); await tick();
+  assert.equal(adapter.paused, false);
+  assert.equal(toggles, 2);
+});
+
 test('given a playing video, when held, then it pauses; when released, it plays again', async () => {
   const { window, document } = boot('<video id="a"></video>');
   const a = video(document, 'a');

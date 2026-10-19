@@ -17,15 +17,17 @@
 /// the dialog.
 library;
 
-// Every <video> in the page and its same-origin iframes.
+// Native media, or the subtitle panel's Spotify player adapter. The adapter
+// owns Spotify playback, so do not also hold its hidden backing media twice.
 const String _videosJs = '''
 function __cupLookupVideos() {
-  var out = [].slice.call(document.querySelectorAll('video'));
+  var adapted = window.__cupCaptionPlayer;
+  var out = adapted ? [adapted] : [].slice.call(document.querySelectorAll('video, audio'));
   var frames = document.querySelectorAll('iframe');
   for (var i = 0; i < frames.length; i++) {
     try {
       var d = frames[i].contentDocument;
-      if (d) out = out.concat([].slice.call(d.querySelectorAll('video')));
+      if (d) out = out.concat([].slice.call(d.querySelectorAll('video, audio')));
     } catch (e) {}
   }
   return out;
