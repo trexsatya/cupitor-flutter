@@ -40,6 +40,28 @@ flutter test test/docx_document_test.dart test/docx_reader_test.dart
 
 ## YouTube subtitle sidebar
 
+The SRT panel also has **Open SRT** for local subtitle files on supported video
+pages and in the Spotify Web Player (`open.spotify.com`) inside Cupitor. Choose
+an `.srt` file from device storage; importing replaces the current transcript
+without starting playback or seeking. Set its language with the panel's
+existing source-language setting. UTF-8, UTF-16 and Latin-1 files are supported.
+
+On Spotify the panel follows the playing track or episode while you browse,
+supports cue seeking, previous/next, translation, replay and selected-line
+capture, and leaves the bottom playback controls visible. Playback speeds
+depend on the underlying player; Spotify Connect playback has no local speed
+control. Changing tracks clears the previous timeline, and choosing a file
+after its media has changed is rejected. Local tracks use the same last-five
+tab-session restore policy; **Clear transcript** removes the saved track.
+
+This needs the companion shared-panel update in
+`trexsatya/trexsatya.github.io` (`db/js/src/20-caption-sidebar.js`,
+`25-spotify-player.js`, `30-caption-sites.js`, `70-caption-capture.js` and the
+regenerated `db/js/snippet.js`). Both app and panel updates must be installed
+for **Open SRT** to appear. The device picker is exposed through the
+`LocalSubtitles` channel and returns JSON via `__cupLocalSubtitlesResult`;
+request ids keep late picker results from attaching to another media item.
+
 Open a YouTube video in the app's main browser and tap **⤓CC** in the subtitle
 sidebar. Cupitor reuses its existing YouTube download flow: choose a caption
 track, download it, then use the complete transcript beside the player.

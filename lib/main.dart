@@ -33,6 +33,7 @@ import 'ai_prompt.dart';
 import 'youtube_urls.dart';
 import 'youtube_controls.dart';
 import 'youtube_sidebar_subtitles.dart';
+import 'local_subtitles.dart';
 import 'stable_dialog_chrome.dart';
 import 'dialog_app_lifecycle.dart';
 import 'mac_webview.dart';
@@ -788,6 +789,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('CaptionCollector', onMessageReceived: (msg) => _handleCaptionCollector(c, msg))
         ..addJavaScriptChannel('YouTubeSubtitles',
             onMessageReceived: (msg) => _downloadYouTubeSubtitlesForPage(c, msg))
+        ..addJavaScriptChannel('LocalSubtitles',
+            onMessageReceived: (msg) => _openLocalSubtitlesForPage(c, msg))
         ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
         ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
         ..addJavaScriptChannel('AdHostDetector', onMessageReceived: (msg) => _onJsAdHostDetected(msg.message))
@@ -6732,6 +6735,71 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String? _extractYouTubeVideoId(String input) => youtubeSubtitleVideoId(input);
 
   bool _youtubeSidebarDownloadBusy = false;
+
+  bool _localSubtitleImportBusy = false;
+
+  Future<void> _openLocalSubtitlesForPage(
+      WebViewController page, JavaScriptMessage message) async {
+    if (!mounted || !identical(page, _controller)) return;
+    Object? request;
+    try { request = jsonDecode(message.message); } catch (_) { return; }
+    if (request is! Map || request['op'] != 'open' ||
+        request['requestId'] is! String ||
+        (request['requestId'] as String).length > 128) {
+      return;
+    }
+    final requestId = request['requestId'] as String;
+    Future<void> cancel() async {
+      if (mounted && identical(page, _controller)) {
+        await page.runJavaScript(localSubtitleResultJs({
+          'requestId': requestId, 'cancelled': true,
+        }));
+      }
+    }
+    if (_localSubtitleImportBusy) { await cancel(); return; }
+    _localSubtitleImportBusy = true;
+    try {
+      final picked = await FilePicker.platform.pickFiles(
+        dialogTitle: 'Open SRT subtitles',
+        type: FileType.custom,
+        allowedExtensions: const ['srt'],
+        allowMultiple: false,
+        withData: true,
+      );
+      if (picked == null || picked.files.isEmpty) { await cancel(); return; }
+      final file = picked.files.single;
+      if (file.size > maxLocalSubtitleBytes) {
+        throw const FormatException('The SRT file is larger than 10 MB.');
+      }
+      final bytes = file.bytes ??
+          (file.path != null ? await File(file.path!).readAsBytes() : null);
+      if (bytes == null) throw const FormatException('The file could not be read.');
+      final lines = await compute(parseLocalSrt, decodeLocalSubtitles(bytes));
+      if (lines.isEmpty) {
+        throw const FormatException('No valid subtitle cues were found in this SRT file.');
+      }
+      if (!mounted || !identical(page, _controller)) return;
+      final language = request['lang'] is String
+          ? request['lang'] as String : _selectedLanguage;
+      final accepted = await page.runJavaScriptReturningResult(localSubtitleResultJs({
+        'requestId': requestId,
+        'fileName': file.name,
+        'lang': language,
+        'lines': lines,
+      }));
+      if (accepted.toString() != 'true') {
+        _showCaptureError('Could not attach subtitles',
+            'The media changed while the file picker was open. Open the SRT file again for the current item.');
+      }
+    } catch (error) {
+      try { await cancel(); } catch (_) {}
+      if (mounted && identical(page, _controller)) {
+        _showCaptureError('Could not open SRT file', '$error');
+      }
+    } finally {
+      _localSubtitleImportBusy = false;
+    }
+  }
 
   Future<void> _downloadYouTubeSubtitlesForPage(
       WebViewController page, JavaScriptMessage message) async {
