@@ -36,6 +36,7 @@ import 'youtube_sidebar_subtitles.dart';
 import 'local_subtitles.dart';
 import 'stable_dialog_chrome.dart';
 import 'dialog_app_lifecycle.dart';
+import 'spotify_clip_bridge.dart';
 import 'mac_webview.dart';
 import 'history_store.dart';
 import 'history_screen.dart';
@@ -188,6 +189,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String? _lastLoadedUrl;
   WebViewController? dialogController;
   late final DialogAppLifecycleBridge _dialogAppLifecycle;
+  late final SpotifyClipBridge _spotifyClipBridge;
+  late final Future<String> _spotifyClipScript;
+  bool _showingSpotifyClipPage = false;
   final TextEditingController _urlController = TextEditingController(text: 'https://google.com');
   /// Owned here rather than left to the TextField, because
   /// [RawAutocomplete] needs the same node to know when to show and hide
@@ -521,6 +525,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     ProfileService.active.removeListener(_onProfileChanged);
     WidgetsBinding.instance.removeObserver(this);
     _dialogAppLifecycle.dispose();
+    _spotifyClipBridge.dispose();
     SpeechHub.release(_speechHubListener);
     _videoNotePoller.dispose();
     HardwareKeyboard.instance.removeHandler(_onMacFullscreenEscape);
@@ -587,6 +592,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    unawaited(_spotifyClipBridge.setForeground(state == AppLifecycleState.resumed));
     if (state == AppLifecycleState.resumed) {
       WakelockPlus.enable();
       if (_pendingVoiceResumeDialog) {
@@ -625,6 +631,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _spotifyClipScript = rootBundle.loadString('assets/js/spotify_clip.js');
+    _spotifyClipBridge = SpotifyClipBridge(openPage: _spotifyPageForClip, send: (detail) async {
+      final ctrl = dialogController;
+      if (mounted && ctrl != null) {
+        await ctrl.runJavaScript("window.dispatchEvent(new CustomEvent('cupitorSpotifyClip', {detail: ${jsonEncode(detail)}}));");
+      }
+    });
     _dialogAppLifecycle = DialogAppLifecycleBridge(send: (script) async {
       final ctrl = dialogController;
       if (mounted && ctrl != null) await ctrl.runJavaScript(script);
@@ -956,6 +969,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // manifest endpoint). The snippet self-guards against duplicate
               // installs, so re-running on every navigation is safe.
               _injectRemoteSnippetEarly();
+              unawaited(_injectSpotifyClip(c));
             },
             onPageFinished: (url) {
               if (identical(c, _controller)) _pageLoading.finished();
@@ -994,6 +1008,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _restoreScrollPosition(url);
               _injectRemoteSnippet();
               _injectScrollDiag(c, 'main');
+              unawaited(_injectSpotifyClip(c));
             },
           ),
         );
@@ -2714,6 +2729,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (cached != null && cached.trim().isNotEmpty) {
       _frameScriptSource = cached;
       _reportFrameAgent('stored copy -> ${await _registerFrameScript(cached)}');
+    } else {
+      // The packaged Spotify hook must precede the first Audio() creation,
+      // even when the remote frame agent has no cached copy or is offline.
+      _reportFrameAgent('Spotify bridge -> ${await _registerFrameScript("", completeReady: false)}');
     }
 
     final fresh = await _fetchFrameScript();
@@ -2772,7 +2791,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// on each WebView as that WebView enters the view tree, which is earlier
   /// than anything reachable from here. This then polls a cheap status call
   /// rather than re-sending the script, which is 40KB a time over the channel.
-  Future<String> _registerFrameScript(String script) async {
+  Future<String> _registerFrameScript(String script, {bool completeReady = true}) async {
+    script = '${await _spotifyClipScript}\n$script';
     String armed;
     try {
       armed = await _permsChannel.invokeMethod<String>(
@@ -2786,7 +2806,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // Nothing to wait for: either it is already on, or this WebView will never
     // support it and waiting would only delay the page for nothing.
     if (!armed.startsWith('armed')) {
-      if (!_frameScriptReady.isCompleted) _frameScriptReady.complete();
+      if (completeReady && !_frameScriptReady.isCompleted) _frameScriptReady.complete();
       return armed;
     }
     var waitMs = 10;
@@ -2800,13 +2820,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         break;
       }
       if (count > 0) {
-        if (!_frameScriptReady.isCompleted) _frameScriptReady.complete();
+        if (completeReady && !_frameScriptReady.isCompleted) _frameScriptReady.complete();
         return 'registered on $count webview(s) after ${attempt + 1} check(s)';
       }
     }
     // Give up waiting rather than hold the page hostage to a feature that is
     // only ever an improvement on it.
-    if (!_frameScriptReady.isCompleted) _frameScriptReady.complete();
+    if (completeReady && !_frameScriptReady.isCompleted) _frameScriptReady.complete();
     return 'armed, but no webview took it in time';
   }
 
@@ -5087,7 +5107,62 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return word;
   }
 
-  void _openDialog2WithWebview(String url) {
+  Future<void> _injectSpotifyClip(WebViewController page) async {
+    try {
+      final script = await _spotifyClipScript;
+      if (mounted) await page.runJavaScript(script);
+    } catch (error) { debugPrint('[spotify-clip] $error'); }
+  }
+
+  Future<SpotifyClipPage> _spotifyPageForClip(String url, bool Function() isCurrent) async {
+    WebViewController? page;
+    String? dialogId;
+    if (_isControllerReady) {
+      final address = await _controller.currentUrl().timeout(const Duration(seconds: 3));
+      if (!isCurrent()) throw StateError("Spotify cue superseded");
+      if (Uri.tryParse(address ?? '')?.host == 'open.spotify.com') page = _controller;
+    }
+    if (page == null) {
+      for (final entry in _dialog2Controllers.entries.toList().reversed) {
+        final address = await entry.value.currentUrl().timeout(const Duration(seconds: 3));
+        if (!isCurrent()) throw StateError("Spotify cue superseded");
+        if (Uri.tryParse(address ?? '')?.host == 'open.spotify.com') {
+          page = entry.value; dialogId = entry.key; break;
+        }
+      }
+    }
+    if (!isCurrent()) throw StateError("Spotify cue superseded");
+    if (page == null) {
+      dialogId = _openDialog2WithWebview(url);
+      page = _dialog2Controllers[dialogId]!;
+    } else {
+      final address = await page.currentUrl().timeout(const Duration(seconds: 3));
+      if (!isCurrent()) throw StateError("Spotify cue superseded");
+      if (spotifyEpisodeId(address) != spotifyEpisodeId(url)) await page.loadRequest(Uri.parse(url));
+    }
+    final target = page;
+    final panel = dialogId;
+    // The managed clip now owns this page. Closing the capture/lookup dialog
+    // must not replay its old held position after the clip has finished.
+    if (identical(_lookupHoldController, target)) _lookupHoldController = null;
+    return SpotifyClipPage(identity: target,
+      install: () => _injectSpotifyClip(target),
+      evaluate: (script) => target.runJavaScriptReturningResult(script).timeout(const Duration(seconds: 3)),
+      show: () async {
+        if (panel != null) {
+          if (_minimizedDialog2s.contains(panel)) _showDialog2(panel);
+        } else {
+          final route = _dialog1Route;
+          if (_dialog1Visible && route != null && route.isActive && mounted) {
+            _showingSpotifyClipPage = true;
+            setState(() { _dialog1Minimized = true; _dialog1EverMinimized = true; });
+            Navigator.of(context).removeRoute(route);
+          }
+        }
+      });
+  }
+
+  String _openDialog2WithWebview(String url) {
     // Pre-rewrite YouTube URLs to the chosen front-end. Cheap to call when no
     // front-end is configured (returns null).
     url = _rewriteYouTubeUrl(url) ?? url;
@@ -5135,6 +5210,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         onPageStarted: (_) {
           errorNotifier.value = null;
           _injectYouTubeAdBlocker(dialog2Controller);
+          unawaited(_injectSpotifyClip(dialog2Controller));
         },
         onWebResourceError: (error) {
           if (error.isForMainFrame == true) {
@@ -5147,6 +5223,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           // Auto-unmute any YouTube/HTML5 media that autoplayed muted.
           dialog2Controller.runJavaScript(_autoUnmuteYouTubeJs);
           _injectScrollDiag(dialog2Controller, 'dialog2:$dialogIdForBridge');
+          unawaited(_injectSpotifyClip(dialog2Controller));
           if (_isFilmotUrl(finishedUrl)) {
             _injectFilmotHelper(dialog2Controller);
           }
@@ -5190,6 +5267,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _showDialog2(dialogId);
     // Same reason as dialog1: a WebView that did not exist a moment ago.
     _installRenderGuardSoon();
+    return dialogId;
   }
 
   void _showDialog2(String dialogId) {
@@ -5261,6 +5339,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// cannot keep working in the background after the dialog is dismissed.
   /// Safe to call even if the platform view has already been detached.
   void _shutdownDialogWebView(WebViewController controller) {
+    _spotifyClipBridge.pageClosed(controller);
     try {
       controller.runJavaScript(
         r'try{document.querySelectorAll("video,audio").forEach(function(v){try{v.pause();v.removeAttribute("src");v.load();}catch(e){}});}catch(e){}'
@@ -8574,6 +8653,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // (_handleTranslateRequest → window.__cupTranslated) is shared.
         ..addJavaScriptChannel('TranslateRequest', onMessageReceived: _handleTranslateRequest)
         ..addJavaScriptChannel('LinkLongPress', onMessageReceived: (msg) => _handleLinkLongPress(msg.message))
+        ..addJavaScriptChannel('SpotifyClipBridge', onMessageReceived: (msg) {
+          if (mounted && identical(ctrl, dialogController)) {
+            unawaited(_spotifyClipBridge.handle(msg.message));
+          }
+        })
         // Language-app ↔ Cupitor bridge for the playlist feature.
         //   { op: 'getPlaylists' } → Cupitor pushes the full playlists
         //     payload as a `cupitorPlaylists` CustomEvent.
@@ -8615,6 +8699,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               }
               _injectYouTubeAdBlocker(dialogController);
               if (identical(ctrl, dialogController)) {
+                unawaited(_spotifyClipBridge.stop());
                 _dialog1Loaded = false;
                 _dialog1Loading = true;
                 _dialog1LoadFailed = false;
@@ -8834,6 +8919,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _dialog1Visible = false;
       _dialog1Route = null;
       _dialog1FullscreenNotifier.value = false;
+      final showingSpotify = _showingSpotifyClipPage;
+      _showingSpotifyClipPage = false;
+      if (!showingSpotify) unawaited(_spotifyClipBridge.stop());
       _releaseVideosAfterLookup();
       // Release the mic, and ANSWER the page rather than tearing down
       // silently: the controller deliberately outlives the dialog (and this
@@ -8853,7 +8941,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // The controller stays alive across opens, so a fresh listener
       // isn't required after every show.
       try {
-        dialogController?.runJavaScript(
+        if (!showingSpotify) dialogController?.runJavaScript(
           "window.dispatchEvent(new CustomEvent('cupitorDialog1Closed'));",
         );
       } catch (_) { /* page may not have finished loading — ignore */ }
