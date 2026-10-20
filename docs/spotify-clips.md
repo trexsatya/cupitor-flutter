@@ -44,6 +44,7 @@ and host disposal stop managed playback.
 
 ```sh
 dart tool/test_spotify_clip_bridge.dart
+flutter test test/spotify_clip_bridge_test.dart
 dart analyze lib/spotify_clip_bridge.dart tool/test_spotify_clip_bridge.dart tool/spotify_clip_fixture.dart
 CUPITOR_JSDOM=/path/to/node_modules/jsdom node --test test/js/spotify_clip.test.mjs
 ```
