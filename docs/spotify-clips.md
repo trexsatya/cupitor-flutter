@@ -8,7 +8,9 @@ The host reuses an existing Spotify WebView, loading the requested episode when
 needed, or opens the normal Spotify dialog when none exists. The study page
 sends a unique `sessionId`, the episode URL, and numeric `start`/`end` seconds.
 The packaged agent seeks while paused, confirms the observed position, and
-then accepts Play. A 50 ms guard inside Spotify pauses at the end independently
+then accepts Play. Selecting a different episode activates its page Play button
+with backing audio muted until the paused seek is confirmed. A 50 ms guard inside
+Spotify pauses at the end independently
 of dialog1. Native polling sends playback progress and completion to the queue.
 Separate selected passages receive separate sessions; stale commands cannot
 seek, resume or stop the next passage.

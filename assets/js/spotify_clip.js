@@ -340,14 +340,35 @@
   const shared = window.__cupShared;
   const player = shared.createSpotifyPlayer();
   let active = null, timer = null;
+  const gated = new Map();
+  // Selecting another episode can start its backing Audio before Spotify
+  // reports a seekable timeline. Keep that startup inaudible until the
+  // requested start has actually been observed.
+  const mediaProto = window.HTMLMediaElement?.prototype;
+  const originalPlay = mediaProto?.play;
+  if (originalPlay) mediaProto.play = function (...args) {
+    if (active && !active.ready) {
+      if (!gated.has(this)) gated.set(this, this.muted);
+      this.muted = true;
+    }
+    return originalPlay.apply(this, args);
+  };
+  function releaseGate({pauseFirst = false} = {}) {
+    for (const [media, muted] of gated) {
+      if (pauseFirst) {try {media.pause();} catch (_) {}}
+      media.muted = muted;
+    }
+    gated.clear();
+  }
   const episode = value => /(?:\/episode\/|spotify:episode:)([A-Za-z0-9]{22})(?:[/?#]|$)/.exec(value || '')?.[1];
   const current = state => active === state;
   const paused = () => player.observedPaused;
   function pause() {try {player.pause();} catch (_) {}}
-  function error(state, text) {state.error = text; state.pendingPlay = false; pause();}
+  function error(state, text) {state.error = text; state.pendingPlay = false; pause(); releaseGate({pauseFirst: true});}
   function play(state) {
     if (!current(state) || state.complete || state.error || state.seeking) return;
     state.pendingPlay = false;
+    releaseGate();
     try {Promise.resolve(player.play()).catch(() => {});} catch (_) {}
   }
   function seek(state, time) {
@@ -362,6 +383,13 @@
       const time = player.observedCurrentTime, actualPaused = paused(), clock = Date.now();
       const mediaId = episode(shared.spotifyMediaUrl());
       if (state.complete || state.error) {if (!actualPaused) pause(); return;}
+      if (!state.ready && !state.activated && episode(location.href) === state.episode) {
+        const button = document.querySelector('main [data-testid="play-button"]:not(:disabled), [data-testid="play-button"]:not(:disabled)');
+        const label = button && (button.getAttribute('aria-label') || button.title || button.textContent || '');
+        if (button && !/pause|paus|pausa|暂停|一時停止|일시.*정지/i.test(label)) {
+          state.activated = true; button.click(); return;
+        }
+      }
       if (mediaId !== state.episode) {
         if (state.ready) error(state, 'Spotify changed to a different episode.');
         else if (clock - state.seekAt > 20000) error(state, 'Spotify has not connected the requested episode.');
@@ -370,6 +398,7 @@
       if (state.seeking) {
         if (Number.isFinite(time) && Math.abs(time - state.seekTarget) <= 0.25 && time < state.end && actualPaused) {
           state.seeking = false; state.ready = true; state.lastProgressAt = clock;
+          releaseGate({pauseFirst: true});
           if (state.pendingPlay) play(state);
         } else if (clock - state.seekAt > 20000) {
           error(state, 'Spotify could not reach the clip timestamp.');
@@ -399,7 +428,7 @@
       duration: player.duration * 1000, isPaused: paused(), isBuffering: false};
   }
   function stop() {
-    pause(); active = null;
+    pause(); releaseGate({pauseFirst: true}); active = null;
     if (timer != null) clearInterval(timer);
     timer = null; window.__cupSpotifyManagedClip = null;
   }

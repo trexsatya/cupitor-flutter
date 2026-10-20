@@ -15,7 +15,7 @@ export function spotifyPage({session = false} = {}) {
   const {window: win} = dom;
   win.console = {log() {}, warn() {}, error() {}};
   let clock = 10000, serial = 0;
-  const timers = new Map();
+  const timers = new Map(), starts = [];
   win.Date.now = () => clock;
   win.setInterval = fn => {timers.set(++serial, fn); return serial;};
   win.clearInterval = key => timers.delete(key);
@@ -25,7 +25,7 @@ export function spotifyPage({session = false} = {}) {
     readyState: {configurable: true, get() {return 4;}},
     paused: {configurable: true, get() {return this._paused !== false;}},
   });
-  proto.play = function () {this._paused = false; return Promise.resolve();};
+  proto.play = function () {starts.push({media: this, position: this.currentTime, muted: this.muted}); this._paused = false; return Promise.resolve();};
   proto.pause = function () {this._paused = true;}; proto.load = function () {};
   let ms;
   if (session) {
@@ -38,7 +38,7 @@ export function spotifyPage({session = false} = {}) {
   const command = packet => win.__cupSpotifyClipAgent.command(packet);
   const cue = (sessionId = 'one', start = 12.52, end = 14.16) => command({op: 'cue', sessionId, url, start, end});
   const tick = (elapsed = 100) => {clock += elapsed; for (const fn of [...timers.values()]) fn();};
-  return {win, ms, command, cue, tick, close: () => win.close()};
+  return {win, ms, command, cue, tick, starts, close: () => win.close()};
 }
 
 test('the Spotify WebView pauses detached Audio at the end without another study-page poll', async () => {
@@ -65,6 +65,40 @@ test('paused time does not finish a clip or trigger an automatic resume', async 
     assert.equal(f.command({op: 'state', sessionId: 'one'}).complete, false); assert.equal(audio.paused, true);
     f.command({op: 'play', sessionId: 'one'}); audio.currentTime = 14.16; f.tick();
     assert.equal(f.command({op: 'state', sessionId: 'one'}).complete, true); assert.equal(audio.paused, true);
+  } finally {f.close();}
+});
+
+test('selecting a different episode stays muted until its real clock reaches the clip start', () => {
+  const f = spotifyPage();
+  try {
+    f.win.document.body.innerHTML = '<main><button data-testid="play-button" aria-label="Play episode">Play</button></main>' +
+      '<div data-testid="now-playing-widget"><a href="/episode/7makk4oTQel546B0PZlDM5">Other episode</a></div>';
+    let audio;
+    f.win.document.querySelector('button').onclick = () => {
+      audio = new f.win.Audio(); audio.currentTime = 0; audio.play();
+      f.win.document.querySelector('a').href = url;
+    };
+    f.cue();
+    assert.ok(audio, 'the requested episode is activated');
+    assert.equal(f.starts[0].position, 0); assert.equal(f.starts[0].muted, true, 'initial playback is inaudible');
+    f.tick(); f.tick();
+    assert.equal(audio.currentTime, 12.52); assert.equal(audio.paused, true); assert.equal(audio.muted, false, 'mute is released only after the confirmed paused seek');
+    f.command({op: 'play', sessionId: 'one'}); f.tick();
+    assert.equal(audio.muted, false); assert.equal(audio.paused, false);
+    assert.equal(f.starts.at(-1).position, 12.52);
+    audio.currentTime = 14.16; f.tick(); assert.equal(audio.paused, true);
+  } finally {f.close();}
+});
+
+test('cancelling an episode activation pauses and unmutes its backing media', () => {
+  const f = spotifyPage();
+  try {
+    f.win.document.body.innerHTML = '<main><button data-testid="play-button">Play</button></main>';
+    let audio;
+    f.win.document.querySelector('button').onclick = () => {audio = new f.win.Audio(); audio.play();};
+    f.cue(); assert.equal(audio.muted, true);
+    f.command({op: 'stop', sessionId: 'one'});
+    assert.equal(audio.paused, true); assert.equal(audio.muted, false);
   } finally {f.close();}
 });
 
