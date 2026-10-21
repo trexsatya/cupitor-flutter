@@ -483,7 +483,8 @@ class NotifDao {
   /// Most-recent fire events for [profileId]'s items, newest first — the
   /// webapp's notification feed. Items/lists deleted since cascade away
   /// automatically.
-  Future<List<NotifFeedEntry>> recentEvents(int profileId, int limit) async =>
+  Future<List<NotifFeedEntry>> recentEvents(int profileId, int limit,
+          {bool includeUnread = false}) async =>
       (await db.rawQuery('''
         SELECT e.id AS eid, e.item_id, e.fired_at, e.responded_at, e.grade,
                e.source, l.external_key AS lek, l.name AS lname,
@@ -493,9 +494,19 @@ class NotifDao {
         JOIN notif_items i ON i.id = e.item_id
         JOIN notif_lists l ON l.id = i.list_id
         WHERE l.profile_id = ?
+        ${includeUnread ? '''
+          AND (e.responded_at IS NULL OR e.id IN (
+            SELECT recent.id FROM notif_events recent
+            JOIN notif_items ri ON ri.id = recent.item_id
+            JOIN notif_lists rl ON rl.id = ri.list_id
+            WHERE rl.profile_id = ?
+            ORDER BY recent.fired_at DESC, recent.id DESC
+            LIMIT ?
+          ))
+        ''' : ''}
         ORDER BY e.fired_at DESC, e.id DESC
-        LIMIT ?
-      ''', [profileId, limit]))
+        ${includeUnread ? '' : 'LIMIT ?'}
+      ''', [profileId, if (includeUnread) profileId, limit]))
           .map((m) => NotifFeedEntry(
                 eventId: m['eid'] as int,
                 itemId: m['item_id'] as int,

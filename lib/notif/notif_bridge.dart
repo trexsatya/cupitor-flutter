@@ -408,7 +408,10 @@ class NotifBridge {
     final rawLimit = m['limit'];
     final limit =
         rawLimit is int && rawLimit > 0 && rawLimit <= 200 ? rawLimit : 50;
-    final entries = await d.recentEvents(activeProfileId(), limit);
+    // Keep the bounded recent history, plus every unread reminder when the
+    // webpage asks for a complete temporary study queue.
+    final entries = await d.recentEvents(activeProfileId(), limit,
+        includeUnread: m['include_unread'] == true);
     emit('cupitorNotifFeed', {
       'version': 1,
       'notifications': [

@@ -434,4 +434,42 @@ void main() {
       expect(lastAck()['error'], 'bad_grade');
     });
   });
+
+  test('notification feed includes all unread outside bounded recent history', () async {
+    await createFrenchList();
+    final list = (await dao.listByExternalKey(1, 'fr-1'))!;
+    final item = (await dao.itemsForList(list.id)).first;
+    await dao.insertEvent(itemId: item.id, firedAt: 1);
+    await dao.insertEvent(itemId: item.id, firedAt: 2);
+    for (var i = 3; i <= 302; i++) {
+      await dao.insertEvent(itemId: item.id, firedAt: i, respondedAt: 400);
+    }
+    await bridge.handle(jsonEncode({
+      'op': 'getNotifications', 'request_id': 'bounded', 'limit': 50,
+    }));
+    var rows = lastEvent('cupitorNotifFeed')!['notifications'] as List;
+    expect(rows, hasLength(50));
+    expect(rows.every((e) => (e as Map)['responded_at'] != null), isTrue);
+
+    await bridge.handle(jsonEncode({
+      'op': 'getNotifications', 'request_id': 'complete',
+      'limit': 50, 'include_unread': true,
+    }));
+    rows = lastEvent('cupitorNotifFeed')!['notifications'] as List;
+    expect(lastAck()['ok'], isTrue);
+    expect(rows, hasLength(52));
+    expect(rows.take(50).map((e) => (e as Map)['fired_at']),
+        orderedEquals(List.generate(50, (i) => 302 - i)));
+    expect(rows.skip(50).map((e) => (e as Map)['fired_at']),
+        orderedEquals([2, 1]));
+    expect(await dao.recentEvents(999, 50, includeUnread: true), isEmpty);
+
+    await dao.ackUnrespondedEvents(item.id, 500);
+    await bridge.handle(jsonEncode({
+      'op': 'getNotifications', 'request_id': 'read',
+      'limit': 50, 'include_unread': true,
+    }));
+    expect(lastEvent('cupitorNotifFeed')!['notifications'] as List, hasLength(50));
+  });
+
 }
