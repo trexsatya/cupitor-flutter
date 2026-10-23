@@ -44,6 +44,9 @@ object StudyCalls {
     const val CHANNEL = "cupitor_study_calls_v1"
     const val RING_MS = 45_000L
     const val MAX_HISTORY = 100
+    const val DEFAULT_PENDING_LIMIT = 50
+    const val MAX_PENDING_LIMIT = 5000
+    const val MAX_ARMED = 50
     private const val PERMISSION_REQUEST = 4301
     private var permissionReply: MethodChannel.Result? = null
     var visibleCallId: String? = null
@@ -51,9 +54,7 @@ object StudyCalls {
 
     fun install(activity: Activity, messenger: BinaryMessenger) {
         cancelObsoletePlaylistCalls(activity)
-        read(activity).filter { it.optString("status") == "scheduled" }.forEach {
-            try { arm(activity, it) } catch (_: Exception) {}
-        }
+        rearmBestEffort(activity)
         MethodChannel(messenger, "cupitor/study_calls").setMethodCallHandler { call, reply ->
             try {
                 val args = call.arguments as? Map<*, *> ?: emptyMap<Any, Any>()
@@ -67,7 +68,14 @@ object StudyCalls {
                         "answer_types" to listOf("choice", "text"),
                         "default_retries" to StudyCallAnswer.DEFAULT_RETRIES,
                         "batch_schedule" to true, "edit_scheduled" to true, "pending_controls" to true, "history_limit" to MAX_HISTORY,
+                        "settings" to true, "pending_limit" to pendingLimit(activity),
+                        "max_pending_limit" to MAX_PENDING_LIMIT, "armed_limit" to MAX_ARMED,
+                        "pending_count" to read(activity).count { it.optString("status") !in terminal },
                     ))
+                    "setSettings" -> {
+                        setPendingLimit(activity, args["pending_limit"])
+                        reply.success(mapOf("pending_limit" to pendingLimit(activity)))
+                    }
                     "requestPermission" -> {
                         if (Build.VERSION.SDK_INT >= 33 && permission(activity) != "granted") {
                             if (permissionReply != null) error("busy")
@@ -92,16 +100,17 @@ object StudyCalls {
                             it.optString("status") in setOf("ringing", "answered")
                         }) { "busy" }
                         val data = validate(args, profile, call.method == "callNow")
-                        check(read(activity).count { !terminal.contains(it.optString("status")) } < 50) { "too_many_calls" }
+                        check(read(activity).count { !terminal.contains(it.optString("status")) } < pendingLimit(activity)) { "too_many_calls" }
                         mutate(activity) { it.add(data) }
                         try {
                             if (call.method == "callNow") {
                                 fire(activity, data.getString("id"))
                                 activity.startActivity(screenIntent(activity, data.getString("id"), false))
-                            } else if (data.optString("status") == "scheduled") arm(activity, data)
+                            } else rearmScheduled(activity)
                         } catch (e: Exception) {
                             update(activity, data.getString("id")) { it.put("status", "cancelled") }
                             dismiss(activity, data.getString("id"))
+                            rearmBestEffort(activity)
                             throw e
                         }
                         reply.success(mapOf("id" to data.getString("id"), "exact" to exactAllowed(activity)))
@@ -134,6 +143,7 @@ object StudyCalls {
                         if (!terminal.contains(row.optString("status"))) {
                             update(activity, id) { it.put("status", "cancelled").put("finished_at", System.currentTimeMillis()) }
                             dismiss(activity, id)
+                            rearmBestEffort(activity)
                         }
                         reply.success(true)
                     }
@@ -145,19 +155,48 @@ object StudyCalls {
         }
     }
 
+    fun pendingLimit(context: Context): Int = context.getSharedPreferences("study_calls", Context.MODE_PRIVATE)
+        .getInt("pending_limit", DEFAULT_PENDING_LIMIT).coerceIn(1, MAX_PENDING_LIMIT)
+
+    fun setPendingLimit(context: Context, raw: Any?) {
+        val value = raw as? Number ?: error("bad_limit")
+        check(value.toDouble() == value.toInt().toDouble() && value.toInt() in 1..MAX_PENDING_LIMIT) { "bad_limit" }
+        check(context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).edit()
+            .putInt("pending_limit", value.toInt()).commit()) { "storage_error" }
+        // Lowering the limit never removes existing questions. It only blocks additions.
+    }
+
+    fun alarmPlan(context: Context): List<JSONObject> = read(context)
+        .filter { it.optString("status") == "scheduled" }
+        .sortedWith(compareBy<JSONObject> { it.optLong("when_ms") }.thenBy { it.optLong("created_at") })
+        .take(MAX_ARMED)
+
+    @Synchronized fun rearmScheduled(context: Context, armCall: (Context, JSONObject) -> Unit = ::arm) {
+        val rows = read(context)
+        rows.filter { it.optString("status") in setOf("scheduled", "disabled") }.forEach {
+            alarms(context).cancel(alarmIntent(context, it.getString("id")))
+        }
+        alarmPlan(context).forEach { armCall(context, it) }
+    }
+
+    fun rearmBestEffort(context: Context) {
+        try { rearmScheduled(context) } catch (_: Exception) {}
+    }
+
     @Synchronized fun scheduleBatch(context: Context, raw: Any?, profile: Int,
                                    armCall: (Context, JSONObject) -> Unit = ::arm): List<String> {
         val calls = raw as? List<*> ?: error("bad_payload")
-        check(calls.size in 1..50) { "bad_payload" }
+        check(calls.size in 1..MAX_PENDING_LIMIT) { "bad_payload" }
         // Validate every question/time before changing storage or arming anything.
         val added = calls.map { validate(it as? Map<*, *> ?: error("bad_payload"), profile, false) }
-        check(read(context).count { it.optString("status") !in terminal } + added.size <= 50) { "too_many_calls" }
+        check(read(context).count { it.optString("status") !in terminal } + added.size <= pendingLimit(context)) { "too_many_calls" }
         mutate(context) { it.addAll(added) }
-        try { added.filter { it.optString("status") == "scheduled" }.forEach { armCall(context, it) } }
+        try { rearmScheduled(context, armCall) }
         catch (e: Exception) {
             val ids = added.map { it.getString("id") }.toSet()
             added.forEach { dismiss(context, it.getString("id")) }
             mutate(context) { rows -> rows.removeAll { it.optString("id") in ids } }
+            rearmBestEffort(context)
             throw e
         }
         return added.map { it.getString("id") }
@@ -171,10 +210,10 @@ object StudyCalls {
         val replacement = validate(args, profile, false).put("id", id).put("created_at", old.getLong("created_at"))
         dismiss(context, id)
         mutate(context) { rows -> rows.removeAll { it.optString("id") == id }; rows.add(replacement) }
-        try { if (replacement.optString("status") == "scheduled") armCall(context, replacement) }
+        try { rearmScheduled(context, armCall) }
         catch (e: Exception) {
             mutate(context) { rows -> rows.removeAll { it.optString("id") == id }; rows.add(old) }
-            try { if (old.optString("status") == "scheduled") arm(context, old) } catch (_: Exception) {}
+            rearmBestEffort(context)
             throw e
         }
     }
@@ -187,8 +226,10 @@ object StudyCalls {
         val previous = JSONObject(old.toString())
         dismiss(context, id)
         update(context, id) { it.put("enabled", enabled).put("status", if (enabled) "scheduled" else "disabled") }
-        if (enabled) try { find(context, id)?.let { arm(context, it) } } catch (e: Exception) {
+        if (!enabled) { rearmBestEffort(context); return }
+        try { rearmScheduled(context) } catch (e: Exception) {
             mutate(context) { rows -> rows.removeAll { it.optString("id") == id }; rows.add(previous) }
+            rearmBestEffort(context)
             throw e
         }
     }
@@ -198,6 +239,7 @@ object StudyCalls {
         check(old.optString("status") in setOf("scheduled", "disabled")) { "not_scheduled" }
         dismiss(context, id)
         mutate(context) { rows -> rows.removeAll { it.optString("id") == id } }
+        rearmBestEffort(context)
     }
 
     fun cancelObsoletePlaylistCalls(context: Context) {
@@ -389,7 +431,7 @@ object StudyCalls {
                 settled = true
             }
         }
-        if (settled) dismiss(context, id)
+        if (settled) { dismiss(context, id); rearmBestEffort(context) }
     }
 
     /** Claim, grade and persist a final response together. Only an answered
@@ -433,7 +475,7 @@ object StudyCalls {
             if (!retry) row.put("status", if (correct == false) "failed" else "completed").put("finished_at", now)
             result = StudyCallResponse(correct, retry, attempts.length(), maxRetries + 1)
         }
-        if (result?.retry == false) dismiss(context, id)
+        if (result?.retry == false) { dismiss(context, id); rearmBestEffort(context) }
         return result
     }
 
@@ -453,6 +495,7 @@ object StudyCalls {
         }
         if (permission(context) != "granted") { finish(context, id, "missed"); return }
         update(context, id) { it.put("status", "ringing").put("fired_at", System.currentTimeMillis()) }
+        rearmBestEffort(context)
         val sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
         if (Build.VERSION.SDK_INT >= 26) {
             val channel = NotificationChannel(CHANNEL, "Study calls", NotificationManager.IMPORTANCE_HIGH)
@@ -492,9 +535,7 @@ class StudyCallReceiver : BroadcastReceiver() {
         try {
             if (intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) {
                 StudyCalls.cancelObsoletePlaylistCalls(context)
-                StudyCalls.read(context).filter { it.optString("status") == "scheduled" }.forEach {
-                    try { StudyCalls.arm(context, it) } catch (_: Exception) {}
-                }
+                StudyCalls.rearmBestEffort(context)
                 return
             }
             val id = intent.getStringExtra("id") ?: return

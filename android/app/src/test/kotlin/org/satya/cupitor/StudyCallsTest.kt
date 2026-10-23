@@ -227,4 +227,33 @@ class StudyCallsTest {
         assertEquals("disabled", StudyCalls.find(context, id)!!.getString("status"))
     }
 
+    @Test fun configuredLimitIsDurableGlobalAndLoweringItDoesNotDeleteCalls() {
+        assertEquals(50, StudyCalls.pendingLimit(context))
+        for (bad in listOf<Any?>(null, "500", 0, -1, 1.5, 5001, Double.NaN)) {
+            expectError("bad_limit") { StudyCalls.setPendingLimit(context, bad) }
+        }
+        StudyCalls.setPendingLimit(context, 500)
+        assertEquals(500, StudyCalls.pendingLimit(context))
+        val ids = StudyCalls.scheduleBatch(context, List(120) { futureArgs() + mapOf("enabled" to false) }, 7) { _, _ -> fail("disabled call armed") }
+        assertEquals(120, ids.size)
+        StudyCalls.setPendingLimit(context, 100)
+        assertEquals(120, StudyCalls.read(context).size)
+        expectError("too_many_calls") { StudyCalls.scheduleBatch(context, listOf(futureArgs()), 8) { _, _ -> } }
+    }
+
+    @Test fun rollingAlarmPlanOnlyArms50EarliestEnabledCallsAndRefills() {
+        StudyCalls.setPendingLimit(context, 200)
+        val start = System.currentTimeMillis() + 3600000L
+        val armed = mutableListOf<String>()
+        val ids = StudyCalls.scheduleBatch(context, (0 until 120).map { futureArgs() + mapOf("when_ms" to start + it * 60000L) }, 7) { _, row -> armed.add(row.getString("id")) }
+        assertEquals(ids.take(50), armed)
+        assertEquals(120, StudyCalls.read(context).size)
+        StudyCalls.setEnabled(context, ids[0], 7, false)
+        assertEquals(ids.subList(1, 51), StudyCalls.alarmPlan(context).map { it.getString("id") })
+        StudyCalls.removePending(context, ids[1], 7)
+        assertEquals(ids.subList(2, 52), StudyCalls.alarmPlan(context).map { it.getString("id") })
+        StudyCalls.finish(context, ids[2], "cancelled")
+        assertEquals(ids.subList(3, 53), StudyCalls.alarmPlan(context).map { it.getString("id") })
+    }
+
 }

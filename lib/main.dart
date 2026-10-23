@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'local_music.dart';
 import 'save_file.dart';
+import 'webview_file_picker.dart';
 import 'snippet_log_export.dart';
 import 'package:flutter/foundation.dart'
     show compute, debugPrint, defaultTargetPlatform, kIsWeb, TargetPlatform;
@@ -3307,6 +3308,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     try {
       final platform = controller.platform;
       if (platform is! AndroidWebViewController) return;
+      platform.setOnShowFileSelector((params) => pickWebViewFiles(params, onError: () {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not open the file picker. Please try again.')));
+      }));
       // Spotify, YouTube embeds, and most modern streaming sites refuse to
       // start audio if the WebView's `mediaPlaybackRequiresUserGesture` is
       // left at its default `true` — they treat the missing gesture as an

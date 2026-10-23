@@ -44,14 +44,15 @@ Operations:
 
 | Operation | Input | Result in `cupitorCallAck.data` |
 | --- | --- | --- |
-| `getCapabilities` | — | `supported`, `permission`, `full_screen`, `exact_alarms`, `speech_input`, `answer_types`, `default_retries`, `batch_schedule`, `edit_scheduled`, `pending_controls`, `history_limit` |
+| `getCapabilities` | — | `supported`, `permission`, `full_screen`, `exact_alarms`, `speech_input`, `answer_types`, `default_retries`, `batch_schedule`, `edit_scheduled`, `pending_controls`, `history_limit`, `pending_limit`, `max_pending_limit`, `pending_count`, `armed_limit`, `settings` |
+| `setSettings` | `pending_limit` integer 1–5000, shared across profiles | `{pending_limit}` |
 | `requestPermission` | — | `permission` after the Android notification prompt |
 | `openFullScreenSettings` | — | Opens Android special-access settings |
 | `openAlarmSettings` | — | Opens exact-alarm settings |
 | `getCalls` | — | `{version:1,calls:[...]}`, also emitted as `cupitorCalls` |
 | `callNow` | `title,question,language`, answer fields below | `{id,exact}` |
 | `schedule` | Same fields plus future `when_ms` | `{id,exact}` |
-| `scheduleBatch` | `{calls:[...]}` (1–50 complete call objects) | `{ids:[...]}` |
+| `scheduleBatch` | `{calls:[...]}` (1–5000 complete call objects, subject to the configured pending limit) | `{ids:[...]}` |
 | `update` | `id` plus complete replacement question/time/answer fields | `{id}` |
 | `setEnabled` | `id,enabled` | `true` |
 | `remove` | `id` (scheduled/disabled only) | `true` |
@@ -74,7 +75,7 @@ an answer is saved as a call result and does not change notification grading.
 
 ## Import and editing
 
-The Import file view accepts a UTF-8 JSON file up to 1 MB. Download example JSON
+The Import file view accepts a UTF-8 JSON file up to 1 MB, subject to the configured pending limit. Settings can raise the default of 50 to 5000. Lowering it never removes existing questions; additions remain blocked until the queue fits. Download example JSON
 from that view. A file contains an array of calls or a versioned object:
 
 ```json
@@ -103,6 +104,15 @@ attempt fields, and replaces its alarm. Only scheduled/disabled calls can be
 edited, enabled/disabled or removed; an active call can be cancelled. A disabled
 call whose date has passed needs a future date before enabling it. Disabling
 cancels its alarm without adding history; removal deletes the pending row.
+
+The native scheduler arms only the next 50 enabled calls at a time, independently
+of the pending storage limit. It refills that rolling window on delivery,
+completion, cancellation, edits, disabling/removal, app startup and reboot.
+Disabled questions are retained without alarms. Android file inputs are wired to
+a native system picker in each configured WebView; cancellation returns no files,
+and provider-selected cache paths are returned to the WebView as file URIs.
+JSON is picked in all-files mode so incorrectly labeled provider MIME types do
+not hide it; the importer validates the actual content.
 
 ## Notification schedule preview
 
@@ -189,7 +199,7 @@ do not replace the current question; overlapping fires become missed. Unanswered
 ringing ends after 45 seconds. An unanswered active question expires after ten
 minutes; a process death during an answered call is recorded as interrupted.
 
-Bounds: 50 pending calls across profiles, last 100 terminal calls across
+Bounds: configurable pending limit (1–5000 across profiles, default 50), last 100 terminal calls across
 profiles, 2–9 alternatives (up to 200 characters each), 120-character title,
 4000-character question, scheduled within 366 days. UTF-8 text and locale tags
 such as `sv-SE` and `en-GB` are supported; the corresponding Android TTS voice
