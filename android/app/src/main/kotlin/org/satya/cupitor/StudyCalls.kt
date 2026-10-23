@@ -193,10 +193,22 @@ object StudyCalls {
 
     @Synchronized fun rearmScheduled(context: Context, armCall: (Context, JSONObject) -> Unit = ::arm) {
         val rows = read(context)
-        rows.filter { it.optString("status") in setOf("scheduled", "disabled") }.forEach {
-            alarms(context).cancel(alarmIntent(context, it.getString("id")))
-        }
-        alarmPlan(context).forEach { armCall(context, it) }
+        val prefs = context.getSharedPreferences("study_calls", Context.MODE_PRIVATE)
+        // Before this setting existed there could be at most 50 pending calls.
+        // Never issue thousands of AlarmManager binder calls for stored-only rows.
+        val oldIds = prefs.getStringSet("armed_ids", null)?.toSet() ?: rows
+            .filter { it.optString("status") in setOf("scheduled", "disabled") }
+            .take(MAX_ARMED).map { it.getString("id") }.toSet()
+        val next = rows.filter { it.optString("status") == "scheduled" }
+            .sortedWith(compareBy<JSONObject> { it.optLong("when_ms") }.thenBy { it.optLong("created_at") })
+            .take(MAX_ARMED)
+        val nextIds = next.map { it.getString("id") }.toSet()
+        // Keep both windows during a transition so a process death or failed
+        // arm can be repaired without losing track of an installed alarm.
+        check(prefs.edit().putStringSet("armed_ids", oldIds + nextIds).commit()) { "storage_error" }
+        oldIds.forEach { alarms(context).cancel(alarmIntent(context, it)) }
+        next.forEach { armCall(context, it) }
+        check(prefs.edit().putStringSet("armed_ids", nextIds).commit()) { "storage_error" }
     }
 
     fun rearmBestEffort(context: Context) {

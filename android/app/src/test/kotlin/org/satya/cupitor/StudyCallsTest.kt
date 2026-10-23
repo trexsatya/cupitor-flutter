@@ -247,6 +247,7 @@ class StudyCallsTest {
         val armed = mutableListOf<String>()
         val ids = StudyCalls.scheduleBatch(context, (0 until 120).map { futureArgs() + mapOf("when_ms" to start + it * 60000L) }, 7) { _, row -> armed.add(row.getString("id")) }
         assertEquals(ids.take(50), armed)
+        assertEquals(ids.take(50).toSet(), context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).getStringSet("armed_ids", null))
         assertEquals(120, StudyCalls.read(context).size)
         StudyCalls.setEnabled(context, ids[0], 7, false)
         assertEquals(ids.subList(1, 51), StudyCalls.alarmPlan(context).map { it.getString("id") })
@@ -254,6 +255,7 @@ class StudyCallsTest {
         assertEquals(ids.subList(2, 52), StudyCalls.alarmPlan(context).map { it.getString("id") })
         StudyCalls.finish(context, ids[2], "cancelled")
         assertEquals(ids.subList(3, 53), StudyCalls.alarmPlan(context).map { it.getString("id") })
+        assertEquals(ids.subList(3, 53).toSet(), context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).getStringSet("armed_ids", null))
     }
 
     @Test fun speechDefaultsAndOverridesAreValidatedWithoutPartialSettingsWrites() {
