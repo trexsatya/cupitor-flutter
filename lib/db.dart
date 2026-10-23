@@ -49,8 +49,9 @@ class CupitorDb {
   // (items without their own open_url inherit it).
   // v10: notif_events.step — the ladder rung a fire SHOWED, so a late grade
   // applies from what the user saw, not the auto-advanced item row.
-  // All additive only: nullable columns, no existing data touched.
-  static const int _schemaVersion = 10;
+  // v11: playlist delivery (notification/call) and call configuration.
+  // Existing lists keep notification delivery and their SRS progress.
+  static const int _schemaVersion = 11;
   static const String _fileName = 'cupitor.db';
   static const int defaultProfileId = 1;
 
@@ -335,6 +336,17 @@ class CupitorDb {
             'ALTER TABLE notif_events ADD COLUMN step INTEGER');
       }
     }
+    if (oldV < 11 && newV >= 11) {
+      final cols = await db.rawQuery('PRAGMA table_info(notif_lists)');
+      final names = cols.map((c) => c['name']).toSet();
+      if (!names.contains('delivery')) {
+        await db.execute("ALTER TABLE notif_lists ADD COLUMN delivery TEXT NOT NULL DEFAULT 'notification'");
+      }
+      if (!names.contains('call_config')) {
+        await db.execute('ALTER TABLE notif_lists ADD COLUMN call_config TEXT');
+      }
+    }
+
   }
 
   /// v7 notification tables. Shared by createSchema (fresh install) and the
@@ -360,6 +372,8 @@ class CupitorDb {
         schedule_id   INTEGER REFERENCES notif_schedules(id),
         intro_schedule_id INTEGER REFERENCES notif_schedules(id),
         open_url      TEXT,
+        delivery      TEXT NOT NULL DEFAULT 'notification',
+        call_config   TEXT,
         status        TEXT NOT NULL,
         cursor        INTEGER NOT NULL DEFAULT 0,
         next_fire_at  INTEGER,

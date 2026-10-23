@@ -28,6 +28,46 @@ class StudyCallsTest {
         StudyCalls.visibleCallId = null
     }
 
+    private fun playlistArgs(due: Long = System.currentTimeMillis() + 60_000) = args() + mapOf(
+        "profile_id" to 1, "notif_id" to 123, "due_at" to due, "when_ms" to due,
+        "playlist_key" to "words", "item_external_id" to "card:one")
+
+    @Test fun playlistFireIsIdempotentEvenAfterAnswering() {
+        val args = playlistArgs()
+        val id = StudyCalls.deliverPlaylist(context, args)
+        assertEquals(id, StudyCalls.deliverPlaylist(context, args))
+        StudyCalls.finish(context, id, "declined")
+        assertEquals(id, StudyCalls.deliverPlaylist(context, args + mapOf("immediate" to true)))
+        assertEquals(1, StudyCalls.read(context).size)
+        assertEquals("declined", StudyCalls.find(context, id)!!.getString("status"))
+    }
+
+    @Test fun rearmPreservesOneOffCallsAndQueuedDueCalls() {
+        val future = StudyCalls.deliverPlaylist(context, playlistArgs())
+        StudyCalls.visibleCallId = "busy"
+        val queued = StudyCalls.deliverPlaylist(context, playlistArgs(System.currentTimeMillis() - 1000) +
+            mapOf("immediate" to true))
+        val oneOff = StudyCalls.validate(args(), 1, true)
+        store(*StudyCalls.read(context).toTypedArray(), oneOff)
+        StudyCalls.cancelPlaylistScheduled(context)
+        assertNull(StudyCalls.find(context, future))
+        assertNotNull(StudyCalls.find(context, queued))
+        assertNotNull(StudyCalls.find(context, oneOff.getString("id")))
+        StudyCalls.retainPlaylistItems(context, emptySet())
+        assertEquals("cancelled", StudyCalls.find(context, queued)!!.getString("status"))
+        assertEquals("scheduled", StudyCalls.find(context, oneOff.getString("id"))!!.getString("status"))
+    }
+
+    @Test fun overlappingPlaylistCallsQueueInsteadOfBeingMarkedMissed() {
+        StudyCalls.visibleCallId = "another-call"
+        val due = System.currentTimeMillis()
+        val id = StudyCalls.deliverPlaylist(context, playlistArgs(due) + mapOf("immediate" to true))
+        val row = StudyCalls.find(context, id)!!
+        assertEquals("scheduled", row.getString("status"))
+        assertTrue(row.getLong("when_ms") > due)
+        assertEquals(due, row.getLong("due_at"))
+    }
+
     @Test fun validationRejectsMalformedChoicesAndTimesWithoutWritingAnything() {
         for (change in listOf(mapOf("choices" to listOf("one")), mapOf("choices" to listOf("a", 42)),
             mapOf("question" to " "), mapOf("language" to "bad-language-name"))) {

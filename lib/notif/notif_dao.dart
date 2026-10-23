@@ -49,6 +49,8 @@ class NotifListRow {
   /// List-level default notification deep link (v9): items without their
   /// own open_url inherit this on tap.
   final String? openUrl;
+  final String delivery; // 'notification' | 'call'
+  final String? callConfig; // raw JSON
   final String status; // 'active' | 'paused'
   final int cursor;
   final int? nextFireAt;
@@ -59,6 +61,7 @@ class NotifListRow {
     required this.id, required this.profileId, required this.name,
     required this.source, required this.externalKey, required this.scheduleId,
     required this.introScheduleId, required this.openUrl,
+    this.delivery = 'notification', this.callConfig,
     required this.status, required this.cursor, required this.nextFireAt,
     required this.lastFiredAt, required this.createdAt, required this.updatedAt,
   });
@@ -72,6 +75,8 @@ class NotifListRow {
         scheduleId: m['schedule_id'] as int?,
         introScheduleId: m['intro_schedule_id'] as int?,
         openUrl: m['open_url'] as String?,
+        delivery: m['delivery'] as String? ?? 'notification',
+        callConfig: m['call_config'] as String?,
         status: m['status'] as String,
         cursor: (m['cursor'] as num?)?.toInt() ?? 0,
         nextFireAt: (m['next_fire_at'] as num?)?.toInt(),
@@ -279,12 +284,15 @@ class NotifDao {
     int? introScheduleId,
     String? openUrl,
     int? nextFireAt,
+    String delivery = 'notification',
+    String? callConfig,
   }) async {
     final now = _now();
     final id = await db.insert('notif_lists', {
       'profile_id': profileId, 'name': name, 'source': source,
       'external_key': externalKey, 'schedule_id': scheduleId,
       'intro_schedule_id': introScheduleId, 'open_url': openUrl,
+      'delivery': delivery, 'call_config': callConfig,
       'status': 'active', 'cursor': 0, 'next_fire_at': nextFireAt,
       'created_at': now, 'updated_at': now,
     });
@@ -292,6 +300,7 @@ class NotifDao {
         id: id, profileId: profileId, name: name, source: source,
         externalKey: externalKey, scheduleId: scheduleId,
         introScheduleId: introScheduleId, openUrl: openUrl, status: 'active',
+        delivery: delivery, callConfig: callConfig,
         cursor: 0, nextFireAt: nextFireAt, lastFiredAt: null,
         createdAt: now, updatedAt: now);
   }
@@ -319,6 +328,14 @@ class NotifDao {
   Future<void> deleteList(int id) async {
     await db.delete('notif_lists', where: 'id = ?', whereArgs: [id]);
   }
+
+  /// All profiles: native call alarms run without a visible web page.
+  Future<Set<int>> activeCallItemIds() async => {
+    for (final r in await db.rawQuery("SELECT i.id FROM notif_items i "
+        "JOIN notif_lists l ON i.list_id = l.id "
+        "WHERE l.delivery = 'call' AND l.status = 'active' AND i.status != 'suspended'"))
+      r['id'] as int,
+  };
 
   // ── items ──────────────────────────────────────────────────────────
 

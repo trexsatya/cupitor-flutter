@@ -48,6 +48,43 @@ object StudyCalls {
     var visibleCallId: String? = null
     private val terminal = setOf("completed", "failed", "declined", "missed", "cancelled", "interrupted")
 
+    /** Idempotent delivery of one scheduler fire, independent of the WebView.
+     * due_at remains the original due time even for a catch-up showNow. */
+    @Synchronized fun deliverPlaylist(context: Context, args: Map<*, *>): String {
+        val profile = (args["profile_id"] as? Number)?.toInt() ?: error("bad_payload")
+        val notifId = (args["notif_id"] as? Number)?.toInt() ?: error("bad_payload")
+        val due = (args["due_at"] as? Number)?.toLong() ?: error("bad_payload")
+        val id = "playlist-$profile-$notifId-$due"
+        // A completed, missed, queued or currently answered fire must not ring again.
+        if (find(context, id) != null) return id
+        val immediate = args["immediate"] == true
+        val row = validate(args, profile, immediate).put("id", id)
+            .put("notif_id", notifId).put("due_at", due)
+            .put("playlist_key", args["playlist_key"])
+            .put("item_external_id", args["item_external_id"])
+        mutate(context) { it.add(row) }
+        if (immediate) fire(context, id) else arm(context, row)
+        return id
+    }
+
+    /** Rearming only replaces future playlist alarms. Keep queued due calls,
+     * the active conversation, one-off calls and all result history. */
+    @Synchronized fun cancelPlaylistScheduled(context: Context) {
+        val now = System.currentTimeMillis()
+        mutate(context) { rows ->
+            val replaced = rows.filter { it.has("notif_id") && it.optString("status") == "scheduled" && it.optLong("due_at") > now }
+            replaced.forEach { dismiss(context, it.getString("id")) }
+            rows.removeAll(replaced.toSet())
+        }
+    }
+
+    @Synchronized fun retainPlaylistItems(context: Context, ids: Set<Int>) {
+        read(context).filter { it.has("notif_id") && it.getInt("notif_id") !in ids &&
+            it.optString("status") in setOf("scheduled", "ringing") }.forEach {
+            finish(context, it.getString("id"), "cancelled")
+        }
+    }
+
     fun install(activity: Activity, messenger: BinaryMessenger) {
         MethodChannel(messenger, "cupitor/study_calls").setMethodCallHandler { call, reply ->
             try {
@@ -350,6 +387,11 @@ object StudyCalls {
         // Avoid simultaneous ringing screens. An overlapping reminder is kept
         // as missed in history rather than replacing a question being answered.
         if (visibleCallId != null || read(context).any { it.optString("status") == "ringing" }) {
+            if (row.has("notif_id") && System.currentTimeMillis() - row.optLong("due_at") < 2 * 3600_000) {
+                update(context, id) { it.put("when_ms", System.currentTimeMillis() + 60_000) }
+                find(context, id)?.let { arm(context, it) }
+                return
+            }
             finish(context, id, "missed"); return
         }
         if (permission(context) != "granted") { finish(context, id, "missed"); return }

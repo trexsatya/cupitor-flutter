@@ -6,6 +6,7 @@ import 'notif_channel.dart';
 import 'notif_dao.dart';
 import 'notif_ops.dart';
 import 'pending_fire.dart';
+import 'playlist_call.dart';
 import 'recurring_scheduler.dart';
 import 'schedules.dart';
 import 'series_scheduler.dart';
@@ -24,6 +25,7 @@ class NotificationService {
 
   /// 60 on iOS (headroom under the 64-pending hard cap), 200 elsewhere.
   final int maxArmed;
+  final Future<void> Function(Set<int>)? retainCallItems;
 
   NotificationService({
     required this.channel,
@@ -32,6 +34,7 @@ class NotificationService {
     required this.perFireCap,
     required this.now,
     required this.maxArmed,
+    this.retainCallItems,
   });
 
   /// Stable notification ids: cancel-and-rearm must be idempotent and a
@@ -86,6 +89,7 @@ class NotificationService {
     final t = now();
     final nowMs = t.millisecondsSinceEpoch;
 
+    await retainCallItems?.call((await d.activeCallItemIds()).map(itemNotifId).toSet());
     await channel.cancelAllScheduled();
 
     final fires = <PendingFire>[];
@@ -138,7 +142,7 @@ class NotificationService {
     // the capped loop so summaries never count against perMinute/maxArmed.
     for (final entry in earliestArmedByList.entries) {
       final list = await d.listById(entry.key);
-      if (list == null) continue;
+      if (list == null || list.delivery == 'call') continue;
       try {
         await channel.schedule(_summaryFire(list, entry.value));
       } catch (_) {
@@ -175,10 +179,24 @@ class NotificationService {
   }
 
   Future<PendingFire> _itemFire(NotifDao d, NotifItemRow item, int whenMs,
-      {required bool withActions}) async {
+      {required bool withActions, int? dueAt}) async {
     final list = await d.listById(item.listId);
+    Map<String, Object?>? studyCall;
+    if (list?.delivery == 'call') {
+      final payload = item.payload == null ? null : jsonDecode(item.payload!);
+      final question = payload is Map ? payload['study_call'] : null;
+      if (!validPlaylistQuestion(question)) throw const FormatException('bad_call');
+      studyCall = {
+        ...Map<String, Object?>.from(question as Map),
+        ...parseCallConfig(list!.callConfig == null ? {} : jsonDecode(list.callConfig!)),
+        'profile_id': list.profileId, 'title': list.name.length > 120 ? list.name.substring(0, 120) : list.name,
+        'playlist_key': list.externalKey, 'item_external_id': item.externalId,
+        'notif_id': itemNotifId(item.id), 'due_at': dueAt ?? whenMs,
+      };
+    }
     return PendingFire(
       notifId: itemNotifId(item.id),
+      studyCall: studyCall,
       whenMs: whenMs,
       title: item.title,
       body: item.body,
@@ -294,10 +312,10 @@ class NotificationService {
       if (fireNow && !delivered) {
         posted++;
         await channel.showNow(await _itemFire(d, item, nowMs,
-            withActions: await _isSeriesList(d, item.listId)));
+            withActions: await _isSeriesList(d, item.listId), dueAt: due));
         if (summarized.add(item.listId)) {
           final list = await d.listById(item.listId);
-          if (list != null) {
+          if (list != null && list.delivery != 'call') {
             await channel.showNow(_summaryFire(list, nowMs));
           }
         }
@@ -356,8 +374,8 @@ class NotificationService {
             if (!opened && !showing.contains(itemNotifId(item.id))) {
               posted++;
               await channel.showNow(
-                  await _itemFire(d, item, nowMs, withActions: false));
-              if (summarized.add(list.id)) {
+                  await _itemFire(d, item, nowMs, withActions: false, dueAt: list.nextFireAt));
+              if (list.delivery != 'call' && summarized.add(list.id)) {
                 await channel.showNow(_summaryFire(list, nowMs));
               }
             }
@@ -431,8 +449,8 @@ class NotificationService {
           if (!opened && !showing.contains(itemNotifId(item.id))) {
             posted++;
             await channel.showNow(
-                await _itemFire(d, item, nowMs, withActions: true));
-            if (summarized.add(list.id)) {
+                await _itemFire(d, item, nowMs, withActions: true, dueAt: list.nextFireAt));
+            if (list.delivery != 'call' && summarized.add(list.id)) {
               await channel.showNow(_summaryFire(list, nowMs));
             }
           }
