@@ -24,6 +24,11 @@ class StudyCallBridge {
 
   static const _ops = {
     'getCapabilities',
+    'setSettings',
+    'getVoices',
+    'previewVoice',
+    'stopVoicePreview',
+    'openVoiceSettings',
     'requestPermission',
     'openFullScreenSettings',
     'openAlarmSettings',
@@ -82,7 +87,7 @@ class StudyCallBridge {
       ack(true, data: result);
       if (op == 'getCalls' && result is Map && profile == activeProfileId()) {
         emit('cupitorCalls', Map<String, Object?>.from(result));
-      } else if (op == 'callNow' || op == 'schedule' || op == 'scheduleBatch' || op == 'update' || op == 'setEnabled' || op == 'remove' || op == 'cancel') {
+      } else if (op == 'setSettings' || op == 'callNow' || op == 'schedule' || op == 'scheduleBatch' || op == 'update' || op == 'setEnabled' || op == 'remove' || op == 'cancel') {
         // A refresh failure must never contradict an already successful ack.
         try {
           final snapshot = await invoke('getCalls', {'profile_id': profile});

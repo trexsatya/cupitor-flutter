@@ -227,4 +227,51 @@ class StudyCallsTest {
         assertEquals("disabled", StudyCalls.find(context, id)!!.getString("status"))
     }
 
+    @Test fun configuredLimitIsDurableGlobalAndLoweringItDoesNotDeleteCalls() {
+        assertEquals(50, StudyCalls.pendingLimit(context))
+        for (bad in listOf<Any?>(null, "500", 0, -1, 1.5, 5001, Double.NaN)) {
+            expectError("bad_limit") { StudyCalls.setPendingLimit(context, bad) }
+        }
+        StudyCalls.setPendingLimit(context, 500)
+        assertEquals(500, StudyCalls.pendingLimit(context))
+        val ids = StudyCalls.scheduleBatch(context, List(120) { futureArgs() + mapOf("enabled" to false) }, 7) { _, _ -> fail("disabled call armed") }
+        assertEquals(120, ids.size)
+        StudyCalls.setPendingLimit(context, 100)
+        assertEquals(120, StudyCalls.read(context).size)
+        expectError("too_many_calls") { StudyCalls.scheduleBatch(context, listOf(futureArgs()), 8) { _, _ -> } }
+    }
+
+    @Test fun rollingAlarmPlanOnlyArms50EarliestEnabledCallsAndRefills() {
+        StudyCalls.setPendingLimit(context, 200)
+        val start = System.currentTimeMillis() + 3600000L
+        val armed = mutableListOf<String>()
+        val ids = StudyCalls.scheduleBatch(context, (0 until 120).map { futureArgs() + mapOf("when_ms" to start + it * 60000L) }, 7) { _, row -> armed.add(row.getString("id")) }
+        assertEquals(ids.take(50), armed)
+        assertEquals(ids.take(50).toSet(), context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).getStringSet("armed_ids", null))
+        assertEquals(120, StudyCalls.read(context).size)
+        StudyCalls.setEnabled(context, ids[0], 7, false)
+        assertEquals(ids.subList(1, 51), StudyCalls.alarmPlan(context).map { it.getString("id") })
+        StudyCalls.removePending(context, ids[1], 7)
+        assertEquals(ids.subList(2, 52), StudyCalls.alarmPlan(context).map { it.getString("id") })
+        StudyCalls.finish(context, ids[2], "cancelled")
+        assertEquals(ids.subList(3, 53), StudyCalls.alarmPlan(context).map { it.getString("id") })
+        assertEquals(ids.subList(3, 53).toSet(), context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).getStringSet("armed_ids", null))
+    }
+
+    @Test fun speechDefaultsAndOverridesAreValidatedWithoutPartialSettingsWrites() {
+        StudyCalls.setSettings(context, mapOf("pending_limit" to 200, "voice_name" to "sv-test", "speech_rate" to 0.75))
+        assertEquals("sv-test", StudyCallSpeech.defaults(context)["voice_name"])
+        assertEquals(0.75, StudyCallSpeech.defaults(context)["speech_rate"])
+        for (bad in listOf(mapOf("speech_rate" to 0.1), mapOf("speech_rate" to Double.NaN), mapOf("voice_name" to 3))) {
+            expectError("bad_voice") { StudyCalls.setSettings(context, bad + mapOf("pending_limit" to 300)) }
+            assertEquals(200, StudyCalls.pendingLimit(context))
+        }
+        val call = StudyCalls.validate(futureArgs() + mapOf("voice_name" to "", "speech_rate" to 1.25), 7, false)
+        assertEquals("", call.getString("voice_name")); assertEquals(1.25, call.getDouble("speech_rate"), 0.001)
+        val voice = android.speech.tts.Voice("sv-test", java.util.Locale.forLanguageTag("sv-SE"), 400, 200, false, emptySet())
+        val missing = android.speech.tts.Voice("sv-missing", java.util.Locale.forLanguageTag("sv-SE"), 400, 200, false, setOf(android.speech.tts.TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED))
+        val options = StudyCallSpeech.options(setOf(voice, missing))
+        assertEquals(1, options.size); assertEquals("sv-test", options.single()["name"])
+    }
+
 }

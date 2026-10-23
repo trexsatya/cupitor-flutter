@@ -50,7 +50,7 @@ void main() {
   );
 
   test('new pending operations use host profile and publish a snapshot', () async {
-    for (final op in ['scheduleBatch', 'update', 'setEnabled', 'remove']) {
+    for (final op in ['setSettings', 'scheduleBatch', 'update', 'setEnabled', 'remove']) {
       invocations.clear(); events.clear();
       await bridge.handle(jsonEncode({'op': op, 'request_id': op,
         'profile_id': 99, 'id': 'x', 'enabled': false,
