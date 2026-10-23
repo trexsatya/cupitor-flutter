@@ -23,8 +23,11 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.view.View
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -43,7 +46,7 @@ object StudyCalls {
     private const val PERMISSION_REQUEST = 4301
     private var permissionReply: MethodChannel.Result? = null
     var visibleCallId: String? = null
-    private val terminal = setOf("completed", "declined", "missed", "cancelled", "interrupted")
+    private val terminal = setOf("completed", "failed", "declined", "missed", "cancelled", "interrupted")
 
     fun install(activity: Activity, messenger: BinaryMessenger) {
         MethodChannel(messenger, "cupitor/study_calls").setMethodCallHandler { call, reply ->
@@ -54,7 +57,10 @@ object StudyCalls {
                     "getCapabilities" -> reply.success(mapOf(
                         "supported" to true, "permission" to permission(activity),
                         "full_screen" to fullScreenAllowed(activity),
-                        "exact_alarms" to exactAllowed(activity), "speech_input" to false,
+                        "exact_alarms" to exactAllowed(activity),
+                        "speech_input" to StudyCallVoice.available(activity),
+                        "answer_types" to listOf("choice", "text"),
+                        "default_retries" to StudyCallAnswer.DEFAULT_RETRIES,
                     ))
                     "requestPermission" -> {
                         if (Build.VERSION.SDK_INT >= 33 && permission(activity) != "granted") {
@@ -139,20 +145,54 @@ object StudyCalls {
         }
         val title = text("title", 120)
         val question = text("question", 4000)
-        val choices = args["choices"] as? List<*> ?: error("bad_payload")
-        check(choices.size in 2..9) { "bad_payload" }
+        check(!args.containsKey("response_type") || args["response_type"] is String) { "bad_payload" }
+        val type = args["response_type"] as? String ?: "choice"
+        check(type in setOf("choice", "text")) { "bad_payload" }
+        val choices = if (type == "text") emptyList<Any>() else args["choices"] as? List<*> ?: error("bad_payload")
+        check(type == "text" || choices.size in 2..9) { "bad_payload" }
         val labels = choices.map {
             val s = (it as? String)?.trim() ?: error("bad_payload")
             check(s.isNotEmpty() && s.length <= 200) { "bad_payload" }; s
         }
         val language = (args["language"] as? String) ?: "sv-SE"
         check(language.matches(Regex("[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?"))) { "bad_payload" }
+        check(!args.containsKey("voice_response") || args["voice_response"] is Boolean) { "bad_payload" }
+        val retries = if (args.containsKey("max_retries")) {
+            val value = args["max_retries"] as? Number ?: error("bad_payload")
+            check(value.toDouble() == value.toInt().toDouble() && value.toInt() in 0..StudyCallAnswer.MAX_RETRIES) { "bad_payload" }
+            value.toInt()
+        } else StudyCallAnswer.DEFAULT_RETRIES
+        val threshold = if (args.containsKey("match_threshold")) {
+            val value = (args["match_threshold"] as? Number)?.toDouble() ?: error("bad_payload")
+            check(value.isFinite() && value in 0.7..1.0) { "bad_payload" }
+            value
+        } else StudyCallAnswer.DEFAULT_MATCH_THRESHOLD
+        val correctIndex = if (type == "choice" && args.containsKey("correct_choice_index")) {
+            val value = args["correct_choice_index"] as? Number ?: error("bad_payload")
+            check(value.toDouble() == value.toInt().toDouble() && value.toInt() in labels.indices) { "bad_payload" }
+            value.toInt()
+        } else null
+        val accepted = if (type == "text") {
+            val values = args["accepted_answers"] as? List<*> ?: error("bad_payload")
+            check(values.size in 1..20) { "bad_payload" }
+            values.map {
+                val value = (it as? String)?.trim() ?: error("bad_payload")
+                check(value.length in 1..500 && StudyCallAnswer.normalize(value).isNotEmpty()) { "bad_payload" }
+                value
+            }
+        } else emptyList()
         val whenMs = if (immediate) now else (args["when_ms"] as? Number)?.toLong() ?: error("bad_payload")
         check(immediate || (whenMs > now && whenMs <= now + 366L * 24 * 60 * 60 * 1000)) { "bad_time" }
-        return JSONObject().put("id", UUID.randomUUID().toString()).put("profile_id", profile)
+        val row = JSONObject().put("id", UUID.randomUUID().toString()).put("profile_id", profile)
             .put("title", title).put("question", question).put("choices", JSONArray(labels))
             .put("language", language).put("when_ms", whenMs).put("created_at", now)
+            .put("voice_response", args["voice_response"] as? Boolean ?: true)
+            .put("response_type", type).put("max_retries", retries).put("attempts", JSONArray())
+            .put("match_threshold", threshold)
+            .put("accepted_answers", JSONArray(accepted))
             .put("status", "scheduled")
+        if (correctIndex != null) row.put("correct_choice_index", correctIndex)
+        return row
     }
 
     /** Single small store, all entry points run in this app process. commit()
@@ -190,13 +230,13 @@ object StudyCalls {
     fun update(context: Context, id: String, fn: (JSONObject) -> Unit) = mutate(context) { rows ->
         rows.find { it.optString("id") == id }?.let(fn)
     }
-    private fun asMap(json: JSONObject): Map<String, Any?> = json.keys().asSequence().associateWith { key ->
-        when (val value = json.get(key)) {
-            is JSONArray -> (0 until value.length()).map { value.get(it) }
+    private fun jsonValue(value: Any?): Any? = when (value) {
+            is JSONObject -> asMap(value)
+            is JSONArray -> (0 until value.length()).map { jsonValue(value.get(it)) }
             JSONObject.NULL -> null
             else -> value
         }
-    }
+    private fun asMap(json: JSONObject): Map<String, Any?> = json.keys().asSequence().associateWith { jsonValue(json.get(it)) }
 
     private fun alarmIntent(context: Context, id: String) = PendingIntent.getBroadcast(context, 0,
         Intent(context, StudyCallReceiver::class.java).setAction("fire")
@@ -229,18 +269,76 @@ object StudyCalls {
         manager(context).cancel(id, 1)
     }
 
-    fun finish(context: Context, id: String, status: String, choice: Int? = null) {
+    fun finish(context: Context, id: String, status: String, choice: Int? = null,
+               responseMode: String = "tap", spokenResponse: String? = null) {
+        if (status == "completed" && choice != null) {
+            val labels = find(context, id)?.optJSONArray("choices") ?: return
+            if (choice !in 0 until labels.length()) return
+            respond(context, id, labels.getString(choice), choice, responseMode, spokenResponse)
+            return
+        }
         var settled = false
         update(context, id) {
             settled = terminal.contains(it.optString("status"))
             if (!terminal.contains(it.optString("status"))) {
                 if (choice != null && (it.optString("status") != "answered" || choice !in 0 until it.getJSONArray("choices").length())) return@update
                 it.put("status", status).put("finished_at", System.currentTimeMillis())
-                if (choice != null) it.put("choice_index", choice).put("choice", it.getJSONArray("choices").getString(choice))
+                if (choice != null) {
+                    it.put("choice_index", choice).put("choice", it.getJSONArray("choices").getString(choice))
+                        .put("response_mode", responseMode)
+                    if (responseMode == "voice" && !spokenResponse.isNullOrBlank()) {
+                        it.put("spoken_response", spokenResponse.trim().take(500))
+                    }
+                }
                 settled = true
             }
         }
         if (settled) dismiss(context, id)
+    }
+
+    /** Claim, grade and persist a final response together. Only an answered
+     * call can accept it, so cancellation or an earlier correct answer wins. */
+    fun respond(context: Context, id: String, answer: String, choice: Int? = null,
+                responseMode: String = "tap", spokenResponse: String? = null,
+                reason: String? = null): StudyCallResponse? {
+        var result: StudyCallResponse? = null
+        mutate(context) { rows ->
+            val row = rows.find { it.optString("id") == id } ?: return@mutate
+            if (row.optString("status") != "answered") return@mutate
+            val type = row.optString("response_type", "choice")
+            val labels = row.getJSONArray("choices")
+            if (reason == null && type == "choice" && (choice == null || choice !in 0 until labels.length())) return@mutate
+            if (reason == null && (answer.isBlank() || answer.length > 500)) return@mutate
+            val correct: Boolean? = when {
+                reason != null -> false
+                type == "text" -> {
+                    val accepted = row.getJSONArray("accepted_answers")
+                    StudyCallAnswer.textIsCorrect(answer, (0 until accepted.length()).map { accepted.getString(it) },
+                        row.optDouble("match_threshold", StudyCallAnswer.DEFAULT_MATCH_THRESHOLD))
+                }
+                row.has("correct_choice_index") -> choice == row.getInt("correct_choice_index")
+                else -> null // older ungraded choice questions retain their behavior
+            }
+            val attempts = row.optJSONArray("attempts") ?: JSONArray()
+            val now = System.currentTimeMillis()
+            val attempt = JSONObject().put("answer", answer.trim().take(500)).put("response_mode", responseMode)
+                .put("at", now).put("correct", correct ?: JSONObject.NULL)
+            if (choice != null) attempt.put("choice_index", choice)
+            if (reason != null) attempt.put("reason", reason)
+            attempts.put(attempt)
+            val maxRetries = row.optInt("max_retries", StudyCallAnswer.DEFAULT_RETRIES)
+            val retry = StudyCallAnswer.shouldRetry(correct, attempts.length(), maxRetries)
+            row.put("attempts", attempts).put("answer", answer.trim().take(500))
+                .put("response_mode", responseMode).put("correct", correct ?: JSONObject.NULL)
+            if (choice != null) row.put("choice_index", choice).put("choice", labels.getString(choice))
+            else { row.remove("choice_index"); row.remove("choice") }
+            if (responseMode == "voice" && !spokenResponse.isNullOrBlank()) row.put("spoken_response", spokenResponse.trim().take(500))
+            else row.remove("spoken_response")
+            if (!retry) row.put("status", if (correct == false) "failed" else "completed").put("finished_at", now)
+            result = StudyCallResponse(correct, retry, attempts.length(), maxRetries + 1)
+        }
+        if (result?.retry == false) dismiss(context, id)
+        return result
     }
 
     fun fire(context: Context, id: String) {
@@ -311,9 +409,10 @@ class StudyCallReceiver : BroadcastReceiver() {
     }
 }
 
-/** Scrollable native UI works while Flutter and the page are absent. Only an
- * explicit Answer reveals/speaks the question. No microphone permission needed. */
+/** Scrollable native UI works while Flutter and the page are absent. Answer
+ * reveals/speaks the question; optional voice replies use a bounded recognizer. */
 class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
+    companion object { private const val MICROPHONE_REQUEST = 4302 }
     private var id = ""
     private var tts: TextToSpeech? = null
     private var ready = false
@@ -323,9 +422,24 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private var focus: AudioFocusRequest? = null
     private lateinit var body: LinearLayout
     private lateinit var message: TextView
+    private lateinit var voiceStatus: TextView
+    private var voiceButton: Button? = null
+    private var voice: StudyCallVoice? = null
+    private var voiceResponse = true
+    private var voiceAvailable = false
+    private var pendingVoicePermission = false
+    private var listenOnResume = false
+    private var speechBatch = 0
+    private var autoListenUtterance: String? = null
+    private var responseType = "choice"
+    private var answerEntry: EditText? = null
+    private var acceptingAnswer = true
+    private var finalFeedback = false
+    private var retryFeedback = ""
     private val handler = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() {
+            if (finalFeedback) return
             val row = StudyCalls.find(this@StudyCallActivity, id)
             if (row == null || row.optString("status") !in setOf("ringing", "answered")) { finish(); return }
             handler.postDelayed(this, 500)
@@ -342,6 +456,9 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         val row = StudyCalls.find(this, id)
         if (row == null || row.optString("status") !in setOf("ringing", "answered")) { finish(); return }
         answered = row.optString("status") == "answered"
+        voiceResponse = row.optBoolean("voice_response", true)
+        responseType = row.optString("response_type", "choice")
+        voiceAvailable = StudyCallVoice.available(this)
         body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val pad = (24 * resources.displayMetrics.density).toInt(); setPadding(pad, pad, pad, pad)
@@ -352,8 +469,43 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         body.addView(TextView(this).apply { text = row.getString("title"); textSize = 28f; setTextColor(Color.BLACK) })
         message = TextView(this).apply { textSize = 20f; setTextColor(Color.BLACK); setPadding(0, 24, 0, 24) }
         body.addView(message)
+        voiceStatus = TextView(this).apply { textSize = 16f; setTextColor(Color.DKGRAY) }
+        body.addView(voiceStatus)
+        voice = StudyCallVoice(this,
+            isActive = { isAnsweredAndResumed() },
+            onStatus = { showVoiceStatus(it) },
+            onListening = { voiceButton?.text = if (it) "Stop listening" else "Answer by voice" },
+            onResult = { acceptSpeech(it) },
+            onFailure = { text, retryable ->
+                if (retryable) recordAttempt("", responseMode = "voice", reason = "no_input")
+                else showVoiceStatus(text)
+            })
         render()
         tts = TextToSpeech(this, this)
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                handler.post {
+                    if (utteranceId == null || utteranceId != autoListenUtterance) return@post
+                    autoListenUtterance = null
+                    val completedBatch = speechBatch
+                    // Let the speaker's trailing audio settle before opening
+                    // the microphone. Any intervening action invalidates this.
+                    handler.postDelayed({
+                        if (voiceResponse && completedBatch == speechBatch && isAnsweredAndResumed() &&
+                            voice?.listening != true) beginVoiceAnswer()
+                    }, 250)
+                }
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                handler.post {
+                    if (utteranceId == null || !utteranceId.startsWith("study-$id-$speechBatch-")) return@post
+                    autoListenUtterance = null
+                    if (isAnsweredAndResumed()) voiceStatus.text = "The question could not be read aloud. You can read it and answer on screen."
+                }
+            }
+        })
         if (Build.VERSION.SDK_INT >= 33) onBackInvokedDispatcher.registerOnBackInvokedCallback(
             android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT
         ) { endCall() }
@@ -367,8 +519,11 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     private fun render() {
-        while (body.childCount > 3) body.removeViewAt(3)
+        while (body.childCount > 4) body.removeViewAt(4)
+        voiceButton = null
+        answerEntry = null
         val row = StudyCalls.find(this, id) ?: return
+        voiceStatus.visibility = if (answered) View.VISIBLE else View.GONE
         if (!answered) {
             message.text = "Incoming study call"
             button("Answer") { answer() }
@@ -376,9 +531,35 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         } else {
             message.text = row.getString("question")
             val choices = row.getJSONArray("choices")
-            for (i in 0 until choices.length()) button("${i + 1}. ${choices.getString(i)}") {
-                StudyCalls.finish(this, id, "completed", i); tts?.stop(); finish()
+            if (responseType == "text") {
+                answerEntry = EditText(this).apply {
+                    hint = "Your answer"
+                    contentDescription = "Your answer"
+                    setTextColor(Color.BLACK)
+                    filters = arrayOf(android.text.InputFilter.LengthFilter(500))
+                }.also { body.addView(it) }
+                button("Submit answer") {
+                    val value = answerEntry?.text?.toString().orEmpty().trim()
+                    if (value.isBlank()) showVoiceStatus("Enter an answer, or answer by voice.")
+                    else recordAttempt(value, responseMode = "typed")
+                }
+            } else {
+                for (i in 0 until choices.length()) button("${i + 1}. ${choices.getString(i)}") {
+                    completeChoice(i)
+                }
             }
+            if (voiceResponse && voiceAvailable) {
+                showVoiceStatus(retryFeedback.ifBlank { if (responseType == "text") "After the question, say your answer."
+                    else "After the question, say a number or an alternative." })
+                voiceButton = button("Answer by voice") {
+                    if (voice?.listening == true) {
+                        voice?.cancel()
+                        showVoiceStatus("Listening stopped. You can answer on screen or tap Answer by voice.")
+                    } else beginVoiceAnswer()
+                }
+            } else if (voiceResponse) {
+                showVoiceStatus("Speech recognition is unavailable. You can answer on screen.")
+            } else showVoiceStatus(retryFeedback.ifBlank { "Answer on screen." })
             button("Read again") { speak() }
             button("End call") { StudyCalls.finish(this, id, "interrupted"); finish() }
         }
@@ -401,6 +582,10 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
 
     private fun speak() {
         if (!ready || !answered || !started || isFinishing) return
+        if (pendingVoicePermission) return
+        acceptingAnswer = true
+        stopReading()
+        voice?.cancel()
         val row = StudyCalls.find(this, id) ?: return
         if (row.optString("status") != "answered") return
         val language = tts?.setLanguage(Locale.forLanguageTag(row.getString("language")))
@@ -413,44 +598,186 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         tts?.setAudioAttributes(attributes)
         if (Build.VERSION.SDK_INT >= 26) {
             if (focus == null) focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setAudioAttributes(attributes).setOnAudioFocusChangeListener { if (it < 0) tts?.stop() }.build()
+                .setAudioAttributes(attributes).setOnAudioFocusChangeListener {
+                    if (it < 0) stopReading()
+                }.build()
             if (audio.requestAudioFocus(focus!!) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) return
         }
         val choices = row.getJSONArray("choices")
         // One utterance may exceed an engine's input limit: queue bounded
         // chunks, keeping the complete question and all numbered alternatives.
-        val spoken = row.getString("question") + ". " + (0 until choices.length()).joinToString(". ") {
+        val swedish = row.getString("language").startsWith("sv")
+        val instruction = when {
+            !voiceResponse || !voiceAvailable -> ""
+            responseType == "text" -> if (swedish) ". Svara med ord eller en mening." else ". Say your answer."
+            swedish -> ". Svara med numret eller alternativet."
+            else -> ". Say the number or the alternative."
+        }
+        val prefix = if (retryFeedback.isBlank()) "" else if (swedish) "Försök igen. " else "Try again. "
+        val spoken = prefix + row.getString("question") + ". " + (0 until choices.length()).joinToString(". ") {
             "${it + 1}. ${choices.getString(it)}"
-        }
-        tts?.stop()
+        } + instruction
         needsInitialReading = false
-        spoken.chunked(3000).forEachIndexed { i, chunk ->
-            tts?.speak(chunk, TextToSpeech.QUEUE_ADD, null, "study-$id-$i")
+        val chunks = spoken.chunked(3000)
+        val batch = ++speechBatch
+        autoListenUtterance = if (voiceResponse && voiceAvailable) "study-$id-$batch-${chunks.lastIndex}" else null
+        chunks.forEachIndexed { i, chunk ->
+            if (tts?.speak(chunk, TextToSpeech.QUEUE_ADD, null, "study-$id-$batch-$i") == TextToSpeech.ERROR) {
+                autoListenUtterance = null
+                voiceStatus.text = "The question could not be read aloud. You can read it and answer on screen."
+            }
         }
+    }
+
+    private fun isAnsweredAndResumed() = started && answered && !isFinishing &&
+        StudyCalls.find(this, id)?.optString("status") == "answered"
+
+    private fun stopReading() {
+        speechBatch++
+        autoListenUtterance = null
+        tts?.stop()
+    }
+
+    private fun beginVoiceAnswer() {
+        if (!voiceResponse || !isAnsweredAndResumed()) return
+        stopReading()
+        if (!voiceAvailable) {
+            voiceStatus.text = "Speech recognition is unavailable. Tap an alternative to answer."
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            if (!pendingVoicePermission) {
+                pendingVoicePermission = true
+                requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), MICROPHONE_REQUEST)
+            }
+            return
+        }
+        // Reading and listening never hold audio at the same time.
+        if (Build.VERSION.SDK_INT >= 26) focus?.let { getSystemService(AudioManager::class.java)?.abandonAudioFocusRequest(it) }
+        val row = StudyCalls.find(this, id) ?: return
+        if (acceptingAnswer) voice?.start(row.getString("language"))
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grants: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grants)
+        if (requestCode != MICROPHONE_REQUEST) return
+        pendingVoicePermission = false
+        if (grants.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            listenOnResume = true
+            if (isAnsweredAndResumed()) { listenOnResume = false; beginVoiceAnswer() }
+        } else if (::voiceStatus.isInitialized) {
+            voiceStatus.text = "Microphone access was not granted. Tap an alternative, or allow microphone access in Android Settings."
+        }
+    }
+
+    private fun completeChoice(index: Int, transcript: String? = null) {
+        val row = StudyCalls.find(this, id) ?: return
+        val choices = row.getJSONArray("choices")
+        if (index !in 0 until choices.length()) return
+        recordAttempt(choices.getString(index), index, if (transcript == null) "tap" else "voice", transcript)
+    }
+
+    private fun acceptSpeech(heard: List<String>) {
+        val row = StudyCalls.find(this, id) ?: return
+        if (responseType == "text") {
+            val text = heard.firstOrNull { it.isNotBlank() }.orEmpty()
+            recordAttempt(text, responseMode = "voice", transcript = text,
+                reason = if (text.isBlank()) "no_input" else null)
+        } else {
+            val labels = row.getJSONArray("choices")
+            val matched = StudyCallChoice.match(heard, (0 until labels.length()).map { labels.getString(it) },
+                row.optDouble("match_threshold", StudyCallAnswer.DEFAULT_MATCH_THRESHOLD))
+            if (matched != null) completeChoice(matched.index, matched.transcript)
+            else recordAttempt(heard.firstOrNull().orEmpty(), responseMode = "voice",
+                transcript = heard.firstOrNull(), reason = "unrecognized")
+        }
+    }
+
+    private fun showVoiceStatus(text: String) {
+        if (!::voiceStatus.isInitialized) return
+        val row = StudyCalls.find(this, id)
+        val used = row?.optJSONArray("attempts")?.length() ?: 0
+        val limit = 1 + (row?.optInt("max_retries", StudyCallAnswer.DEFAULT_RETRIES) ?: StudyCallAnswer.DEFAULT_RETRIES)
+        voiceStatus.text = "Attempt ${minOf(used + 1, limit)} of $limit.\n$text"
+    }
+
+    private fun recordAttempt(answer: String, choice: Int? = null, responseMode: String,
+                              transcript: String? = null, reason: String? = null) {
+        if (!acceptingAnswer || !isAnsweredAndResumed()) return
+        acceptingAnswer = false
+        stopReading()
+        voice?.cancel()
+        val result = try { StudyCalls.respond(this, id, answer, choice, responseMode, transcript, reason) }
+            catch (_: Exception) {
+                acceptingAnswer = true
+                showVoiceStatus("Could not save your answer. Please try again.")
+                return
+            }
+        if (result == null) { finish(); return }
+        if (!result.retry) {
+            showFinalFeedback(result.correct)
+            return
+        }
+        retryFeedback = if (reason == null) "Not quite. Try again." else "The answer was not clear. Let's try again."
+        needsInitialReading = true
+        showVoiceStatus(retryFeedback)
+        handler.postDelayed({
+            if (isAnsweredAndResumed() && needsInitialReading) {
+                acceptingAnswer = true
+                render()
+                speak()
+            }
+        }, 500)
+    }
+
+    private fun showFinalFeedback(correct: Boolean?) {
+        finalFeedback = true
+        while (body.childCount > 4) body.removeViewAt(4)
+        voiceButton = null
+        val row = StudyCalls.find(this, id)
+        val swedish = row?.optString("language")?.startsWith("sv") == true
+        val feedback = when (correct) {
+            true -> if (swedish) "Rätt svar." else "Correct."
+            false -> if (swedish) "Inga försök kvar." else "No attempts left."
+            null -> if (swedish) "Svaret har sparats." else "Answer saved."
+        }
+        message.text = feedback
+        voiceStatus.visibility = View.VISIBLE
+        voiceStatus.text = if (correct != false) row?.optString("answer").orEmpty() else "Your attempts have been saved."
+        button("Close") { finish() }
+        if (ready && started) tts?.speak(feedback, TextToSpeech.QUEUE_FLUSH, null, "result-$id")
+        handler.postDelayed({ if (!isFinishing) finish() }, 5000)
     }
 
     override fun onResume() {
         super.onResume()
         started = true
+        if (finalFeedback) return
+        if (needsInitialReading) acceptingAnswer = true
         if (answered && ready && needsInitialReading) speak()
+        if (listenOnResume) { listenOnResume = false; beginVoiceAnswer() }
     }
 
     override fun onPause() {
         started = false
-        tts?.stop()
+        listenOnResume = false
+        stopReading()
+        voice?.cancel()
         super.onPause()
     }
 
     override fun onStop() {
         started = false
-        tts?.stop()
+        stopReading()
+        voice?.cancel()
         if (Build.VERSION.SDK_INT >= 26) focus?.let { getSystemService(AudioManager::class.java)?.abandonAudioFocusRequest(it) }
         super.onStop()
     }
 
     override fun onDestroy() {
-        handler.removeCallbacks(tick)
-        tts?.stop(); tts?.shutdown()
+        handler.removeCallbacksAndMessages(null)
+        stopReading(); tts?.shutdown()
+        voice?.cancel()
         if (StudyCalls.visibleCallId == id) StudyCalls.visibleCallId = null
         super.onDestroy()
     }

@@ -95,4 +95,58 @@ class StudyCallsTest {
         screen.onBackPressed()
         assertEquals("declined", StudyCalls.find(context, row.getString("id"))!!.getString("status"))
     }
+
+    @Test fun wrongThenCorrectChoiceSavesBothAttemptsAndStopsImmediately() {
+        val row = StudyCalls.validate(args() + mapOf("correct_choice_index" to 1), 1, true)
+            .put("status", "answered").put("answered_at", System.currentTimeMillis())
+        val id = row.getString("id")
+        StudyCalls.visibleCallId = id
+        store(row)
+        val wrong = StudyCalls.respond(context, id, "ett", 0, "voice", "ett")!!
+        assertFalse(wrong.correct!!); assertTrue(wrong.retry)
+        assertEquals(1, wrong.attempts); assertEquals(4, wrong.maxAttempts)
+        val right = StudyCalls.respond(context, id, "en", 1, "voice", "en")!!
+        assertTrue(right.correct!!); assertFalse(right.retry)
+        assertNull(StudyCalls.respond(context, id, "ett", 0))
+        val saved = StudyCalls.find(context, id)!!
+        assertEquals("completed", saved.getString("status"))
+        assertEquals(2, saved.getJSONArray("attempts").length())
+        assertEquals("voice", saved.getString("response_mode"))
+        assertEquals("en", saved.getString("spoken_response"))
+    }
+
+    @Test fun retryBudgetAlsoBoundsSilenceAndUnrecognizedSpeech() {
+        val row = StudyCalls.validate(args() + mapOf("correct_choice_index" to 1), 1, true)
+            .put("status", "answered").put("answered_at", System.currentTimeMillis())
+        val id = row.getString("id")
+        StudyCalls.visibleCallId = id; store(row)
+        for (i in 1..4) {
+            val result = StudyCalls.respond(context, id, "", responseMode = "voice", reason = "no_input")!!
+            assertEquals(i < 4, result.retry)
+        }
+        assertEquals("failed", StudyCalls.find(context, id)!!.getString("status"))
+        assertNull(StudyCalls.respond(context, id, "en", 1))
+    }
+
+    @Test fun freeFormVoiceAnswersAreFuzzyMarkedAndPersistedWithoutAlternatives() {
+        val row = StudyCalls.validate(args() + mapOf("response_type" to "text", "accepted_answers" to listOf("Stockholm")), 1, true)
+            .put("status", "answered").put("answered_at", System.currentTimeMillis())
+        val id = row.getString("id")
+        StudyCalls.visibleCallId = id; store(row)
+        assertEquals(0, row.getJSONArray("choices").length())
+        val result = StudyCalls.respond(context, id, "Stockholn", responseMode = "voice", spokenResponse = "Stockholn")!!
+        assertTrue(result.correct!!)
+        val saved = StudyCalls.find(context, id)!!
+        assertEquals("Stockholn", saved.getString("answer"))
+        assertFalse(saved.has("choice_index"))
+    }
+
+    @Test fun invalidRetryAndMarkingConfigurationIsRejectedBeforeCreatingACall() {
+        for (bad in listOf(mapOf("max_retries" to -1), mapOf("max_retries" to 1.5), mapOf("max_retries" to 11),
+            mapOf("correct_choice_index" to 8), mapOf("match_threshold" to Double.NaN),
+            mapOf("voice_response" to "true"), mapOf("response_type" to "text", "accepted_answers" to emptyList<String>()))) {
+            try { StudyCalls.validate(args() + bad, 1, true); fail("expected validation failure") }
+            catch (_: IllegalStateException) {}
+        }
+    }
 }
