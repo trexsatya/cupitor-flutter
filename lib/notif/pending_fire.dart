@@ -25,9 +25,6 @@ class PendingFire {
   /// Group summary scaffolding (Android): setAsGroupSummary, exempt from caps.
   final bool isSummary;
 
-  /// Native call payload when this playlist uses call delivery.
-  final Map<String, Object?>? studyCall;
-
   const PendingFire({
     required this.notifId,
     required this.whenMs,
@@ -37,6 +34,5 @@ class PendingFire {
     required this.groupKey,
     required this.withActions,
     this.isSummary = false,
-    this.studyCall,
   });
 }

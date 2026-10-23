@@ -43,49 +43,17 @@ import java.util.UUID
 object StudyCalls {
     const val CHANNEL = "cupitor_study_calls_v1"
     const val RING_MS = 45_000L
+    const val MAX_HISTORY = 100
     private const val PERMISSION_REQUEST = 4301
     private var permissionReply: MethodChannel.Result? = null
     var visibleCallId: String? = null
     private val terminal = setOf("completed", "failed", "declined", "missed", "cancelled", "interrupted")
 
-    /** Idempotent delivery of one scheduler fire, independent of the WebView.
-     * due_at remains the original due time even for a catch-up showNow. */
-    @Synchronized fun deliverPlaylist(context: Context, args: Map<*, *>): String {
-        val profile = (args["profile_id"] as? Number)?.toInt() ?: error("bad_payload")
-        val notifId = (args["notif_id"] as? Number)?.toInt() ?: error("bad_payload")
-        val due = (args["due_at"] as? Number)?.toLong() ?: error("bad_payload")
-        val id = "playlist-$profile-$notifId-$due"
-        // A completed, missed, queued or currently answered fire must not ring again.
-        if (find(context, id) != null) return id
-        val immediate = args["immediate"] == true
-        val row = validate(args, profile, immediate).put("id", id)
-            .put("notif_id", notifId).put("due_at", due)
-            .put("playlist_key", args["playlist_key"])
-            .put("item_external_id", args["item_external_id"])
-        mutate(context) { it.add(row) }
-        if (immediate) fire(context, id) else arm(context, row)
-        return id
-    }
-
-    /** Rearming only replaces future playlist alarms. Keep queued due calls,
-     * the active conversation, one-off calls and all result history. */
-    @Synchronized fun cancelPlaylistScheduled(context: Context) {
-        val now = System.currentTimeMillis()
-        mutate(context) { rows ->
-            val replaced = rows.filter { it.has("notif_id") && it.optString("status") == "scheduled" && it.optLong("due_at") > now }
-            replaced.forEach { dismiss(context, it.getString("id")) }
-            rows.removeAll(replaced.toSet())
-        }
-    }
-
-    @Synchronized fun retainPlaylistItems(context: Context, ids: Set<Int>) {
-        read(context).filter { it.has("notif_id") && it.getInt("notif_id") !in ids &&
-            it.optString("status") in setOf("scheduled", "ringing") }.forEach {
-            finish(context, it.getString("id"), "cancelled")
-        }
-    }
-
     fun install(activity: Activity, messenger: BinaryMessenger) {
+        cancelObsoletePlaylistCalls(activity)
+        read(activity).filter { it.optString("status") == "scheduled" }.forEach {
+            try { arm(activity, it) } catch (_: Exception) {}
+        }
         MethodChannel(messenger, "cupitor/study_calls").setMethodCallHandler { call, reply ->
             try {
                 val args = call.arguments as? Map<*, *> ?: emptyMap<Any, Any>()
@@ -98,6 +66,7 @@ object StudyCalls {
                         "speech_input" to StudyCallVoice.available(activity),
                         "answer_types" to listOf("choice", "text"),
                         "default_retries" to StudyCallAnswer.DEFAULT_RETRIES,
+                        "batch_schedule" to true, "edit_scheduled" to true, "pending_controls" to true, "history_limit" to MAX_HISTORY,
                     ))
                     "requestPermission" -> {
                         if (Build.VERSION.SDK_INT >= 33 && permission(activity) != "granted") {
@@ -129,13 +98,34 @@ object StudyCalls {
                             if (call.method == "callNow") {
                                 fire(activity, data.getString("id"))
                                 activity.startActivity(screenIntent(activity, data.getString("id"), false))
-                            } else arm(activity, data)
+                            } else if (data.optString("status") == "scheduled") arm(activity, data)
                         } catch (e: Exception) {
                             update(activity, data.getString("id")) { it.put("status", "cancelled") }
                             dismiss(activity, data.getString("id"))
                             throw e
                         }
                         reply.success(mapOf("id" to data.getString("id"), "exact" to exactAllowed(activity)))
+                    }
+                    "scheduleBatch" -> {
+                        check(permission(activity) == "granted") { "permission_denied" }
+                        val ids = scheduleBatch(activity, args["calls"], profile)
+                        reply.success(mapOf("ids" to ids))
+                    }
+                    "update" -> {
+                        check(permission(activity) == "granted") { "permission_denied" }
+                        editScheduled(activity, args, profile)
+                        reply.success(mapOf("id" to args["id"]))
+                    }
+                    "setEnabled" -> {
+                        val id = args["id"] as? String ?: error("bad_payload")
+                        val enabled = args["enabled"] as? Boolean ?: error("bad_payload")
+                        if (enabled) check(permission(activity) == "granted") { "permission_denied" }
+                        setEnabled(activity, id, profile, enabled)
+                        reply.success(true)
+                    }
+                    "remove" -> {
+                        removePending(activity, args["id"] as? String ?: error("bad_payload"), profile)
+                        reply.success(true)
                     }
                     "cancel" -> {
                         val id = args["id"] as? String ?: error("bad_payload")
@@ -152,6 +142,67 @@ object StudyCalls {
             } catch (e: Exception) {
                 reply.error(e.message?.takeIf { it.matches(Regex("[a-z_]+")) } ?: "internal", null, null)
             }
+        }
+    }
+
+    @Synchronized fun scheduleBatch(context: Context, raw: Any?, profile: Int,
+                                   armCall: (Context, JSONObject) -> Unit = ::arm): List<String> {
+        val calls = raw as? List<*> ?: error("bad_payload")
+        check(calls.size in 1..50) { "bad_payload" }
+        // Validate every question/time before changing storage or arming anything.
+        val added = calls.map { validate(it as? Map<*, *> ?: error("bad_payload"), profile, false) }
+        check(read(context).count { it.optString("status") !in terminal } + added.size <= 50) { "too_many_calls" }
+        mutate(context) { it.addAll(added) }
+        try { added.filter { it.optString("status") == "scheduled" }.forEach { armCall(context, it) } }
+        catch (e: Exception) {
+            val ids = added.map { it.getString("id") }.toSet()
+            added.forEach { dismiss(context, it.getString("id")) }
+            mutate(context) { rows -> rows.removeAll { it.optString("id") in ids } }
+            throw e
+        }
+        return added.map { it.getString("id") }
+    }
+
+    @Synchronized fun editScheduled(context: Context, args: Map<*, *>, profile: Int,
+                                   armCall: (Context, JSONObject) -> Unit = ::arm) {
+        val id = args["id"] as? String ?: error("bad_payload")
+        val old = find(context, id)?.takeIf { it.optInt("profile_id") == profile } ?: error("unknown_call")
+        check(old.optString("status") in setOf("scheduled", "disabled")) { "not_scheduled" }
+        val replacement = validate(args, profile, false).put("id", id).put("created_at", old.getLong("created_at"))
+        dismiss(context, id)
+        mutate(context) { rows -> rows.removeAll { it.optString("id") == id }; rows.add(replacement) }
+        try { if (replacement.optString("status") == "scheduled") armCall(context, replacement) }
+        catch (e: Exception) {
+            mutate(context) { rows -> rows.removeAll { it.optString("id") == id }; rows.add(old) }
+            try { if (old.optString("status") == "scheduled") arm(context, old) } catch (_: Exception) {}
+            throw e
+        }
+    }
+
+    @Synchronized fun setEnabled(context: Context, id: String, profile: Int, enabled: Boolean) {
+        val old = find(context, id)?.takeIf { it.optInt("profile_id") == profile } ?: error("unknown_call")
+        check(old.optString("status") in setOf("scheduled", "disabled")) { "not_scheduled" }
+        if (enabled) check(old.getLong("when_ms") > System.currentTimeMillis()) { "bad_time" }
+        if ((old.optString("status") == "scheduled") == enabled) return
+        val previous = JSONObject(old.toString())
+        dismiss(context, id)
+        update(context, id) { it.put("enabled", enabled).put("status", if (enabled) "scheduled" else "disabled") }
+        if (enabled) try { find(context, id)?.let { arm(context, it) } } catch (e: Exception) {
+            mutate(context) { rows -> rows.removeAll { it.optString("id") == id }; rows.add(previous) }
+            throw e
+        }
+    }
+
+    @Synchronized fun removePending(context: Context, id: String, profile: Int) {
+        val old = find(context, id)?.takeIf { it.optInt("profile_id") == profile } ?: error("unknown_call")
+        check(old.optString("status") in setOf("scheduled", "disabled")) { "not_scheduled" }
+        dismiss(context, id)
+        mutate(context) { rows -> rows.removeAll { it.optString("id") == id } }
+    }
+
+    fun cancelObsoletePlaylistCalls(context: Context) {
+        read(context).filter { it.has("notif_id") && it.optString("status") !in terminal }.forEach {
+            finish(context, it.getString("id"), "cancelled")
         }
     }
 
@@ -218,6 +269,9 @@ object StudyCalls {
                 value
             }
         } else emptyList()
+        check(!args.containsKey("enabled") || args["enabled"] is Boolean) { "bad_payload" }
+        val enabled = args["enabled"] as? Boolean ?: true
+        check(!immediate || enabled) { "bad_payload" }
         val whenMs = if (immediate) now else (args["when_ms"] as? Number)?.toLong() ?: error("bad_payload")
         check(immediate || (whenMs > now && whenMs <= now + 366L * 24 * 60 * 60 * 1000)) { "bad_time" }
         val row = JSONObject().put("id", UUID.randomUUID().toString()).put("profile_id", profile)
@@ -227,7 +281,7 @@ object StudyCalls {
             .put("response_type", type).put("max_retries", retries).put("attempts", JSONArray())
             .put("match_threshold", threshold)
             .put("accepted_answers", JSONArray(accepted))
-            .put("status", "scheduled")
+            .put("enabled", enabled).put("status", if (enabled) "scheduled" else "disabled")
         if (correctIndex != null) row.put("correct_choice_index", correctIndex)
         return row
     }
@@ -248,16 +302,21 @@ object StudyCalls {
                 it.put("status", "interrupted").put("finished_at", now); changed = true
             }
         }
-        if (changed) save(context, rows)
-        return rows
+        val capped = retained(rows)
+        if (changed || capped.size != rows.size) save(context, capped)
+        return capped.toMutableList()
+    }
+
+    private fun retained(rows: List<JSONObject>): List<JSONObject> {
+        val active = rows.filter { !terminal.contains(it.optString("status")) }
+        val history = rows.filter { terminal.contains(it.optString("status")) }
+            .sortedBy { it.optLong("finished_at", it.optLong("created_at")) }.takeLast(MAX_HISTORY)
+        return active + history
     }
 
     private fun save(context: Context, rows: List<JSONObject>) {
-        val active = rows.filter { !terminal.contains(it.optString("status")) }
-        val history = rows.filter { terminal.contains(it.optString("status")) }
-            .sortedBy { it.optLong("finished_at", it.optLong("created_at")) }.takeLast(200)
         check(context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).edit()
-            .putString("calls", JSONArray(active + history).toString()).commit()) { "storage_error" }
+            .putString("calls", JSONArray(retained(rows)).toString()).commit()) { "storage_error" }
     }
 
     @Synchronized private fun mutate(context: Context, fn: (MutableList<JSONObject>) -> Unit) {
@@ -381,17 +440,15 @@ object StudyCalls {
     fun fire(context: Context, id: String) {
         val row = find(context, id) ?: return
         if (row.optString("status") != "scheduled") return
+        if (row.has("notif_id")) { finish(context, id, "cancelled"); return }
+        // A queued alarm from before an edit must not ring the rescheduled call early.
+        if (row.optLong("when_ms") > System.currentTimeMillis()) return
         if (System.currentTimeMillis() - row.optLong("when_ms") > 5 * 60_000) {
             finish(context, id, "missed"); return
         }
         // Avoid simultaneous ringing screens. An overlapping reminder is kept
         // as missed in history rather than replacing a question being answered.
         if (visibleCallId != null || read(context).any { it.optString("status") == "ringing" }) {
-            if (row.has("notif_id") && System.currentTimeMillis() - row.optLong("due_at") < 2 * 3600_000) {
-                update(context, id) { it.put("when_ms", System.currentTimeMillis() + 60_000) }
-                find(context, id)?.let { arm(context, it) }
-                return
-            }
             finish(context, id, "missed"); return
         }
         if (permission(context) != "granted") { finish(context, id, "missed"); return }
@@ -434,6 +491,7 @@ class StudyCallReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         try {
             if (intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) {
+                StudyCalls.cancelObsoletePlaylistCalls(context)
                 StudyCalls.read(context).filter { it.optString("status") == "scheduled" }.forEach {
                     try { StudyCalls.arm(context, it) } catch (_: Exception) {}
                 }

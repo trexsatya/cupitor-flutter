@@ -405,6 +405,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     window: () => NotifSettings.window,
     now: () => tz.TZDateTime.now(tz.local),
     onMutated: () => notifService.rearm(),
+    schedulePreview: (list) => notifService.schedulePreview(list),
   );
   late final StudyCallBridge _studyCallBridge = StudyCallBridge(
     activeProfileId: () => ProfileService.currentId,

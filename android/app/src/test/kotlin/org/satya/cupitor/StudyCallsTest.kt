@@ -28,46 +28,6 @@ class StudyCallsTest {
         StudyCalls.visibleCallId = null
     }
 
-    private fun playlistArgs(due: Long = System.currentTimeMillis() + 60_000) = args() + mapOf(
-        "profile_id" to 1, "notif_id" to 123, "due_at" to due, "when_ms" to due,
-        "playlist_key" to "words", "item_external_id" to "card:one")
-
-    @Test fun playlistFireIsIdempotentEvenAfterAnswering() {
-        val args = playlistArgs()
-        val id = StudyCalls.deliverPlaylist(context, args)
-        assertEquals(id, StudyCalls.deliverPlaylist(context, args))
-        StudyCalls.finish(context, id, "declined")
-        assertEquals(id, StudyCalls.deliverPlaylist(context, args + mapOf("immediate" to true)))
-        assertEquals(1, StudyCalls.read(context).size)
-        assertEquals("declined", StudyCalls.find(context, id)!!.getString("status"))
-    }
-
-    @Test fun rearmPreservesOneOffCallsAndQueuedDueCalls() {
-        val future = StudyCalls.deliverPlaylist(context, playlistArgs())
-        StudyCalls.visibleCallId = "busy"
-        val queued = StudyCalls.deliverPlaylist(context, playlistArgs(System.currentTimeMillis() - 1000) +
-            mapOf("immediate" to true))
-        val oneOff = StudyCalls.validate(args(), 1, true)
-        store(*StudyCalls.read(context).toTypedArray(), oneOff)
-        StudyCalls.cancelPlaylistScheduled(context)
-        assertNull(StudyCalls.find(context, future))
-        assertNotNull(StudyCalls.find(context, queued))
-        assertNotNull(StudyCalls.find(context, oneOff.getString("id")))
-        StudyCalls.retainPlaylistItems(context, emptySet())
-        assertEquals("cancelled", StudyCalls.find(context, queued)!!.getString("status"))
-        assertEquals("scheduled", StudyCalls.find(context, oneOff.getString("id"))!!.getString("status"))
-    }
-
-    @Test fun overlappingPlaylistCallsQueueInsteadOfBeingMarkedMissed() {
-        StudyCalls.visibleCallId = "another-call"
-        val due = System.currentTimeMillis()
-        val id = StudyCalls.deliverPlaylist(context, playlistArgs(due) + mapOf("immediate" to true))
-        val row = StudyCalls.find(context, id)!!
-        assertEquals("scheduled", row.getString("status"))
-        assertTrue(row.getLong("when_ms") > due)
-        assertEquals(due, row.getLong("due_at"))
-    }
-
     @Test fun validationRejectsMalformedChoicesAndTimesWithoutWritingAnything() {
         for (change in listOf(mapOf("choices" to listOf("one")), mapOf("choices" to listOf("a", 42)),
             mapOf("question" to " "), mapOf("language" to "bad-language-name"))) {
@@ -121,7 +81,7 @@ class StudyCallsTest {
         }
         store(active, *history.toTypedArray())
         StudyCalls.finish(context, id, "completed", 0)
-        assertEquals(200, StudyCalls.read(context).size)
+        assertEquals(100, StudyCalls.read(context).size)
         assertEquals("ett", StudyCalls.find(context, id)!!.getString("choice"))
     }
 
@@ -189,4 +149,82 @@ class StudyCallsTest {
             catch (_: IllegalStateException) {}
         }
     }
+    private fun futureArgs() = args() + mapOf("when_ms" to System.currentTimeMillis() + 3600000L, "correct_choice_index" to 1)
+    private fun expectError(message: String, action: () -> Unit) {
+        try { action(); fail("expected $message") } catch (e: IllegalStateException) { assertEquals(message, e.message) }
+    }
+
+    @Test fun batchValidatesEverythingAndRollsBackWhenArmingFails() {
+        val armed = mutableListOf<String>()
+        expectError("bad_payload") {
+            StudyCalls.scheduleBatch(context, listOf(futureArgs(), futureArgs() + mapOf("choices" to listOf("one"))), 7) { _, row -> armed.add(row.getString("id")) }
+        }
+        assertTrue(StudyCalls.read(context).isEmpty()); assertTrue(armed.isEmpty())
+        expectError("alarm_failed") {
+            StudyCalls.scheduleBatch(context, listOf(futureArgs(), futureArgs()), 7) { _, _ -> error("alarm_failed") }
+        }
+        assertTrue(StudyCalls.read(context).isEmpty())
+        val ids = StudyCalls.scheduleBatch(context, listOf(futureArgs() + mapOf("profile_id" to 99), futureArgs() + mapOf("enabled" to false)), 7) { _, row -> armed.add(row.getString("id")) }
+        assertEquals(2, ids.size); assertEquals(listOf(ids[0]), armed)
+        assertEquals("disabled", StudyCalls.find(context, ids[1])!!.getString("status"))
+        assertTrue(StudyCalls.read(context).all { it.getInt("profile_id") == 7 })
+        expectError("too_many_calls") { StudyCalls.scheduleBatch(context, List(49) { futureArgs() }, 7) { _, _ -> } }
+        assertEquals(2, StudyCalls.read(context).size)
+    }
+
+    @Test fun editingPreservesIdentityAndRejectsOtherProfilesAndStartedCalls() {
+        val id = StudyCalls.scheduleBatch(context, listOf(futureArgs()), 7) { _, _ -> }.single()
+        val created = StudyCalls.find(context, id)!!.getLong("created_at")
+        expectError("unknown_call") { StudyCalls.editScheduled(context, futureArgs() + mapOf("id" to id), 8) { _, _ -> } }
+        expectError("bad_payload") { StudyCalls.editScheduled(context, futureArgs() + mapOf("id" to id, "question" to ""), 7) { _, _ -> } }
+        assertEquals("Choose a word", StudyCalls.find(context, id)!!.getString("question"))
+        StudyCalls.editScheduled(context, futureArgs() + mapOf("id" to id, "question" to "Edited", "enabled" to false), 7) { _, _ -> fail("disabled call armed") }
+        val saved = StudyCalls.find(context, id)!!
+        assertEquals(created, saved.getLong("created_at")); assertEquals("Edited", saved.getString("question"))
+        assertEquals("disabled", saved.getString("status"))
+        expectError("alarm_failed") { StudyCalls.editScheduled(context, futureArgs() + mapOf("id" to id), 7) { _, _ -> error("alarm_failed") } }
+        assertEquals("Edited", StudyCalls.find(context, id)!!.getString("question"))
+        StudyCalls.update(context, id) { it.put("status", "ringing").put("fired_at", System.currentTimeMillis()) }
+        expectError("not_scheduled") { StudyCalls.editScheduled(context, futureArgs() + mapOf("id" to id), 7) { _, _ -> } }
+        expectError("not_scheduled") { StudyCalls.removePending(context, id, 7) }
+    }
+
+    @Test fun pendingEnableDisableAndRemovalAreDurableAndProfileScoped() {
+        val id = StudyCalls.scheduleBatch(context, listOf(futureArgs()), 7) { _, _ -> }.single()
+        expectError("unknown_call") { StudyCalls.setEnabled(context, id, 8, false) }
+        expectError("unknown_call") { StudyCalls.removePending(context, id, 8) }
+        StudyCalls.setEnabled(context, id, 7, false)
+        assertEquals("disabled", StudyCalls.find(context, id)!!.getString("status"))
+        StudyCalls.setEnabled(context, id, 7, true)
+        assertEquals("scheduled", StudyCalls.find(context, id)!!.getString("status"))
+        StudyCalls.setEnabled(context, id, 7, false)
+        StudyCalls.update(context, id) { it.put("when_ms", 1L) }
+        expectError("bad_time") { StudyCalls.setEnabled(context, id, 7, true) }
+        StudyCalls.removePending(context, id, 7)
+        assertNull(StudyCalls.find(context, id))
+    }
+
+    @Test fun upgradeTrimsHistoryTo100WithoutRemovingPendingAndRetiresPlaylistCalls() {
+        val pending = StudyCalls.validate(futureArgs() + mapOf("enabled" to false), 1, false)
+        val obsolete = StudyCalls.validate(futureArgs(), 1, false).put("notif_id", 123)
+        val history = (1..200).map { StudyCalls.validate(args(), 1, true).put("status", "declined").put("finished_at", it.toLong()) }
+        store(pending, obsolete, *history.toTypedArray())
+        assertEquals(102, StudyCalls.read(context).size)
+        assertEquals(102, JSONArray(context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).getString("calls", "[]")).length())
+        StudyCalls.cancelObsoletePlaylistCalls(context)
+        assertEquals("cancelled", StudyCalls.find(context, obsolete.getString("id"))!!.getString("status"))
+        assertEquals("disabled", StudyCalls.find(context, pending.getString("id"))!!.getString("status"))
+        assertEquals(101, StudyCalls.read(context).size)
+    }
+
+    @Test fun staleAlarmAfterReschedulingCannotRingEarly() {
+        val id = StudyCalls.scheduleBatch(context, listOf(futureArgs()), 7) { _, _ -> }.single()
+        StudyCalls.editScheduled(context, futureArgs() + mapOf("id" to id, "when_ms" to System.currentTimeMillis() + 7200000L), 7) { _, _ -> }
+        StudyCalls.fire(context, id)
+        assertEquals("scheduled", StudyCalls.find(context, id)!!.getString("status"))
+        StudyCalls.setEnabled(context, id, 7, false)
+        StudyCalls.fire(context, id)
+        assertEquals("disabled", StudyCalls.find(context, id)!!.getString("status"))
+    }
+
 }

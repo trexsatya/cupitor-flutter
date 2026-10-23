@@ -30,6 +30,10 @@ class StudyCallBridge {
     'getCalls',
     'callNow',
     'schedule',
+    'scheduleBatch',
+    'update',
+    'setEnabled',
+    'remove',
     'cancel',
   };
 
@@ -78,7 +82,7 @@ class StudyCallBridge {
       ack(true, data: result);
       if (op == 'getCalls' && result is Map && profile == activeProfileId()) {
         emit('cupitorCalls', Map<String, Object?>.from(result));
-      } else if (op == 'callNow' || op == 'schedule' || op == 'cancel') {
+      } else if (op == 'callNow' || op == 'schedule' || op == 'scheduleBatch' || op == 'update' || op == 'setEnabled' || op == 'remove' || op == 'cancel') {
         // A refresh failure must never contradict an already successful ack.
         try {
           final snapshot = await invoke('getCalls', {'profile_id': profile});

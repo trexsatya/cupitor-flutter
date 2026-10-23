@@ -250,4 +250,25 @@ void main() {
     expect(seeds, hasLength(7));
     await db.close();
   });
+  test('v11 rollback preserves notification data and pauses old playlist calls', () async {
+    final db = await databaseFactory.openDatabase(inMemoryDatabasePath);
+    await CupitorDb.createSchema(db);
+    // Exact additive columns introduced by the previously shipped v11.
+    await db.execute("ALTER TABLE notif_lists ADD COLUMN delivery TEXT NOT NULL DEFAULT 'notification'");
+    await db.execute('ALTER TABLE notif_lists ADD COLUMN call_config TEXT');
+    for (final delivery in ['call', 'notification']) {
+      await db.insert('notif_lists', {'profile_id': 1, 'name': delivery, 'source': 'webpage',
+        'external_key': delivery, 'status': 'active', 'delivery': delivery,
+        'call_config': delivery == 'call' ? '{"max_retries":3}' : null,
+        'created_at': 1, 'updated_at': 1});
+    }
+    final before = (await db.query('notif_lists', where: "delivery = 'notification'")).single;
+    await CupitorDb.runMigrations(db, 11, 12);
+    final call = (await db.query('notif_lists', where: "external_key = 'call'")).single;
+    expect(call['status'], 'paused'); expect(call['delivery'], 'notification'); expect(call['call_config'], isNull);
+    expect((await db.query('notif_lists', where: "external_key = 'notification'")).single, before);
+    expect(await db.rawQuery('PRAGMA foreign_key_check'), isEmpty);
+    await db.close();
+  });
+
 }
