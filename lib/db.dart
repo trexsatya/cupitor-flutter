@@ -49,9 +49,9 @@ class CupitorDb {
   // (items without their own open_url inherit it).
   // v10: notif_events.step — the ladder rung a fire SHOWED, so a late grade
   // applies from what the user saw, not the auto-advanced item row.
-  // v11: playlist delivery (notification/call) and call configuration.
-  // Existing lists keep notification delivery and their SRS progress.
-  static const int _schemaVersion = 11;
+  // v12 restores standalone calls after v11 playlist call delivery.
+  // Retain the two compatibility columns; never downgrade a v11 database.
+  static const int _schemaVersion = 12;
   static const String _fileName = 'cupitor.db';
   static const int defaultProfileId = 1;
 
@@ -336,14 +336,12 @@ class CupitorDb {
             'ALTER TABLE notif_events ADD COLUMN step INTEGER');
       }
     }
-    if (oldV < 11 && newV >= 11) {
+    if (oldV < 12 && newV >= 12) {
       final cols = await db.rawQuery('PRAGMA table_info(notif_lists)');
-      final names = cols.map((c) => c['name']).toSet();
-      if (!names.contains('delivery')) {
-        await db.execute("ALTER TABLE notif_lists ADD COLUMN delivery TEXT NOT NULL DEFAULT 'notification'");
-      }
-      if (!names.contains('call_config')) {
-        await db.execute('ALTER TABLE notif_lists ADD COLUMN call_config TEXT');
+      if (cols.any((c) => c['name'] == 'delivery')) {
+        // Keep study progress, but do not silently turn old calls into alerts.
+        await db.rawUpdate("UPDATE notif_lists SET status = 'paused', "
+            "delivery = 'notification', call_config = NULL WHERE delivery = 'call'");
       }
     }
 
@@ -372,8 +370,6 @@ class CupitorDb {
         schedule_id   INTEGER REFERENCES notif_schedules(id),
         intro_schedule_id INTEGER REFERENCES notif_schedules(id),
         open_url      TEXT,
-        delivery      TEXT NOT NULL DEFAULT 'notification',
-        call_config   TEXT,
         status        TEXT NOT NULL,
         cursor        INTEGER NOT NULL DEFAULT 0,
         next_fire_at  INTEGER,

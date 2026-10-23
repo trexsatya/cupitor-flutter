@@ -55,6 +55,59 @@ void main() {
         externalKey: ek, scheduleId: eb!.id);
   }
 
+
+  group('schedule preview', () {
+    Future<List<Map>> preview(NotifListRow list) async =>
+        ((await service.schedulePreview(list))['rows'] as List).cast<Map>();
+
+    test('matches the actual capped arming plan without mutating or scheduling', () async {
+      final l = await seriesList();
+      final due = nowMs() + 600000;
+      for (var i = 0; i < 8; i++) {
+        await dao.insertItem(listId: l.id, title: 'i$i', position: i, nextDueAt: due + i * 100);
+      }
+      await dao.insertItem(listId: l.id, title: 'far', position: 8, nextDueAt: nowMs() + 49 * 3600000);
+      final before = await db.query('notif_items');
+      final rows = await preview(l);
+      expect(rows.where((r) => r['state'] == 'Planned'), hasLength(5));
+      expect(rows.where((r) => r['state'] == 'Not pre-armed — delivery cap'), hasLength(3));
+      expect(rows.last['state'], 'Outside the next 48 hours');
+      expect(rows.first['item_number'], 1);
+      expect(await db.query('notif_items'), before);
+      expect(channel.cancelAllCalls, 0); expect(channel.scheduled, isEmpty);
+      await service.rearm();
+      expect(rows.where((r) => r['when_ms'] != null).map((r) => r['when_ms']),
+          channel.scheduled.where((f) => !f.isSummary).map((f) => f.whenMs));
+      await dao.updateList(l.id, {'status': 'paused'});
+      expect((await preview(l)).every((r) => r['state'] == 'Paused' && r['when_ms'] == null), true);
+    });
+
+    test('recurring and introduction previews use current rotation, no invented later times', () async {
+      final daily = (await dao.scheduleByKey('daily_0900'))!;
+      final eb = (await dao.scheduleByKey('ebbinghaus'))!;
+      for (final intro in [false, true]) {
+        final l = await dao.createList(profileId: 1, name: 'R$intro', source: 'app',
+          scheduleId: intro ? eb.id : daily.id, introScheduleId: intro ? daily.id : null,
+          nextFireAt: nowMs() + 3600000);
+        for (var i = 0; i < 3; i++) { await dao.insertItem(listId: l.id, title: 'r$i', position: i); }
+        final rows = await preview(l);
+        expect(rows.first['when_ms'], nowMs() + 3600000);
+        expect(rows.first['item_number'], 1);
+        expect(rows.skip(1).every((r) => r['when_ms'] == null), true);
+        expect(rows.last['state'], intro ? 'Waiting for introduction' : 'Later in rotation');
+      }
+    });
+
+    test('global cap across profiles is applied before filtering this list', () async {
+      final l = await seriesList();
+      await db.insert('profiles', {'id': 2, 'name': 'Other', 'created_at': 1});
+      final other = await dao.createList(profileId: 2, name: 'Other', source: 'app');
+      for (var i = 0; i < 60; i++) { await dao.insertItem(listId: other.id, title: 'o$i', position: i, nextDueAt: nowMs() + (i + 1) * 60000); }
+      await dao.insertItem(listId: l.id, title: 'later', position: 0, nextDueAt: nowMs() + 62 * 60000);
+      expect((await preview(l)).single['state'], 'Not pre-armed — delivery cap');
+    });
+  });
+
   group('rearm', () {
     test('arms only strictly-future items inside 48h, stable ids, cancels first',
         () async {

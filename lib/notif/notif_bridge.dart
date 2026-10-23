@@ -4,7 +4,6 @@ import 'package:timezone/timezone.dart' as tz;
 
 import 'notif_dao.dart';
 import 'notif_ops.dart';
-import 'playlist_call.dart';
 import 'schedules.dart';
 import 'series_scheduler.dart';
 import 'waking_clock.dart';
@@ -25,7 +24,6 @@ class NotifCapabilities {
   Map<String, Object?> toJson() => {
         'supported': supported, 'permission': permission,
         'exact_alarms': exactAlarms, 'actions': actions, 'platform': platform,
-        'delivery_modes': ['notification', if (platform == 'android') 'call'],
       };
 }
 
@@ -48,6 +46,7 @@ class NotifBridge {
 
   /// Plan 2 hooks rearm() here; null until then.
   final Future<void> Function()? onMutated;
+  final Future<Map<String, Object?>> Function(NotifListRow)? schedulePreview;
 
   NotifBridge({
     required this.dao,
@@ -58,6 +57,7 @@ class NotifBridge {
     required this.window,
     required this.now,
     this.onMutated,
+    this.schedulePreview,
   });
 
   void _ack(String? requestId, String op, bool ok,
@@ -94,9 +94,16 @@ class NotifBridge {
     try {
       switch (op) {
         case 'getCapabilities':
-          _ack(reqId, op, true, data: (await capabilities()).toJson());
+          _ack(reqId, op, true, data: {...(await capabilities()).toJson(), 'schedule_preview': schedulePreview != null});
         case 'requestPermission':
           _ack(reqId, op, true, data: {'permission': await requestPermission()});
+        case 'getSchedulePreview':
+          final d = await _daoOrAck(reqId, op);
+          if (d == null) return;
+          final list = await _listOrAck(d, reqId, op, m['external_key']);
+          if (list == null) return;
+          if (schedulePreview == null) { _ack(reqId, op, false, error: 'unsupported'); return; }
+          _ack(reqId, op, true, data: await schedulePreview!(list));
         case 'getSchedules':
           await _getSchedules(reqId);
         case 'createList':
@@ -113,8 +120,6 @@ class NotifBridge {
           await _grade(reqId, m);
         case 'setSchedule':
           await _setSchedule(reqId, m);
-        case 'setDelivery':
-          await _setDelivery(reqId, m);
         case 'setStatus':
           await _setStatus(reqId, m);
         case 'deleteList':
@@ -208,8 +213,6 @@ class NotifBridge {
         'intro_schedule_key': introSchedule?.key,
         'open_url': l.openUrl,
         'status': l.status,
-        'delivery': l.delivery,
-        'call_config': l.callConfig == null ? null : jsonDecode(l.callConfig!),
         'next_fire_at': l.nextFireAt,
         'items': [
           for (final i in items)
@@ -294,19 +297,6 @@ class NotifBridge {
       _ack(reqId, op, false, error: 'bad_payload');
       return;
     }
-    final delivery = m['delivery'] ?? 'notification';
-    Map<String, Object?>? callConfig;
-    if (delivery != 'notification' && delivery != 'call') {
-      _ack(reqId, op, false, error: 'bad_payload'); return;
-    }
-    if (delivery == 'call') {
-      if ((await capabilities()).platform != 'android') {
-        _ack(reqId, op, false, error: 'unsupported'); return;
-      }
-      try { callConfig = parseCallConfig(m['call_config'] ?? {}); }
-      on FormatException { _ack(reqId, op, false, error: 'bad_call'); return; }
-      if (!_callItemsValid(items)) { _ack(reqId, op, false, error: 'bad_call'); return; }
-    }
     final profileId = activeProfileId();
     if (await d.listByExternalKey(profileId, key) != null) {
       _ack(reqId, op, false, error: 'duplicate_key');
@@ -337,8 +327,7 @@ class NotifBridge {
         profileId: profileId, name: name, source: 'webpage',
         externalKey: key, scheduleId: schedule.id,
         introScheduleId: intro?.id, openUrl: listOpenUrl as String?,
-        nextFireAt: nextFireAt, delivery: delivery as String,
-        callConfig: callConfig == null ? null : jsonEncode(callConfig));
+        nextFireAt: nextFireAt);
     var pos = 0;
     for (final it in items) {
       await _insertParsedItem(d, list.id, it, pos++, offsets, t, w);
@@ -359,9 +348,6 @@ class NotifBridge {
     }
     final list = await _listOrAck(d, reqId, op, m['external_key']);
     if (list == null) return;
-    if (list.delivery == 'call' && !_callItemsValid(items)) {
-      _ack(reqId, op, false, error: 'bad_call'); return;
-    }
     // List-level deep link: present-and-string sets, present-and-null
     // clears, absent leaves unchanged.
     if (m.containsKey('open_url')) {
@@ -546,42 +532,6 @@ class NotifBridge {
       'grade': grade,
       'source': 'webpage',
     });
-    _ack(reqId, op, true);
-    await _afterMutation(d);
-  }
-
-  bool _callItemsValid(List<_ItemInput> items) => items.every((i) {
-    if (i.payloadJson == null) return false;
-    final payload = jsonDecode(i.payloadJson!);
-    return payload is Map && validPlaylistQuestion(payload['study_call']);
-  });
-
-  /// Delivery changes keep identity, schedules and SRS progress intact.
-  Future<void> _setDelivery(String? reqId, Map<String, dynamic> m) async {
-    const op = 'setDelivery';
-    final d = await _daoOrAck(reqId, op);
-    if (d == null) return;
-    final list = await _listOrAck(d, reqId, op, m['external_key']);
-    if (list == null) return;
-    final delivery = m['delivery'];
-    if (delivery != 'notification' && delivery != 'call') {
-      _ack(reqId, op, false, error: 'bad_payload'); return;
-    }
-    Map<String, Object?>? config;
-    if (delivery == 'call') {
-      if ((await capabilities()).platform != 'android') {
-        _ack(reqId, op, false, error: 'unsupported'); return;
-      }
-      try { config = parseCallConfig(m['call_config'] ?? {}); }
-      on FormatException { _ack(reqId, op, false, error: 'bad_call'); return; }
-      final items = await d.itemsForList(list.id);
-      if (items.any((i) {
-        final payload = i.payload == null ? null : jsonDecode(i.payload!);
-        return payload is! Map || !validPlaylistQuestion(payload['study_call']);
-      })) { _ack(reqId, op, false, error: 'bad_call'); return; }
-    }
-    await d.updateList(list.id, {'delivery': delivery,
-      'call_config': config == null ? null : jsonEncode(config)});
     _ack(reqId, op, true);
     await _afterMutation(d);
   }

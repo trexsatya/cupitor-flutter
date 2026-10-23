@@ -10,7 +10,9 @@ default when a system speech recognizer is available.
 
 The language webapp exposes **Settings → Study calls** when `CallBridge` exists.
 It can compose a question, copy text from a synced study reminder, call now,
-schedule a one-off call, cancel a pending call, and view saved answers.
+schedule a one-off call, import JSON files, and manage pending calls. Add, edit,
+enable/disable or remove a scheduled call. History is hidden behind its button
+and contains at most the latest 100 finished calls across profiles.
 
 The bridge mirrors `NotifBridge`: JSON over a WebView channel and CustomEvents
 back to the page, with one acknowledgement for every request.
@@ -42,13 +44,17 @@ Operations:
 
 | Operation | Input | Result in `cupitorCallAck.data` |
 | --- | --- | --- |
-| `getCapabilities` | — | `supported`, `permission`, `full_screen`, `exact_alarms`, `speech_input`, `answer_types`, `default_retries` |
+| `getCapabilities` | — | `supported`, `permission`, `full_screen`, `exact_alarms`, `speech_input`, `answer_types`, `default_retries`, `batch_schedule`, `edit_scheduled`, `pending_controls`, `history_limit` |
 | `requestPermission` | — | `permission` after the Android notification prompt |
 | `openFullScreenSettings` | — | Opens Android special-access settings |
 | `openAlarmSettings` | — | Opens exact-alarm settings |
 | `getCalls` | — | `{version:1,calls:[...]}`, also emitted as `cupitorCalls` |
 | `callNow` | `title,question,language`, answer fields below | `{id,exact}` |
 | `schedule` | Same fields plus future `when_ms` | `{id,exact}` |
+| `scheduleBatch` | `{calls:[...]}` (1–50 complete call objects) | `{ids:[...]}` |
+| `update` | `id` plus complete replacement question/time/answer fields | `{id}` |
+| `setEnabled` | `id,enabled` | `true` |
+| `remove` | `id` (scheduled/disabled only) | `true` |
 | `cancel` | `id` | `true` (idempotent for terminal calls) |
 
 Acknowledgements: `{request_id,op,ok,data?,error?}` in `cupitorCallAck`.
@@ -65,6 +71,56 @@ Voice answers include `spoken_response`; attempts retain the text, marking,
 mode, timestamp and a reason for missing/unrecognized speech. The host injects the active profile; callers cannot choose another
 profile. History is scoped to that profile. Copied reminder text is a snapshot;
 an answer is saved as a call result and does not change notification grading.
+
+## Import and editing
+
+The Import file view accepts a UTF-8 JSON file up to 1 MB. Download example JSON
+from that view. A file contains an array of calls or a versioned object:
+
+```json
+{
+  "version": 1,
+  "defaults": {"language": "sv-SE", "max_retries": 3, "match_threshold": 0.8, "voice_response": true},
+  "calls": [
+    {"title": "Swedish", "question": "Vad betyder försynt?", "choices": ["Stillsam", "Högljudd"], "correct_choice_index": 0},
+    {"title": "Geography", "question": "Vad heter Sveriges huvudstad?", "response_type": "text", "accepted_answers": ["Stockholm", "Stockholms stad"], "enabled": false}
+  ]
+}
+```
+
+All calls are validated before importing. Review rows support editing, removal
+and enabled state. Edit custom alternatives and select the correct one, or edit
+accepted free-response answers. Export edited calls preserves those changes.
+Optional per-call `when_ms` (epoch milliseconds) or `when` (ISO with timezone)
+keeps its explicit date. Otherwise call N uses the selected first time plus
+N−1 intervals. Files never ring the phone automatically.
+
+Add imported calls to pending list sends one `scheduleBatch`. Native code
+validates every row and pending capacity before writing, and removes newly
+added rows/alarms if any alarm fails to arm. Disabled rows are stored but do not
+arm alarms. Editing preserves the call ID and creation time, resets unanswered
+attempt fields, and replaces its alarm. Only scheduled/disabled calls can be
+edited, enabled/disabled or removed; an active call can be cancelled. A disabled
+call whose date has passed needs a future date before enabling it. Disabling
+cancels its alarm without adding history; removal deletes the pending row.
+
+## Notification schedule preview
+
+The notification dialog scrolls within the viewport. Each enabled playlist has
+View schedule, which uses `NotifBridge.getSchedulePreview({external_key})`.
+Capabilities advertise `schedule_preview`. The read-only response includes
+`rows` (up to 200), `item_count`, `window_start`, `window_end`, list name/status.
+Each row has `item_number` (position + 1), title, `when_ms`, `next_due_at`, state.
+It uses the same next-48-hour plan and global delivery caps as notification
+arming. Only the next current rotation/introduction fire is planned; later items
+show their waiting state. Paused/overdue/outside-window/capped items are labeled.
+This is a plan, not a guarantee of delivery under Android timing restrictions.
+
+This release removes playlist call delivery. Upgrading schema v11 to v12
+preserves progress and pauses former call lists, instead of converting them to
+active notifications. Old native call rows carrying `notif_id` are cancelled on
+upgrade/boot or when their alarm fires. Standalone calls and regular
+notification lists keep their existing behavior.
 
 ## Questions, marking and retries
 
@@ -133,7 +189,7 @@ do not replace the current question; overlapping fires become missed. Unanswered
 ringing ends after 45 seconds. An unanswered active question expires after ten
 minutes; a process death during an answered call is recorded as interrupted.
 
-Bounds: 50 pending calls across profiles, last 200 terminal calls across
+Bounds: 50 pending calls across profiles, last 100 terminal calls across
 profiles, 2–9 alternatives (up to 200 characters each), 120-character title,
 4000-character question, scheduled within 366 days. UTF-8 text and locale tags
 such as `sv-SE` and `en-GB` are supported; the corresponding Android TTS voice
@@ -169,42 +225,3 @@ the existing review scheduler's cancel-all operation must not remove them.
 Deploy the matching webapp source from `trexsatya/cupitor:music-study-app` and
 install the updated Android build. Generated `trexsatya.github.io` app files are
 not the source of this feature.
-
-## Playlist calls
-
-Playlist calls use the existing NotifBridge list flow. `createList` accepts
-`delivery: "call"` and `call_config` (`language`, `max_retries`,
-`match_threshold`, `voice_response`). `getCapabilities.delivery_modes` advertises
-support; existing and migrated lists default to `notification`.
-`setDelivery` changes delivery/configuration without replacing identity or SRS
-state. Each item's `payload.study_call` contains the full question and answer
-key using the existing call schema. Invalid keys/settings reject before mutation.
-`syncItems`, `setSchedule`, `setStatus`, and `deleteList` retain their meanings.
-
-The same recurring/series scheduler, introduction cadence, waking window,
-per-fire cap, profile isolation and background sweeps apply. A `PendingFire`
-with a call payload goes to native ringing instead of the notification plugin;
-call lists do not post shade grouping summaries. Original due timestamps make
-armed and catch-up deliveries idempotent. Overlapping playlist calls queue at
-one-minute intervals for up to two hours instead of interrupting an answer.
-Pausing, removing items or changing delivery cancels their pending call alarms.
-Rearming preserves conversations, queued due calls and one-off calls.
-
-Native classes now live in the local `study_calls_native` Flutter plugin, so
-Flutter automatically registers the internal `cupitor/playlist_calls` channel
-in Workmanager's headless engine as well as the foreground engine. The public
-`CallBridge` stays profile-scoped in the host. No browser or active WebView is
-needed when a scheduled call rings.
-
-The webapp's Study calls button opens the same playlist scheduling dialog as
-Notifications, with Calls selected. Paired cards read one side and expect the
-other (direction selectable). One-sided cards and word groups explicitly ask
-for repetition. Multiple choice uses distinct answers from the same playlist;
-free response uses the full card answer. Oversized/unusable entries are counted
-as skipped, never truncated into incorrect answer keys. Disabled items are
-excluded; playlist edits resync with stable notification item ids. Editing call
-settings preserves the existing schedule and progress. The one-off composer and
-saved call answers remain accessible from Call history / one-off call.
-
-Device checks still required: ringing/lockscreen, microphone and TTS, plus
-headless worker rearming, pause/delete and a queue of simultaneous due calls.

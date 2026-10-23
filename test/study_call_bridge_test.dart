@@ -49,6 +49,19 @@ void main() {
     },
   );
 
+  test('new pending operations use host profile and publish a snapshot', () async {
+    for (final op in ['scheduleBatch', 'update', 'setEnabled', 'remove']) {
+      invocations.clear(); events.clear();
+      await bridge.handle(jsonEncode({'op': op, 'request_id': op,
+        'profile_id': 99, 'id': 'x', 'enabled': false,
+        'calls': [{'profile_id': 99}]}));
+      expect(invocations.map((i) => i.$1), [op, 'getCalls']);
+      expect(invocations.first.$2['profile_id'], 7);
+      expect(events.first.$2['ok'], true);
+      expect(events.last.$1, 'cupitorCalls');
+    }
+  });
+
   test('a failed refresh cannot produce a contradictory second ack', () async {
     refreshFails = true;
     await bridge.handle('{"op":"callNow","request_id":"r"}');

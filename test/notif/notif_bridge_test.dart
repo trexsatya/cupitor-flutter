@@ -111,6 +111,27 @@ void main() {
     });
   });
 
+  test('schedule preview is profile scoped, read-only and capability gated', () async {
+    await createFrenchList();
+    await bridge.handle('{"op":"getSchedulePreview","external_key":"fr-1"}');
+    expect(lastAck()['error'], 'unsupported');
+    var previews = 0;
+    final previewBridge = NotifBridge(dao: () async => dao, activeProfileId: () => 1,
+      emit: (e, d) => events.add((e, d)), capabilities: bridge.capabilities,
+      requestPermission: bridge.requestPermission, window: bridge.window, now: () => now,
+      schedulePreview: (list) async { previews++; return {'external_key': list.externalKey, 'rows': <Object>[]}; });
+    await previewBridge.handle('{"op":"getCapabilities"}');
+    expect((lastAck()['data'] as Map)['schedule_preview'], true);
+    events.clear();
+    await previewBridge.handle('{"op":"getSchedulePreview","external_key":"fr-1","request_id":"preview"}');
+    expect(events, hasLength(1)); expect(lastAck()['request_id'], 'preview');
+    expect((lastAck()['data'] as Map)['external_key'], 'fr-1'); expect(previews, 1);
+    await db.insert('profiles', {'id': 2, 'name': 'Other', 'created_at': 1});
+    await dao.createList(profileId: 2, name: 'Private', source: 'app', externalKey: 'private');
+    await previewBridge.handle('{"op":"getSchedulePreview","external_key":"private"}');
+    expect(lastAck()['ok'], false); expect(previews, 1);
+  });
+
   group('getSchedules', () {
     test('emits the 7 built-ins with keys and configs', () async {
       await bridge.handle('{"op":"getSchedules","request_id":"r6"}');
