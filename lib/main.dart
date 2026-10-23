@@ -59,6 +59,7 @@ import 'page_zoom.dart';
 import 'scroll_diagnostics.dart';
 import 'search_index.dart';
 import 'notif/notif_bridge.dart';
+import 'study_call_bridge.dart';
 import 'account/account_bridge.dart';
 import 'account/device_signin_dialog.dart';
 import 'notif/notif_channel.dart';
@@ -405,6 +406,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     now: () => tz.TZDateTime.now(tz.local),
     onMutated: () => notifService.rearm(),
   );
+  late final StudyCallBridge _studyCallBridge = StudyCallBridge(
+    activeProfileId: () => ProfileService.currentId,
+    emit: _emitNotifEvent,
+  );
   // Language-app ↔ Cupitor bridge for the account feature: GitHub device
   // sign-in / sign-out on the page's request. Contract:
   // docs/webapp-integration-spec.md §3 "AccountBridge". The token never
@@ -594,6 +599,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         _flushContinuousTranscript();
       }
       _sweepThenPush(); // resume catch-up + rearm (spec: sweep callers)
+      _studyCallBridge.handle('{"op":"getCalls"}');
     } else if (state == AppLifecycleState.paused) {
       WakelockPlus.disable();
       // Don't leave the mic open behind a backgrounded app — the OEM revokes
@@ -2029,6 +2035,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   Future<void> _onProfileChanged() async {
+    await _studyCallBridge.handle('{"op":"getCalls"}');
     // Clear all existing paint/state from the JS side, load the new
     // profile's filter + mask prefs, then re-rehydrate the current
     // page under the new profile.
@@ -8585,6 +8592,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // Ops + events: spec §Bridge. Acks via cupitorNotifAck.
         ..addJavaScriptChannel('NotifBridge',
             onMessageReceived: (msg) => _notifBridge.handle(msg.message))
+        ..addJavaScriptChannel('CallBridge',
+            onMessageReceived: (msg) => _studyCallBridge.handle(msg.message))
         // Language-app ↔ Cupitor bridge for the account feature
         // (docs/webapp-integration-spec.md §3.9).
         // Ops signIn / signOut / getStatus, acks via cupitorAccountAck.
@@ -10470,6 +10479,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     await _notifBridge.handle('{"op":"getSchedules"}');
     await _notifBridge.handle('{"op":"getLists"}');
     await _notifBridge.handle('{"op":"getNotifications"}');
+    await _studyCallBridge.handle('{"op":"getCalls"}');
   }
 
   /// Sweep, then refresh the webpage's notification feed — fires the sweep
