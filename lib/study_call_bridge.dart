@@ -18,12 +18,19 @@ class StudyCallBridge {
     Future<Object?> Function(String, Map<String, Object?>)? invoke,
     bool? supported,
   }) : invoke = invoke ?? ((op, args) => channel.invokeMethod(op, args)),
-       supported = supported ??
+       supported =
+           supported ??
            (!kIsWeb && defaultTargetPlatform == TargetPlatform.android);
 
   static const _ops = {
-    'getCapabilities', 'requestPermission', 'openFullScreenSettings',
-    'openAlarmSettings', 'getCalls', 'callNow', 'schedule', 'cancel',
+    'getCapabilities',
+    'requestPermission',
+    'openFullScreenSettings',
+    'openAlarmSettings',
+    'getCalls',
+    'callNow',
+    'schedule',
+    'cancel',
   };
 
   Future<void> handle(String raw) async {
@@ -31,11 +38,14 @@ class StudyCallBridge {
     var op = 'unknown';
     void ack(bool ok, {Object? data, String? error}) {
       emit('cupitorCallAck', {
-        'request_id': requestId, 'op': op, 'ok': ok,
+        'request_id': requestId,
+        'op': op,
+        'ok': ok,
         if (data != null) 'data': data,
         if (error != null) 'error': error,
       });
     }
+
     try {
       final decoded = jsonDecode(raw);
       if (decoded is! Map<String, dynamic>) {
@@ -43,7 +53,8 @@ class StudyCallBridge {
         return;
       }
       requestId = decoded['request_id'] is String
-          ? decoded['request_id'] as String : null;
+          ? decoded['request_id'] as String
+          : null;
       op = decoded['op'] is String ? decoded['op'] as String : 'unknown';
       if (!_ops.contains(op)) {
         ack(false, error: 'unknown_op');
@@ -59,9 +70,7 @@ class StudyCallBridge {
       }
       // Never accept a profile supplied by page JavaScript.
       final profile = activeProfileId();
-      final result = await invoke(op, {
-        ...decoded, 'profile_id': profile,
-      });
+      final result = await invoke(op, {...decoded, 'profile_id': profile});
       if (profile != activeProfileId()) {
         ack(false, error: 'profile_changed');
         return;

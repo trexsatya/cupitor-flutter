@@ -318,6 +318,8 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private var tts: TextToSpeech? = null
     private var ready = false
     private var answered = false
+    private var started = false
+    private var needsInitialReading = true
     private var focus: AudioFocusRequest? = null
     private lateinit var body: LinearLayout
     private lateinit var message: TextView
@@ -393,12 +395,12 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         ready = status == TextToSpeech.SUCCESS
-        if (answered && ready && !isFinishing) speak()
+        if (answered && ready && started && !isFinishing) speak()
         else if (answered && !ready) message.append("\n\nSpeech unavailable. You can still choose an answer.")
     }
 
     private fun speak() {
-        if (!ready || !answered || isFinishing) return
+        if (!ready || !answered || !started || isFinishing) return
         val row = StudyCalls.find(this, id) ?: return
         if (row.optString("status") != "answered") return
         val language = tts?.setLanguage(Locale.forLanguageTag(row.getString("language")))
@@ -421,12 +423,26 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             "${it + 1}. ${choices.getString(it)}"
         }
         tts?.stop()
+        needsInitialReading = false
         spoken.chunked(3000).forEachIndexed { i, chunk ->
             tts?.speak(chunk, TextToSpeech.QUEUE_ADD, null, "study-$id-$i")
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        started = true
+        if (answered && ready && needsInitialReading) speak()
+    }
+
+    override fun onPause() {
+        started = false
+        tts?.stop()
+        super.onPause()
+    }
+
     override fun onStop() {
+        started = false
         tts?.stop()
         if (Build.VERSION.SDK_INT >= 26) focus?.let { getSystemService(AudioManager::class.java)?.abandonAudioFocusRequest(it) }
         super.onStop()

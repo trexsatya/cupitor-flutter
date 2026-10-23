@@ -65,6 +65,7 @@
         <receiver android:exported="false"
             android:name="com.dexterous.flutterlocalnotifications.ActionBroadcastReceiver" />
         <activity android:name=".StudyCallActivity" android:exported="false"
+            android:taskAffinity="" android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Material.Light.NoActionBar"
             android:showWhenLocked="true" android:turnScreenOn="true" />
         <receiver android:name=".StudyCallReceiver" android:exported="false">

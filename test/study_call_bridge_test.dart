@@ -31,13 +31,23 @@ void main() {
     );
   });
 
-  test('host supplies profile; successful mutation acks once and pushes history', () async {
-    await bridge.handle(jsonEncode({'op': 'schedule', 'request_id': 'r', 'profile_id': 99}));
-    expect(invocations.map((i) => i.$1), ['schedule', 'getCalls']);
-    expect(invocations.every((i) => i.$2['profile_id'] == 7), true);
-    expect(events.map((e) => e.$1), ['cupitorCallAck', 'cupitorCalls']);
-    expect(events.first.$2, {'request_id': 'r', 'op': 'schedule', 'ok': true, 'data': {'id': 'native-id'}});
-  });
+  test(
+    'host supplies profile; successful mutation acks once and pushes history',
+    () async {
+      await bridge.handle(
+        jsonEncode({'op': 'schedule', 'request_id': 'r', 'profile_id': 99}),
+      );
+      expect(invocations.map((i) => i.$1), ['schedule', 'getCalls']);
+      expect(invocations.every((i) => i.$2['profile_id'] == 7), true);
+      expect(events.map((e) => e.$1), ['cupitorCallAck', 'cupitorCalls']);
+      expect(events.first.$2, {
+        'request_id': 'r',
+        'op': 'schedule',
+        'ok': true,
+        'data': {'id': 'native-id'},
+      });
+    },
+  );
 
   test('a failed refresh cannot produce a contradictory second ack', () async {
     refreshFails = true;
@@ -46,32 +56,50 @@ void main() {
     expect(events.single.$2['ok'], true);
   });
 
-  test('bad JSON, nonobjects, unknown operations and platform errors all ack', () async {
-    for (final input in ['{bad', '[]', 'null']) {
-      await bridge.handle(input);
-      expect(events.last.$2['error'], 'bad_json');
-    }
-    await bridge.handle('{"op":"oops"}');
-    expect(events.last.$2['error'], 'unknown_op');
-    await bridge.handle('{"op":"cancel"}');
-    expect(events.last.$2['error'], 'unknown_call');
-  });
+  test(
+    'bad JSON, nonobjects, unknown operations and platform errors all ack',
+    () async {
+      for (final input in ['{bad', '[]', 'null']) {
+        await bridge.handle(input);
+        expect(events.last.$2['error'], 'bad_json');
+      }
+      await bridge.handle('{"op":"oops"}');
+      expect(events.last.$2['error'], 'unknown_op');
+      await bridge.handle('{"op":"cancel"}');
+      expect(events.last.$2['error'], 'unknown_call');
+    },
+  );
 
-  test('non-Android advertises unsupported and never invokes native code', () async {
-    final unsupported = StudyCallBridge(supported: false,
-        activeProfileId: () => 1, emit: (e, d) => events.add((e, d)),
-        invoke: (_, __) async => fail('unexpected native call'));
-    await unsupported.handle('{"op":"getCapabilities"}');
-    expect(events.single.$2['data'], {'supported': false});
-    await unsupported.handle('{"op":"callNow"}');
-    expect(events.last.$2['error'], 'unsupported');
-  });
+  test(
+    'non-Android advertises unsupported and never invokes native code',
+    () async {
+      final unsupported = StudyCallBridge(
+        supported: false,
+        activeProfileId: () => 1,
+        emit: (e, d) => events.add((e, d)),
+        invoke: (_, __) async => fail('unexpected native call'),
+      );
+      await unsupported.handle('{"op":"getCapabilities"}');
+      expect(events.single.$2['data'], {'supported': false});
+      await unsupported.handle('{"op":"callNow"}');
+      expect(events.last.$2['error'], 'unsupported');
+    },
+  );
 
-  test('profile switch during an async fetch never publishes another profile snapshot', () async {
-    bridge = StudyCallBridge(supported: true,
-      activeProfileId: () => profile, emit: (e, d) => events.add((e, d)),
-      invoke: (_, __) async { profile = 8; return {'calls': []}; });
-    await bridge.handle('{"op":"getCalls"}');
-    expect(events.where((e) => e.$1 == 'cupitorCalls'), isEmpty);
-  });
+  test(
+    'profile switch during an async fetch never publishes another profile snapshot',
+    () async {
+      bridge = StudyCallBridge(
+        supported: true,
+        activeProfileId: () => profile,
+        emit: (e, d) => events.add((e, d)),
+        invoke: (_, __) async {
+          profile = 8;
+          return {'calls': []};
+        },
+      );
+      await bridge.handle('{"op":"getCalls"}');
+      expect(events.where((e) => e.$1 == 'cupitorCalls'), isEmpty);
+    },
+  );
 }
