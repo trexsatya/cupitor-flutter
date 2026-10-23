@@ -6,13 +6,19 @@ Map<String, Object?> parseCallConfig(Object? raw) {
   final retries = raw['max_retries'] ?? 3;
   final threshold = raw['match_threshold'] ?? 0.8;
   final voice = raw['voice_response'] ?? true;
+  final direction = raw['direction'];
+  final type = raw['answer_type'] ?? raw['response_type'];
   if (language is! String ||
       !RegExp(r'^[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?$').hasMatch(language) ||
       retries is! int || retries < 0 || retries > 10 ||
       threshold is! num || !threshold.isFinite || threshold < 0.7 || threshold > 1 ||
-      voice is! bool) throw const FormatException('bad_call');
+      voice is! bool ||
+      (direction != null && direction != 'source-target' && direction != 'target-source') ||
+      (type != null && type != 'text' && type != 'choice')) throw const FormatException('bad_call');
   return {'language': language, 'max_retries': retries,
-    'match_threshold': threshold, 'voice_response': voice};
+    'match_threshold': threshold, 'voice_response': voice,
+    if (direction != null) 'direction': direction,
+    if (type != null) 'answer_type': type};
 }
 
 bool validPlaylistQuestion(Object? raw) {

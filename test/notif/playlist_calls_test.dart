@@ -28,7 +28,7 @@ void main() {
   Future<void> create({String schedule = 'ebbinghaus', String? intro}) => send('createList', {
     'external_key': 'geo', 'name': 'Geography', 'delivery': 'call',
     'schedule_key': schedule, if (intro != null) 'intro_schedule_key': intro,
-    'call_config': {'max_retries': 3, 'language': 'sv-SE'}, 'items': [item('one'), item('two')],
+    'call_config': {'max_retries': 3, 'language': 'sv-SE', 'direction': 'target-source', 'response_type': 'text'}, 'items': [item('one'), item('two')],
   });
   setUpAll(() {
     sqfliteFfiInit(); databaseFactory = databaseFactoryFfi;
@@ -55,6 +55,8 @@ void main() {
     await create(); expect(ack()['ok'], true);
     final list = (await dao.listByExternalKey(1, 'geo'))!;
     expect(list.delivery, 'call');
+    expect(jsonDecode(list.callConfig!), containsPair('direction', 'target-source'));
+    expect(jsonDecode(list.callConfig!), containsPair('answer_type', 'text'));
     var first = (await dao.itemsForList(list.id)).first;
     await dao.updateItem(first.id, {'step': 2});
     await send('syncItems', {'external_key': 'geo', 'mode': 'replace', 'items': [item('one')]});
