@@ -234,6 +234,24 @@ assumed or forced. A force-stopped app cannot receive alarms until reopened.
 The Android integration is `cupitor/study_calls` (MethodChannel) and
 `StudyCalls.kt`. Native activity speech stops when backgrounded; **Read again**
 restarts it. Unsupported/missing voices leave readable text and answer buttons.
+
+Answered calls use communication audio (`MODE_IN_COMMUNICATION`,
+`USAGE_VOICE_COMMUNICATION` and the call-volume stream). They automatically use
+a connected wired/USB or Bluetooth call headset, otherwise the phone earpiece.
+The native screen shows the current audio route and a **Speaker** toggle. Devices
+without an earpiece use their speaker when no headset is available. The ringtone
+continues to use the notification channel's normal ringing behavior.
+
+Android 12+ uses `setCommunicationDevice`, including Bluetooth LE Audio. Older
+Android versions establish Bluetooth SCO and wait for its connected event before
+reading or listening. Changing devices pauses current speech/listening while the
+new route connects; cancellation does not use an answer attempt. A headset that
+fails to connect leaves on-screen answers available. Routing stays active between
+TTS and speech recognition so Android can select the matching communication
+microphone; actual microphone support also depends on the recognition service.
+Pausing, ending or destroying the screen releases the communication device,
+Bluetooth connection request, call mode and audio focus.
+
 Study-call notifications use their own native channel and alarm identities;
 the existing review scheduler's cancel-all operation must not remove them.
 

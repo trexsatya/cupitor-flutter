@@ -12,7 +12,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.RingtoneManager
@@ -594,6 +593,18 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private var started = false
     private var needsInitialReading = true
     private var focus: AudioFocusRequest? = null
+    private var callAudio: StudyCallAudio? = null
+    private var audioStatus: TextView? = null
+    private var speakerButton: Button? = null
+    private var listenOnAudioReady = false
+    private var lastReadUtterance: String? = null
+    private val focusListener = AudioManager.OnAudioFocusChangeListener {
+        if (it < 0) {
+            needsInitialReading = true
+            stopReading(); voice?.cancel()
+            callAudio?.stop("Audio interrupted. Tap Read again to resume.")
+        }
+    }
     private lateinit var body: LinearLayout
     private lateinit var message: TextView
     private lateinit var voiceStatus: TextView
@@ -645,6 +656,25 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         body.addView(message)
         voiceStatus = TextView(this).apply { textSize = 16f; setTextColor(Color.DKGRAY) }
         body.addView(voiceStatus)
+        callAudio = StudyCallAudio(this, savedInstanceState?.getBoolean("study_speaker") == true) { state ->
+            audioStatus?.text = "Audio: ${state.label}"
+            speakerButton?.apply {
+                text = if (state.speaker) "Speaker: on" else "Speaker: off"
+                isSelected = state.speaker
+                isEnabled = state.ready && state.canToggleSpeaker
+            }
+            if (!state.ready) {
+                if (started && answered && !finalFeedback) {
+                    if (lastReadUtterance != null) needsInitialReading = true
+                    if (voice?.listening == true) listenOnAudioReady = true
+                }
+                stopReading(); voice?.cancel()
+            } else handler.post {
+                if (!isAnsweredAndResumed() || callAudio?.state?.ready != true) return@post
+                if (listenOnAudioReady) { listenOnAudioReady = false; beginVoiceAnswer() }
+                else if (ready && needsInitialReading) speak()
+            }
+        }
         voice = StudyCallVoice(this,
             isActive = { isAnsweredAndResumed() },
             onStatus = { showVoiceStatus(it) },
@@ -661,6 +691,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             override fun onStart(utteranceId: String?) {}
             override fun onDone(utteranceId: String?) {
                 handler.post {
+                    if (utteranceId == lastReadUtterance) lastReadUtterance = null
                     if (utteranceId == null || utteranceId != autoListenUtterance) return@post
                     autoListenUtterance = null
                     val completedBatch = speechBatch
@@ -696,6 +727,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private fun render() {
         while (body.childCount > 4) body.removeViewAt(4)
         voiceButton = null
+        audioStatus = null; speakerButton = null
         answerEntry = null
         val row = StudyCalls.find(this, id) ?: return
         voiceStatus.visibility = if (answered) View.VISIBLE else View.GONE
@@ -705,6 +737,18 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             button("Decline") { StudyCalls.finish(this, id, "declined"); finish() }
         } else {
             message.text = row.getString("question")
+            val audioState = callAudio?.state
+            audioStatus = TextView(this).apply {
+                text = "Audio: ${audioState?.label ?: "Connecting…"}"
+                textSize = 16f; setTextColor(Color.DKGRAY)
+            }.also { body.addView(it) }
+            speakerButton = button(if (audioState?.speaker == true) "Speaker: on" else "Speaker: off") {
+                callAudio?.let { it.setSpeaker(!it.state.speaker) }
+            }.apply {
+                contentDescription = "Toggle call speaker"
+                isSelected = audioState?.speaker == true
+                isEnabled = audioState?.ready == true && audioState.canToggleSpeaker
+            }
             val choices = row.getJSONArray("choices")
             if (responseType == "text") {
                 answerEntry = EditText(this).apply {
@@ -743,6 +787,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private fun answer() {
         if (StudyCalls.find(this, id)?.optString("status") != "ringing") return
         answered = true
+        volumeControlStream = AudioManager.STREAM_VOICE_CALL
         StudyCalls.update(this, id) { it.put("status", "answered").put("answered_at", System.currentTimeMillis()) }
         StudyCalls.dismiss(this, id)
         render()
@@ -751,6 +796,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         ready = status == TextToSpeech.SUCCESS
+        if (ready) tts?.setAudioAttributes(StudyCallAudio.attributes)
         if (answered && ready && started && !isFinishing) speak()
         else if (answered && !ready) message.append("\n\nSpeech unavailable. You can still choose an answer.")
     }
@@ -763,21 +809,18 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         voice?.cancel()
         val row = StudyCalls.find(this, id) ?: return
         if (row.optString("status") != "answered") return
+        if (callAudio?.state?.ready != true) {
+            needsInitialReading = true
+            callAudio?.start()
+            return
+        }
         val language = tts?.let { StudyCallSpeech.configure(it, this, row) }
         if (language == TextToSpeech.LANG_MISSING_DATA || language == TextToSpeech.LANG_NOT_SUPPORTED) {
             message.text = row.getString("question") + "\n\nInstall a voice for ${row.getString("language")} in Android speech settings."
             return
         }
-        val audio = getSystemService(AudioManager::class.java) ?: return
-        val attributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
-        tts?.setAudioAttributes(attributes)
-        if (Build.VERSION.SDK_INT >= 26) {
-            if (focus == null) focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setAudioAttributes(attributes).setOnAudioFocusChangeListener {
-                    if (it < 0) stopReading()
-                }.build()
-            if (audio.requestAudioFocus(focus!!) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) return
-        }
+        tts?.setAudioAttributes(StudyCallAudio.attributes)
+        if (!requestSpeechFocus()) return
         val choices = row.getJSONArray("choices")
         // One utterance may exceed an engine's input limit: queue bounded
         // chunks, keeping the complete question and all numbered alternatives.
@@ -796,9 +839,11 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         val chunks = spoken.chunked(3000)
         val batch = ++speechBatch
         autoListenUtterance = if (voiceResponse && voiceAvailable) "study-$id-$batch-${chunks.lastIndex}" else null
+        lastReadUtterance = "study-$id-$batch-${chunks.lastIndex}"
         chunks.forEachIndexed { i, chunk ->
             if (tts?.speak(chunk, TextToSpeech.QUEUE_ADD, null, "study-$id-$batch-$i") == TextToSpeech.ERROR) {
                 autoListenUtterance = null
+                lastReadUtterance = null
                 voiceStatus.text = "The question could not be read aloud. You can read it and answer on screen."
             }
         }
@@ -810,7 +855,35 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private fun stopReading() {
         speechBatch++
         autoListenUtterance = null
+        lastReadUtterance = null
         tts?.stop()
+    }
+
+    private fun requestSpeechFocus(): Boolean {
+        val audio = getSystemService(AudioManager::class.java) ?: return false
+        val granted = if (Build.VERSION.SDK_INT >= 26) {
+            if (focus == null) focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(StudyCallAudio.attributes).setOnAudioFocusChangeListener(focusListener).build()
+            audio.requestAudioFocus(focus!!)
+        } else {
+            @Suppress("DEPRECATION")
+            audio.requestAudioFocus(focusListener, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+        }
+        if (granted != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            needsInitialReading = true
+            callAudio?.stop("Audio is busy. Tap Read again to resume.")
+            return false
+        }
+        return true
+    }
+
+    private fun abandonSpeechFocus() {
+        val audio = getSystemService(AudioManager::class.java) ?: return
+        if (Build.VERSION.SDK_INT >= 26) focus?.let { audio.abandonAudioFocusRequest(it) }
+        else {
+            @Suppress("DEPRECATION")
+            audio.abandonAudioFocus(focusListener)
+        }
     }
 
     private fun beginVoiceAnswer() {
@@ -828,7 +901,12 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             return
         }
         // Reading and listening never hold audio at the same time.
-        if (Build.VERSION.SDK_INT >= 26) focus?.let { getSystemService(AudioManager::class.java)?.abandonAudioFocusRequest(it) }
+        abandonSpeechFocus()
+        if (callAudio?.state?.ready != true) {
+            listenOnAudioReady = true
+            callAudio?.start()
+            return
+        }
         val row = StudyCalls.find(this, id) ?: return
         if (acceptingAnswer) voice?.start(row.getString("language"))
     }
@@ -909,6 +987,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         finalFeedback = true
         while (body.childCount > 4) body.removeViewAt(4)
         voiceButton = null
+        audioStatus = null; speakerButton = null
         val row = StudyCalls.find(this, id)
         val swedish = row?.optString("language")?.startsWith("sv") == true
         val feedback = when (correct) {
@@ -920,7 +999,10 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         voiceStatus.visibility = View.VISIBLE
         voiceStatus.text = if (correct != false) row?.optString("answer").orEmpty() else "Your attempts have been saved."
         button("Close") { finish() }
-        if (ready && started) tts?.speak(feedback, TextToSpeech.QUEUE_FLUSH, null, "result-$id")
+        if (ready && started && callAudio?.state?.ready == true && requestSpeechFocus()) {
+            tts?.setAudioAttributes(StudyCallAudio.attributes)
+            tts?.speak(feedback, TextToSpeech.QUEUE_FLUSH, null, "result-$id")
+        }
         handler.postDelayed({ if (!isFinishing) finish() }, 5000)
     }
 
@@ -928,6 +1010,10 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         super.onResume()
         started = true
         if (finalFeedback) return
+        if (answered) {
+            volumeControlStream = AudioManager.STREAM_VOICE_CALL
+            callAudio?.start()
+        }
         if (needsInitialReading) acceptingAnswer = true
         if (answered && ready && needsInitialReading) speak()
         if (listenOnResume) { listenOnResume = false; beginVoiceAnswer() }
@@ -936,8 +1022,10 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     override fun onPause() {
         started = false
         listenOnResume = false
+        listenOnAudioReady = false
         stopReading()
         voice?.cancel()
+        abandonSpeechFocus(); callAudio?.stop()
         super.onPause()
     }
 
@@ -945,7 +1033,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         started = false
         stopReading()
         voice?.cancel()
-        if (Build.VERSION.SDK_INT >= 26) focus?.let { getSystemService(AudioManager::class.java)?.abandonAudioFocusRequest(it) }
+        abandonSpeechFocus(); callAudio?.stop()
         super.onStop()
     }
 
@@ -953,8 +1041,14 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         handler.removeCallbacksAndMessages(null)
         stopReading(); tts?.shutdown()
         voice?.cancel()
+        abandonSpeechFocus(); callAudio?.stop()
         if (StudyCalls.visibleCallId == id) StudyCalls.visibleCallId = null
         super.onDestroy()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("study_speaker", callAudio?.speakerPreferred == true)
+        super.onSaveInstanceState(outState)
     }
 
     @Deprecated("Deprecated in Java")
