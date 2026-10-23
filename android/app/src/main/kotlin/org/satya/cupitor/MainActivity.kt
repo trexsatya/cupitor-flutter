@@ -184,6 +184,7 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        StudyCalls.install(this, flutterEngine.dartExecutor.binaryMessenger)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cupitor/youtube_controls")
             .setMethodCallHandler { call, result ->
                 if (call.method != "install") {
@@ -1034,6 +1035,7 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (StudyCalls.onPermissionResult(requestCode, grantResults)) return
         val pending = pendingPermResults.remove(requestCode) ?: return
         val ok = grantResults.isNotEmpty() &&
                  grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
