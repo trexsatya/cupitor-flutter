@@ -217,4 +217,14 @@ class StudyCallsTest {
         assertEquals(101, StudyCalls.read(context).size)
     }
 
+    @Test fun staleAlarmAfterReschedulingCannotRingEarly() {
+        val id = StudyCalls.scheduleBatch(context, listOf(futureArgs()), 7) { _, _ -> }.single()
+        StudyCalls.editScheduled(context, futureArgs() + mapOf("id" to id, "when_ms" to System.currentTimeMillis() + 7200000L), 7) { _, _ -> }
+        StudyCalls.fire(context, id)
+        assertEquals("scheduled", StudyCalls.find(context, id)!!.getString("status"))
+        StudyCalls.setEnabled(context, id, 7, false)
+        StudyCalls.fire(context, id)
+        assertEquals("disabled", StudyCalls.find(context, id)!!.getString("status"))
+    }
+
 }

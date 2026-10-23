@@ -441,6 +441,8 @@ object StudyCalls {
         val row = find(context, id) ?: return
         if (row.optString("status") != "scheduled") return
         if (row.has("notif_id")) { finish(context, id, "cancelled"); return }
+        // A queued alarm from before an edit must not ring the rescheduled call early.
+        if (row.optLong("when_ms") > System.currentTimeMillis()) return
         if (System.currentTimeMillis() - row.optLong("when_ms") > 5 * 60_000) {
             finish(context, id, "missed"); return
         }

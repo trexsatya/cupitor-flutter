@@ -98,12 +98,7 @@ class NotifBridge {
         case 'requestPermission':
           _ack(reqId, op, true, data: {'permission': await requestPermission()});
         case 'getSchedulePreview':
-          final d = await _daoOrAck(reqId, op);
-          if (d == null) return;
-          final list = await _listOrAck(d, reqId, op, m['external_key']);
-          if (list == null) return;
-          if (schedulePreview == null) { _ack(reqId, op, false, error: 'unsupported'); return; }
-          _ack(reqId, op, true, data: await schedulePreview!(list));
+          await _getSchedulePreview(reqId, m);
         case 'getSchedules':
           await _getSchedules(reqId);
         case 'createList':
@@ -131,6 +126,21 @@ class NotifBridge {
       // Nothing may escape into the channel.
       _ack(reqId, op, false, error: 'internal');
     }
+  }
+
+  Future<void> _getSchedulePreview(String? reqId, Map<String, dynamic> m) async {
+    const op = 'getSchedulePreview';
+    final profile = activeProfileId();
+    final d = await _daoOrAck(reqId, op);
+    if (d == null) return;
+    if (profile != activeProfileId()) { _ack(reqId, op, false, error: 'profile_changed'); return; }
+    final list = await _listOrAck(d, reqId, op, m['external_key']);
+    if (list == null) return;
+    if (profile != activeProfileId()) { _ack(reqId, op, false, error: 'profile_changed'); return; }
+    if (schedulePreview == null) { _ack(reqId, op, false, error: 'unsupported'); return; }
+    final data = await schedulePreview!(list);
+    if (profile != activeProfileId()) { _ack(reqId, op, false, error: 'profile_changed'); return; }
+    _ack(reqId, op, true, data: data);
   }
 
   // ── payload builders ───────────────────────────────────────────────
