@@ -169,3 +169,42 @@ the existing review scheduler's cancel-all operation must not remove them.
 Deploy the matching webapp source from `trexsatya/cupitor:music-study-app` and
 install the updated Android build. Generated `trexsatya.github.io` app files are
 not the source of this feature.
+
+## Playlist calls
+
+Playlist calls use the existing NotifBridge list flow. `createList` accepts
+`delivery: "call"` and `call_config` (`language`, `max_retries`,
+`match_threshold`, `voice_response`). `getCapabilities.delivery_modes` advertises
+support; existing and migrated lists default to `notification`.
+`setDelivery` changes delivery/configuration without replacing identity or SRS
+state. Each item's `payload.study_call` contains the full question and answer
+key using the existing call schema. Invalid keys/settings reject before mutation.
+`syncItems`, `setSchedule`, `setStatus`, and `deleteList` retain their meanings.
+
+The same recurring/series scheduler, introduction cadence, waking window,
+per-fire cap, profile isolation and background sweeps apply. A `PendingFire`
+with a call payload goes to native ringing instead of the notification plugin;
+call lists do not post shade grouping summaries. Original due timestamps make
+armed and catch-up deliveries idempotent. Overlapping playlist calls queue at
+one-minute intervals for up to two hours instead of interrupting an answer.
+Pausing, removing items or changing delivery cancels their pending call alarms.
+Rearming preserves conversations, queued due calls and one-off calls.
+
+Native classes now live in the local `study_calls_native` Flutter plugin, so
+Flutter automatically registers the internal `cupitor/playlist_calls` channel
+in Workmanager's headless engine as well as the foreground engine. The public
+`CallBridge` stays profile-scoped in the host. No browser or active WebView is
+needed when a scheduled call rings.
+
+The webapp's Study calls button opens the same playlist scheduling dialog as
+Notifications, with Calls selected. Paired cards read one side and expect the
+other (direction selectable). One-sided cards and word groups explicitly ask
+for repetition. Multiple choice uses distinct answers from the same playlist;
+free response uses the full card answer. Oversized/unusable entries are counted
+as skipped, never truncated into incorrect answer keys. Disabled items are
+excluded; playlist edits resync with stable notification item ids. Editing call
+settings preserves the existing schedule and progress. The one-off composer and
+saved call answers remain accessible from Call history / one-off call.
+
+Device checks still required: ringing/lockscreen, microphone and TTS, plus
+headless worker rearming, pause/delete and a queue of simultaneous due calls.

@@ -2,6 +2,7 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform, debugPrint;
+import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/timezone.dart' as tz;
 
@@ -33,7 +34,18 @@ class FlutterNotifChannel implements NotifChannel {
   static const String androidChannelName = 'Review reminders';
   static const String darwinCategoryId = 'cupitorNotif';
 
+  static const _calls = MethodChannel('cupitor/playlist_calls');
   final _plugin = FlutterLocalNotificationsPlugin();
+
+  Future<void> retainCallItems(Set<int> ids) async {
+    if (_isAndroid) await _calls.invokeMethod('retainItems', {'notif_ids': ids.toList()});
+  }
+
+  Future<void> _deliverCall(PendingFire fire, bool immediate) async {
+    if (!_isAndroid) throw UnsupportedError('Calls need Android');
+    await _calls.invokeMethod('deliver', {...fire.studyCall!,
+      'when_ms': fire.whenMs, 'immediate': immediate});
+  }
   NotifCallbacks? _callbacks;
 
   bool get _isAndroid =>
@@ -210,6 +222,7 @@ class FlutterNotifChannel implements NotifChannel {
 
   @override
   Future<void> schedule(PendingFire fire) async {
+    if (fire.studyCall != null) return _deliverCall(fire, false);
     final exact = await exactAlarmsAllowed();
     await _plugin.zonedSchedule(
       fire.notifId,
@@ -233,12 +246,14 @@ class FlutterNotifChannel implements NotifChannel {
 
   @override
   Future<void> showNow(PendingFire fire) async {
+    if (fire.studyCall != null) return _deliverCall(fire, true);
     await _plugin.show(fire.notifId, fire.title, fire.body, _details(fire),
         payload: fire.payloadJson);
   }
 
   @override
   Future<void> cancelAllScheduled() async {
+    if (_isAndroid) await _calls.invokeMethod('cancelScheduled');
     // NOT _plugin.cancelAll(): that also dismisses notifications already
     // SHOWING in the shade — and rearm() (whose first step is this call)
     // runs on every sweep/resume/mutation, so fires vanished seconds after
@@ -269,7 +284,10 @@ class FlutterNotifChannel implements NotifChannel {
   @override
   Future<Set<int>> activeNotificationIds() async {
     try {
+      final callIds = _isAndroid
+          ? await _calls.invokeListMethod<int>('activeIds') ?? <int>[] : <int>[];
       return {
+        ...callIds,
         for (final n in await _plugin.getActiveNotifications())
           if (n.id != null) n.id!,
       };

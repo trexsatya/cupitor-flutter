@@ -40,6 +40,11 @@ final NotificationService notifService = NotificationService(
   window: () => NotifSettings.window,
   perFireCap: () => NotifSettings.perFireCap,
   now: () => tz.TZDateTime.now(tz.local),
+  retainCallItems: (ids) async {
+    if (notifChannel is FlutterNotifChannel) {
+      await (notifChannel as FlutterNotifChannel).retainCallItems(ids);
+    }
+  },
   maxArmed: !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS ? 60 : 200,
 );
 
