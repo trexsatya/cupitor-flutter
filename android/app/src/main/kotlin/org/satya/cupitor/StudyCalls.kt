@@ -68,13 +68,25 @@ object StudyCalls {
                         "answer_types" to listOf("choice", "text"),
                         "default_retries" to StudyCallAnswer.DEFAULT_RETRIES,
                         "batch_schedule" to true, "edit_scheduled" to true, "pending_controls" to true, "history_limit" to MAX_HISTORY,
+                        "voice_selection" to true,
                         "settings" to true, "pending_limit" to pendingLimit(activity),
                         "max_pending_limit" to MAX_PENDING_LIMIT, "armed_limit" to MAX_ARMED,
                         "pending_count" to read(activity).count { it.optString("status") !in terminal },
-                    ))
+                    ) + StudyCallSpeech.defaults(activity))
                     "setSettings" -> {
-                        setPendingLimit(activity, args["pending_limit"])
-                        reply.success(mapOf("pending_limit" to pendingLimit(activity)))
+                        setSettings(activity, args)
+                        reply.success(mapOf("pending_limit" to pendingLimit(activity)) + StudyCallSpeech.defaults(activity))
+                    }
+                    "getVoices" -> StudyCallSpeech.getVoices(activity, reply)
+                    "previewVoice" -> {
+                        check(visibleCallId == null && read(activity).none { it.optString("status") in setOf("ringing", "answered") }) { "busy" }
+                        StudyCallSpeech.preview(activity, args, reply)
+                    }
+                    "stopVoicePreview" -> { StudyCallSpeech.stopPreview(); reply.success(true) }
+                    "openVoiceSettings" -> {
+                        try { activity.startActivity(Intent("com.android.settings.TTS_SETTINGS")) }
+                        catch (_: Exception) { activity.startActivity(Intent(Settings.ACTION_SETTINGS)) }
+                        reply.success(true)
                     }
                     "requestPermission" -> {
                         if (Build.VERSION.SDK_INT >= 33 && permission(activity) != "granted") {
@@ -158,11 +170,19 @@ object StudyCalls {
     fun pendingLimit(context: Context): Int = context.getSharedPreferences("study_calls", Context.MODE_PRIVATE)
         .getInt("pending_limit", DEFAULT_PENDING_LIMIT).coerceIn(1, MAX_PENDING_LIMIT)
 
-    fun setPendingLimit(context: Context, raw: Any?) {
-        val value = raw as? Number ?: error("bad_limit")
-        check(value.toDouble() == value.toInt().toDouble() && value.toInt() in 1..MAX_PENDING_LIMIT) { "bad_limit" }
-        check(context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).edit()
-            .putInt("pending_limit", value.toInt()).commit()) { "storage_error" }
+    fun setPendingLimit(context: Context, raw: Any?) = setSettings(context, mapOf("pending_limit" to raw))
+
+    fun setSettings(context: Context, args: Map<*, *>) {
+        val voice = StudyCallSpeech.validate(args)
+        val limit = if (args.containsKey("pending_limit")) {
+            val value = args["pending_limit"] as? Number ?: error("bad_limit")
+            check(value.toDouble() == value.toInt().toDouble() && value.toInt() in 1..MAX_PENDING_LIMIT) { "bad_limit" }
+            value.toInt()
+        } else pendingLimit(context)
+        val edit = context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).edit().putInt("pending_limit", limit)
+        voice["voice_name"]?.let { edit.putString("voice_name", it as String) }
+        voice["speech_rate"]?.let { edit.putFloat("speech_rate", (it as Number).toFloat()) }
+        check(edit.commit()) { "storage_error" }
         // Lowering the limit never removes existing questions. It only blocks additions.
     }
 
@@ -324,6 +344,7 @@ object StudyCalls {
             .put("match_threshold", threshold)
             .put("accepted_answers", JSONArray(accepted))
             .put("enabled", enabled).put("status", if (enabled) "scheduled" else "disabled")
+        StudyCallSpeech.validate(args).forEach { (key, value) -> row.put(key, value) }
         if (correctIndex != null) row.put("correct_choice_index", correctIndex)
         return row
     }
@@ -622,6 +643,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
                 else showVoiceStatus(text)
             })
         render()
+        StudyCallSpeech.stopPreview()
         tts = TextToSpeech(this, this)
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {}
@@ -729,7 +751,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         voice?.cancel()
         val row = StudyCalls.find(this, id) ?: return
         if (row.optString("status") != "answered") return
-        val language = tts?.setLanguage(Locale.forLanguageTag(row.getString("language")))
+        val language = tts?.let { StudyCallSpeech.configure(it, this, row) }
         if (language == TextToSpeech.LANG_MISSING_DATA || language == TextToSpeech.LANG_NOT_SUPPORTED) {
             message.text = row.getString("question") + "\n\nInstall a voice for ${row.getString("language")} in Android speech settings."
             return

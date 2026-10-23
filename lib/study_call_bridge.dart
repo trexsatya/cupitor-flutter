@@ -25,6 +25,10 @@ class StudyCallBridge {
   static const _ops = {
     'getCapabilities',
     'setSettings',
+    'getVoices',
+    'previewVoice',
+    'stopVoicePreview',
+    'openVoiceSettings',
     'requestPermission',
     'openFullScreenSettings',
     'openAlarmSettings',

@@ -256,4 +256,20 @@ class StudyCallsTest {
         assertEquals(ids.subList(3, 53), StudyCalls.alarmPlan(context).map { it.getString("id") })
     }
 
+    @Test fun speechDefaultsAndOverridesAreValidatedWithoutPartialSettingsWrites() {
+        StudyCalls.setSettings(context, mapOf("pending_limit" to 200, "voice_name" to "sv-test", "speech_rate" to 0.75))
+        assertEquals("sv-test", StudyCallSpeech.defaults(context)["voice_name"])
+        assertEquals(0.75, StudyCallSpeech.defaults(context)["speech_rate"])
+        for (bad in listOf(mapOf("speech_rate" to 0.1), mapOf("speech_rate" to Double.NaN), mapOf("voice_name" to 3))) {
+            expectError("bad_voice") { StudyCalls.setSettings(context, bad + mapOf("pending_limit" to 300)) }
+            assertEquals(200, StudyCalls.pendingLimit(context))
+        }
+        val call = StudyCalls.validate(futureArgs() + mapOf("voice_name" to "", "speech_rate" to 1.25), 7, false)
+        assertEquals("", call.getString("voice_name")); assertEquals(1.25, call.getDouble("speech_rate"), 0.001)
+        val voice = android.speech.tts.Voice("sv-test", java.util.Locale.forLanguageTag("sv-SE"), 400, 200, false, emptySet())
+        val missing = android.speech.tts.Voice("sv-missing", java.util.Locale.forLanguageTag("sv-SE"), 400, 200, false, setOf(android.speech.tts.TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED))
+        val options = StudyCallSpeech.options(setOf(voice, missing))
+        assertEquals(1, options.size); assertEquals("sv-test", options.single()["name"])
+    }
+
 }

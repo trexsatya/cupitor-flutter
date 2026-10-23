@@ -45,7 +45,11 @@ Operations:
 | Operation | Input | Result in `cupitorCallAck.data` |
 | --- | --- | --- |
 | `getCapabilities` | — | `supported`, `permission`, `full_screen`, `exact_alarms`, `speech_input`, `answer_types`, `default_retries`, `batch_schedule`, `edit_scheduled`, `pending_controls`, `history_limit`, `pending_limit`, `max_pending_limit`, `pending_count`, `armed_limit`, `settings` |
-| `setSettings` | `pending_limit` integer 1–5000, shared across profiles | `{pending_limit}` |
+| `setSettings` | Optional `pending_limit` (1–5000), `voice_name` (up to 200 chars), `speech_rate` (0.5–1.5), shared across profiles | Saved defaults |
+| `getVoices` | — | `{voices:[{name,language,label,network}]}` from the default Android TTS engine |
+| `previewVoice` | `voice_name,speech_rate,language` | `true` when a short sample starts |
+| `stopVoicePreview` | — | `true` |
+| `openVoiceSettings` | — | Opens Android TTS settings |
 | `requestPermission` | — | `permission` after the Android notification prompt |
 | `openFullScreenSettings` | — | Opens Android special-access settings |
 | `openAlarmSettings` | — | Opens exact-alarm settings |
@@ -171,6 +175,21 @@ notification lists keep their existing behavior.
   partial transcripts never submit. The native screen displays attempt count,
   provides an explicit voice retry/stop button, and keeps choice buttons or a
   typed answer field available. Completion shows correct/saved/exhausted feedback.
+
+## Voice selection and speaking speed
+
+Settings can choose an available voice from the default Android TTS engine and a
+speaking speed from 0.5 to 1.5 (default 1). Voice preview requests transient audio
+focus and stops on completion, loss of focus, backgrounding, a real call opening
+or Stop. It cannot start while a study call is ringing/answered. Refresh voices
+after installing voices through Android speech settings. Online voices are labeled.
+
+A call can override defaults with `voice_name` (an engine voice identifier, up to
+200 characters; empty means device default) and `speech_rate` (0.5–1.5). Omission
+inherits current app settings at delivery. The editor offers Use Settings voice/
+speed. Unavailable voices fall back to the selected question language; a saved
+voice applies only to questions in its language. Speech-recognition language is
+unchanged. Imported JSON can include the same optional fields.
 
 ## Voice lifecycle
 

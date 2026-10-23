@@ -1165,6 +1165,11 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun onStop() {
+        StudyCallSpeech.stopPreview()
+        super.onStop()
+    }
+
     override fun onDestroy() {
         try {
             mediaSession?.isActive = false
