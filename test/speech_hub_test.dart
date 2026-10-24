@@ -139,4 +139,29 @@ void main() {
       returnsNormally,
     );
   });
+  test('a recorder handoff detaches before stop/cancel events arrive', () {
+    final log = <String>[];
+    final main = recorder(log, 'main');
+    SpeechHub.acquire(main);
+    SpeechHub.releaseForMicHandoff(main);
+    SpeechHub.dispatchError(SpeechRecognitionError('error_client', true));
+    SpeechHub.dispatchStatus('done');
+    expect(SpeechHub.owner, isNull);
+    expect(log, isEmpty); // The caller resets its UI; no fallback or self-lost.
+  });
+
+  test('a recorder handoff tells a different owner it lost the microphone', () {
+    final log = <String>[];
+    final main = recorder(log, 'main');
+    final other = recorder(log, 'other');
+    SpeechHub.acquire(other);
+    SpeechHub.releaseForMicHandoff(main);
+    SpeechHub.dispatchError(SpeechRecognitionError('error_audio', true));
+    expect(log, ['other:lost']);
+    expect(SpeechHub.owner, isNull);
+    SpeechHub.acquire(main);
+    SpeechHub.dispatchStatus('listening');
+    expect(log.last, 'main:status:listening');
+  });
+
 }
