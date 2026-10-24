@@ -11896,6 +11896,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             // dialog and can be dragged freely.
             if (_tagCaptureToggleVisible)
               TagCaptureFloatingChip(
+                key: const ValueKey('tag-capture-chip'),
                 armed: _tagCaptureArmed,
                 initialPos: _tagCaptureChipPos,
                 onTap: _onCaptureChipTap,
@@ -11912,6 +11913,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               ),
             if (_videoNoteEnabled && _videoNoteHasVideo)
               TagCaptureFloatingChip(
+                key: const ValueKey('video-note-chip'),
                 armed: true,
                 armedIcon: Icons.edit_note,
                 armedColor: Colors.indigo,
@@ -11932,6 +11934,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             // Over a fullscreen video too, like the other floating buttons.
             if (_studyFsChipEnabled)
               TagCaptureFloatingChip(
+                key: const ValueKey('study-fullscreen-chip'),
                 armed: true,
                 armedIcon: Icons.fullscreen,
                 armedColor: Colors.teal,
