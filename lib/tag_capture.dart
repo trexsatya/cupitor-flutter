@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -1970,26 +1971,57 @@ class TagCaptureFloatingChip extends StatefulWidget {
 class _TagCaptureFloatingChipState extends State<TagCaptureFloatingChip> {
   static const double _size = 48;
   Offset? _pos;
+  Rect? _positionBounds;
+
+  // Keep the distance to the nearer edge when the viewport changes. Simply
+  // clamping portrait positions would pile all of the chips at the bottom
+  // of a landscape video. Retain the original bounds so rotating back also
+  // restores the original position unless the user dragged the chip.
+  Offset _visiblePosition(Rect bounds) {
+    final from = _positionBounds!;
+    double axis(double value, double oldStart, double oldEnd,
+        double start, double end) {
+      final before = value - oldStart;
+      final after = oldEnd - value;
+      return (before <= after ? start + before : end - after)
+          .clamp(start, end);
+    }
+
+    return Offset(
+      axis(_pos!.dx, from.left, from.right, bounds.left, bounds.right),
+      axis(_pos!.dy, from.top, from.bottom, bounds.top, bounds.bottom),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
     final pad = MediaQuery.of(context).padding;
+    final bounds = Rect.fromLTRB(
+      pad.left,
+      pad.top,
+      math.max(pad.left, size.width - _size - pad.right),
+      math.max(pad.top, size.height - _size - pad.bottom),
+    );
     _pos ??= widget.initialPos.dx < 0
         ? Offset(size.width - _size - 16, size.height - _size - pad.bottom - 96)
         : widget.initialPos;
+    _positionBounds ??= bounds;
+    final position = _visiblePosition(bounds);
     return Positioned(
-      left: _pos!.dx,
-      top: _pos!.dy,
+      left: position.dx,
+      top: position.dy,
       child: GestureDetector(
         onTap: widget.onTap,
         onLongPress: widget.onHide,
         onPanUpdate: (d) {
           setState(() {
+            final current = _visiblePosition(bounds);
             _pos = Offset(
-              (_pos!.dx + d.delta.dx).clamp(0, size.width - _size),
-              (_pos!.dy + d.delta.dy).clamp(pad.top, size.height - _size - pad.bottom),
+              (current.dx + d.delta.dx).clamp(bounds.left, bounds.right),
+              (current.dy + d.delta.dy).clamp(bounds.top, bounds.bottom),
             );
+            _positionBounds = bounds;
           });
           widget.onMoved(_pos!);
         },
