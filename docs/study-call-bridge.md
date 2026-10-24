@@ -282,3 +282,49 @@ the existing review scheduler's cancel-all operation must not remove them.
 Deploy the matching webapp source from `trexsatya/cupitor:music-study-app` and
 install the updated Android build. Generated `trexsatya.github.io` app files are
 not the source of this feature.
+
+## Repetition pauses and call-language commands
+
+`repetition_pause_seconds` is an optional per-call number from 0 to 120. Omission
+inherits the app's current setting at delivery, initially **3 seconds**. The same
+field in `setSettings` changes that default. Imported JSON supports it in
+`defaults` or individual calls, and the editor preserves overrides. The pause
+applies before automatic retries and requested repeats; **Continue** starts
+reading immediately. During the gap, spoken/on-screen answers remain available.
+
+The native call screen has **Pause**, **Continue** and **Read again** controls.
+With voice replies enabled, commands use the call's `language`, independently of
+the page language or chosen voice. Swedish: **vänta/pausa**, **kör/fortsätt**,
+**igen/en gång till/upprepa**. English: **wait/pause**, **go/continue/resume**,
+**again/once more/repeat**. Spanish, French, German, Hindi and Greek are also
+supported. Capabilities advertise `repetition_controls`, `command_languages`,
+`command_hints` and the saved `repetition_pause_seconds` default.
+
+Say commands when the microphone is listening, including during repetition gaps
+and pauses. Use the on-screen Pause button while TTS is reading; recognition and
+TTS do not run together. Waiting cancels queued repetitions and keeps listening
+for Continue/Repeat. Silence and unclear input while paused or waiting to repeat
+never use an answer attempt. Commands never change the attempt budget. Only the
+first final speech hypothesis can be a command. Whole phrases are matched with
+case/accent tolerance; long phrases tolerate a small transcription error, while
+short command words stay exact. An exact configured answer takes priority over
+a command while answering (e.g. an answer of “igen”); during a pause, command
+controls take priority. Unsupported languages retain the on-screen controls.
+The existing ten-minute active-call expiry still applies. Backgrounding stops
+recognition and pending timers; a waiting repetition restarts its gap on resume.
+
+## Decline and call back
+
+The incoming screen's Decline action and the notification's explicit Decline
+button stop ringing and offer **Call back in 5, 10 or 15 minutes**, or **Dismiss
+without callback**. Back from that chooser also keeps the call declined. Swiping
+the notification away declines quietly without opening another screen.
+
+Choosing a callback reschedules the same call ID and profile, preserving the
+question, answers, language, voice and repetition overrides. The next call starts
+with an empty attempt list. The new time is measured from callback selection.
+It survives app closure/reboot and follows the same exact/inexact alarm and
+pending-capacity rules as scheduled calls. Duplicate callback actions cannot
+reschedule an already changed call. Failure to arm the new alarm restores the
+declined row and reports the failure. Stale delivery/expiry actions from the
+original ring cannot fire or expire the future callback.
