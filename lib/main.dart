@@ -607,6 +607,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _studyCallBridge.handle('{"op":"getCalls"}');
     } else if (state == AppLifecycleState.paused) {
       WakelockPlus.disable();
+      // Permission/teardown work must not open a microphone after backgrounding.
+      if (_nativeRecordingStart.isPending) _stopNativeRecordingIfAny();
       // Don't leave the mic open behind a backgrounded app — the OEM revokes
       // it anyway, and as an error rather than a clean stop, which for the
       // long-press loop means restarting the recognizer over and over in the
