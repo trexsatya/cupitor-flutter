@@ -20,6 +20,7 @@ import org.robolectric.shadows.ShadowAudioTrack
 import org.robolectric.shadows.ShadowTextToSpeech
 import org.robolectric.util.ReflectionHelpers
 import java.time.Duration
+import java.util.Locale
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
@@ -74,6 +75,7 @@ class StudyCallPlaybackTest {
             val speaker = device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, 2)
             shadowOf(audio).setAvailableCommunicationDevices(listOf(receiver, speaker))
             ShadowAudioTrack.setRoutedDevice(speaker)
+            ShadowTextToSpeech.addLanguageAvailability(Locale.UK)
             val tts = ShadowTextToSpeech.getLastTextToSpeechInstance()
             shadowOf(tts).onInitListener.onInit(TextToSpeech.SUCCESS)
             controller.start().resume().visible()
