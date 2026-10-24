@@ -63,13 +63,14 @@ class StudyCallPlaybackTest {
         val app = RuntimeEnvironment.getApplication()
         val row = StudyCalls.validate(mapOf("title" to "Test", "question" to "Private study question",
             "choices" to listOf("One", "Two"), "language" to "en-GB", "voice_response" to false), 1, true)
-            .put("status", "answered")
+            .put("status", "answered").put("answered_at", System.currentTimeMillis())
         app.getSharedPreferences("study_calls", 0).edit().clear()
             .putString("calls", JSONArray(listOf(row)).toString()).commit()
         val controller = Robolectric.buildActivity(StudyCallActivity::class.java,
             Intent(app, StudyCallActivity::class.java).putExtra("id", row.getString("id"))).create()
         try {
             val screen = controller.get()
+            assertFalse("The answered call fixture must remain active", screen.isFinishing)
             val audio = screen.getSystemService(AudioManager::class.java)!!
             val receiver = device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE, 1)
             val speaker = device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, 2)
