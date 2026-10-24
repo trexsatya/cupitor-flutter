@@ -24,6 +24,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 // read the same as the rest of the plugin's API.
 import 'package:speech_to_text/speech_recognition_error.dart' as stt;
 import 'speech_hub.dart';
+import 'native_recording_start.dart';
 import 'caption_capture.dart';
 import 'video_note.dart';
 import 'lookup_video_hold.dart';
@@ -361,6 +362,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // MainActivity exposes no way to ask. Mirror its state here so a dictation
   // request can refuse rather than silently record nothing.
   bool _nativeRecordingActive = false;
+  final NativeRecordingStart _nativeRecordingStart = NativeRecordingStart();
+  bool get _recordingHasMic => _nativeRecordingActive || _nativeRecordingStart.isPending;
   // A long-press capture was cut short by the app being backgrounded; show
   // what was heard once the user is actually looking at the screen again.
   bool _pendingVoiceResumeDialog = false;
@@ -604,6 +607,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _studyCallBridge.handle('{"op":"getCalls"}');
     } else if (state == AppLifecycleState.paused) {
       WakelockPlus.disable();
+      // Permission/teardown work must not open a microphone after backgrounding.
+      if (_nativeRecordingStart.isPending) _stopNativeRecordingIfAny();
       // Don't leave the mic open behind a backgrounded app — the OEM revokes
       // it anyway, and as an error rather than a clean stop, which for the
       // long-press loop means restarting the recognizer over and over in the
@@ -3522,10 +3527,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// isn't running, so the unconditional call is safe.
   Future<void> _releaseMicFromSpeechToText() async {
     _continuousVoiceActive = false;
-    try { await _speech.stop(); } catch (_) {}
-    try { await _speech.cancel(); } catch (_) {}
+    _voiceLastWords = '';
     if (mounted && _isListening) setState(() => _isListening = false);
     _isListeningNotifier.value = false;
+    // stop/cancel can emit errors synchronously. Remove the old callbacks
+    // before awaiting them so a recorder handoff cannot open speech fallback.
+    SpeechHub.releaseForMicHandoff(_speechHubListener);
+    try { await _speech.stop(); } catch (_) {}
+    try { await _speech.cancel(); } catch (_) {}
     // The underlying AudioRecord teardown is async at the OS layer — give
     // it a beat to actually let go before the WebView tries to claim it.
     // 500 ms covers SpeechRecognizer's own settle time on slower devices;
@@ -9049,6 +9058,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   /// Routes an engine status to whichever feature currently holds the mic.
   void _onSpeechStatus(String status) {
+    if (_recordingHasMic) return;
     // 'done' ONLY, for every consumer. 'notListening' is emitted at
     // end-of-speech and reaches us *before* the engine's final result:
     // acting on it truncates a transcript to its last partial, and — for the
@@ -9074,6 +9084,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// to the dictation session too, and must not fall through to the one-shot
   /// handler and pop a native dialog over the WebView.
   void _onSpeechError(stt.SpeechRecognitionError error) {
+    if (_recordingHasMic) return;
     if (_sttSession.isBusy) {
       final outcome = mapSpeechError(error.errorMsg);
       _sttApply(outcome.silent
@@ -9141,7 +9152,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _showVoiceInputFallback();
   }
 
+  bool _refuseSpeechDuringRecording() {
+    if (!_recordingHasMic) return false;
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('Stop the voice recording before starting speech recognition.'),
+    ));
+    return true;
+  }
+
   Future<void> _toggleVoiceInput() async {
+    if (_refuseSpeechDuringRecording()) return;
+    final recordingRevision = _nativeRecordingStart.revision;
     if (_isListening) {
       await _speech.stop();
       setState(() => _isListening = false);
@@ -9162,6 +9183,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     try {
       _voiceLastWords = '';
       final available = await _ensureSpeechInit();
+      if (!mounted || _recordingHasMic || recordingRevision != _nativeRecordingStart.revision) return;
       if (!available) {
         _showVoiceInputFallback();
         return;
@@ -9172,6 +9194,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       await _speech.listen(
         localeId: _speechLocale(),
         onResult: (result) {
+          if (!_isListening || _recordingHasMic || !SpeechHub.owns(_speechHubListener)) return;
           _voiceLastWords = result.recognizedWords;
           if (result.finalResult && _voiceLastWords.isNotEmpty) {
             _speech.stop();
@@ -9207,6 +9230,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// the underlying engine ends an utterance, until the user taps the mic to
   /// stop (or 5 minutes elapse as a safety net).
   Future<void> _startContinuousVoiceCapture() async {
+    if (_refuseSpeechDuringRecording()) return;
     if (_continuousVoiceActive) return;
     // End a webapp dictation cleanly before taking the recognizer — while one
     // is in flight it owns the status routing, so the restart loop below
@@ -9223,6 +9247,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _isListeningNotifier.value = true;
     _showAppBarWithTimer();
     final started = await _initContinuousListen();
+    if (!_continuousVoiceActive || _recordingHasMic) return; // Recorder handoff during initialize().
     if (!started) {
       _continuousVoiceActive = false;
       setState(() => _isListening = false);
@@ -9238,7 +9263,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // restart now happens in _onSpeechStatus / _onSpeechError, which are
       // installed once by _ensureSpeechInit.
       final ok = await _ensureSpeechInit();
-      if (!ok) return false;
+      if (!ok || !_continuousVoiceActive || _recordingHasMic) return false;
       SpeechHub.acquire(_speechHubListener);
       await _speech.listen(
         localeId: _speechLocale(),
@@ -9246,6 +9271,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         listenFor: const Duration(minutes: 5),
         pauseFor: const Duration(seconds: 30),
         onResult: (result) {
+          if (_recordingHasMic || !SpeechHub.owns(_speechHubListener)) return;
           final words = result.recognizedWords;
           if (result.finalResult) {
             if (words.trim().isNotEmpty) {
@@ -9266,11 +9292,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   void _restartContinuousListen() {
-    if (!_continuousVoiceActive) return;
+    if (!_continuousVoiceActive || _recordingHasMic) return;
     // Tiny delay so the plugin's previous session is fully torn down before
     // we kick off a new one. Without it, listen() occasionally throws.
     Future.delayed(const Duration(milliseconds: 200), () async {
-      if (!_continuousVoiceActive) return;
+      if (!_continuousVoiceActive || _recordingHasMic) return;
       try {
         SpeechHub.acquire(_speechHubListener);
         await _speech.listen(
@@ -9279,6 +9305,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           listenFor: const Duration(minutes: 5),
           pauseFor: const Duration(seconds: 30),
           onResult: (result) {
+            if (_recordingHasMic || !SpeechHub.owns(_speechHubListener)) return;
             final words = result.recognizedWords;
             if (result.finalResult) {
               if (words.trim().isNotEmpty) {
@@ -9727,7 +9754,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   Future<void> _sttBeginListen(String rid, String? locale) async {
     // §7 — free the mic. The native recorder wins: refusing is friendlier
     // than binning a clip the user is still recording.
-    if (_nativeRecordingActive) {
+    if (_recordingHasMic) {
       await _sttApply(_sttSession.abort(rid, 'mic-busy'));
       return;
     }
@@ -9748,6 +9775,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // settled this rid. Keep this check adjacent to listen() with no await
     // between them, so check-and-listen is atomic on the event loop.
     if (_sttSession.startRid != rid) return;
+    if (_recordingHasMic) {
+      await _sttApply(_sttSession.abort(rid, 'mic-busy'));
+      return;
+    }
     // From here on the engine's events are ours, not the outgoing session's.
     _sttSession.listenIssued(rid);
     SpeechHub.acquire(_speechHubListener);
@@ -9835,6 +9866,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// already gone, so nobody is left to call `recordStop`. Unconditional on
   /// the native side, which no-ops when no recorder is open.
   void _stopNativeRecordingIfAny() {
+    _nativeRecordingStart.cancel();
     _nativeRecordingActive = false;
     _permsChannel.invokeMethod<void>('cancelNativeRecording').catchError((_) {});
   }
@@ -9899,7 +9931,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       moment: moment,
       speechLocale: _speechLocale(),
       prepareMic: () async {
-        if (_nativeRecordingActive) return false;
+        if (_recordingHasMic) return false;
         await _sttCancelForMicHandoff();
         await _releaseMicFromSpeechToText();
         return _ensureMicPermission();
@@ -10099,16 +10131,28 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // extension the recorder actually wrote.
         final id = _safeFileId((req['id'] as String?) ?? '');
         if (id.isEmpty) { _audioReply('recordStart', rid, null, 'bad-id'); return; }
-        await _sttCancelForMicHandoff();
-        await _releaseMicFromSpeechToText();
-        final permOk = await _ensureMicPermission();
-        if (!permOk) { _audioReply('recordStart', rid, null, 'permission-denied'); return; }
-        final dir = await _manualAudioDir();
-        final pathStem = '${dir.path}/$id';
+        final token = _nativeRecordingStart.begin(recording: _nativeRecordingActive);
+        if (token == null) { _audioReply('recordStart', rid, null, 'mic-busy'); return; }
+        bool cancelled() {
+          if (_nativeRecordingStart.isCurrent(token)) return false;
+          _audioReply('recordStart', rid, null, 'cancelled');
+          return true;
+        }
         try {
+          await _sttCancelForMicHandoff();
+          if (cancelled()) return;
+          await _releaseMicFromSpeechToText();
+          if (cancelled()) return;
+          final permOk = await _ensureMicPermission();
+          if (cancelled()) return;
+          if (!permOk) { _audioReply('recordStart', rid, null, 'permission-denied'); return; }
+          final dir = await _manualAudioDir();
+          if (cancelled()) return;
+          final pathStem = '${dir.path}/$id';
           final actualPath = await _permsChannel.invokeMethod<String>(
             'startNativeRecording', {'pathStem': pathStem},
           );
+          if (cancelled()) return;
           if (actualPath != null && actualPath.isNotEmpty) {
             _nativeRecordingActive = true;
             _audioReply('recordStart', rid, _fileUrlForPath(actualPath), null);
@@ -10116,9 +10160,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             _audioReply('recordStart', rid, null, 'start-failed');
           }
         } on PlatformException catch (e) {
-          _audioReply('recordStart', rid, null, '${e.code}: ${e.message ?? ''}');
+          if (!cancelled()) _audioReply('recordStart', rid, null, '${e.code}: ${e.message ?? ''}');
+        } finally {
+          _nativeRecordingStart.complete(token);
         }
       } else if (op == 'recordStop') {
+        _nativeRecordingStart.cancel();
         _nativeRecordingActive = false;
         try {
           final path = await _permsChannel.invokeMethod<String>('stopNativeRecording');
@@ -10131,6 +10178,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           _audioReply('recordStop', rid, null, '${e.code}: ${e.message ?? ''}');
         }
       } else if (op == 'recordCancel') {
+        _nativeRecordingStart.cancel();
         _nativeRecordingActive = false;
         try {
           await _permsChannel.invokeMethod<void>('cancelNativeRecording');

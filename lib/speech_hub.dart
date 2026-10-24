@@ -53,6 +53,8 @@ class SpeechHub {
   @visibleForTesting
   static SpeechHubListener? get owner => _owner;
 
+  static bool owns(SpeechHubListener listener) => identical(_owner, listener);
+
   /// Claims the recognizer's callbacks for [listener].
   ///
   /// Call immediately before `listen()`. The previous owner, if any, is told
@@ -68,6 +70,16 @@ class SpeechHub {
   /// from `dispose()` and safe to call twice.
   static void release(SpeechHubListener listener) {
     if (identical(_owner, listener)) _owner = null;
+  }
+
+  /// Disconnect callbacks before recorder cleanup can emit late speech errors.
+  /// The caller resets its own UI; only a different owner needs onSpeechLost.
+  static void releaseForMicHandoff(SpeechHubListener caller) {
+    final displaced = _owner;
+    _owner = null;
+    if (displaced != null && !identical(displaced, caller)) {
+      _guard(displaced.onSpeechLost);
+    }
   }
 
   /// Initializes the recognizer once, wiring its callbacks to this hub.

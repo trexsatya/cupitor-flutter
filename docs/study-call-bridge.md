@@ -155,8 +155,7 @@ notification lists keep their existing behavior.
 
 - `max_retries` defaults to **3 retries after the first attempt** (4 answers in
   total), configurable from 0 to 10. A correct answer stops immediately. Wrong
-  answers, ambiguous/unrecognized speech, silence and transient recognition
-  errors consume attempts, repeat the question and listen again automatically
+  answers, ambiguous/unrecognized speech and silence consume attempts, repeat the question and listen again automatically
   within the same call. After the last attempt the call becomes `failed`.
   Missing speech services, unsupported language or denied microphone permission
   leave the on-screen fallback available instead of looping permission prompts.
@@ -328,3 +327,30 @@ pending-capacity rules as scheduled calls. Duplicate callback actions cannot
 reschedule an already changed call. Failure to arm the new alarm restores the
 declined row and reports the failure. Stale delivery/expiry actions from the
 original ring cannot fire or expire the future callback.
+
+
+## Speech-service recovery
+
+An answer turn automatically retries temporary speech-service failures at most
+twice, with increasing backoff. Microphone recording errors, a busy/disconnected
+service, client/server failures, network errors and request throttling are
+service failures rather than wrong answers. They never use the question's
+attempt budget. Exhausting recovery leaves Answer by voice and the on-screen
+answer controls available, with a specific message and Android error code.
+Permission errors and unsupported/unavailable language models do not loop;
+the message explains which permission or question language needs attention.
+The call screen offers Speech recognition settings separately from TTS settings.
+
+Service availability is checked again on recovery/manual retry. A failed check
+cannot hide the voice button for the rest of the call. Success/error cleanup
+releases a finished recognizer without an additional cancel request, and rapid
+commands wait at least 350 ms before binding another recognizer. Stop, route
+changes, backgrounding and closing cancel queued restarts and reject stale
+callbacks. The microphone button remains Stop listening during recovery.
+
+The 15-second watchdog distinguishes a service that never opened its microphone
+(recoverable service failure) from silence after it opened (an answer attempt).
+No-match/speech-timeout callbacks and empty results still follow the configured
+answer retry budget, except while paused or waiting to repeat as described above.
+The installed Android recognition service and downloaded language models still
+determine actual device support; the app does not silently switch answer language.
