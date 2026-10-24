@@ -11,16 +11,19 @@ import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import java.util.concurrent.Executor
 
 /** Owns communication routing only while an answered study call is visible.
  * TTS and recognition keep the same route across their turn-taking. */
 @Suppress("DEPRECATION")
-class StudyCallAudio(private val context: Context, initialSpeaker: Boolean = false, private val changed: (State) -> Unit) {
+class StudyCallAudio(private val context: Context, initialSpeaker: Boolean = false,
+                     private val playback: StudyCallPlayback = SilentStudyCallPlayback(), private val changed: (State) -> Unit) {
     data class State(val ready: Boolean, val label: String, val speaker: Boolean = false,
                      val canToggleSpeaker: Boolean = false)
 
     companion object {
+        internal const val SETTLE_MS = 350L
         val attributes: AudioAttributes get() = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
@@ -54,6 +57,9 @@ class StudyCallAudio(private val context: Context, initialSpeaker: Boolean = fal
     private var scoStarted = false
     private var scoFailed = false
     private var timer: Runnable? = null
+    private var routeCheck: Runnable? = null
+    private var stableSince: Long? = null
+    private var candidate: State? = null
     private var communicationListener: AudioManager.OnCommunicationDeviceChangedListener? = null
     var state = State(false, "Audio not active")
         private set
@@ -84,9 +90,13 @@ class StudyCallAudio(private val context: Context, initialSpeaker: Boolean = fal
         }
     }
 
-    fun start(): Boolean {
+    fun start(recheck: Boolean = false): Boolean {
         if (active) {
             if (audio.mode != AudioManager.MODE_IN_COMMUNICATION) stop("Call audio was interrupted. Tap Read again to resume.")
+            else {
+                if (recheck) stableSince = null
+                checkPlaybackRoute()
+            }
             return state.ready
         }
         if (audio.mode != AudioManager.MODE_NORMAL) {
@@ -111,6 +121,7 @@ class StudyCallAudio(private val context: Context, initialSpeaker: Boolean = fal
                 }.also { audio.addOnCommunicationDeviceChangedListener(executor, it) }
             } else context.registerReceiver(scoReceiver, IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED))
             audio.registerAudioDeviceCallback(devices, handler)
+            playback.start { if (active) checkPlaybackRoute() }
             selectRoute()
         } catch (_: Exception) { stop("Could not route call audio. You can answer on screen.") }
         return state.ready
@@ -140,9 +151,11 @@ class StudyCallAudio(private val context: Context, initialSpeaker: Boolean = fal
             }
             if (requested?.id == target.id && (state.ready || timer != null)) return
             requested = target
+            stableSince = null; candidate = null
             publish(State(false, "Connecting ${label(target).lowercase()}…", target.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, canToggle(routes)))
             timer?.let(handler::removeCallbacks)
             timer = null
+            routeCheck?.let(handler::removeCallbacks); routeCheck = null
             if (Build.VERSION.SDK_INT >= 31) {
                 if (!audio.setCommunicationDevice(target)) {
                     if (target.type != AudioDeviceInfo.TYPE_BUILTIN_EARPIECE && routes.any { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }) {
@@ -170,13 +183,40 @@ class StudyCallAudio(private val context: Context, initialSpeaker: Boolean = fal
     }
 
     private fun waitForRoute() {
+        if (timer != null) return
         timer = Runnable {
             if (active && !state.ready) stop("The headset did not connect. Reconnect it or tap Read again.")
         }.also { handler.postDelayed(it, 30_000) }
     }
     private fun ready(label: String, speaker: Boolean) {
-        timer?.let(handler::removeCallbacks); timer = null
-        publish(State(true, label, speaker, canToggle(available())))
+        candidate = State(true, label, speaker, canToggle(available()))
+        checkPlaybackRoute()
+    }
+    private fun checkPlaybackRoute() {
+        if (!active) return
+        routeCheck?.let(handler::removeCallbacks); routeCheck = null
+        try {
+            val expected = candidate
+            val outputs = playback.routedDevices()
+            val selected = Build.VERSION.SDK_INT < 31 || audio.communicationDevice?.id == requested?.id
+            val actual = outputs.isNotEmpty() && outputs.all { device ->
+                if (requested != null) device.id == requested?.id
+                else if (speakerRequested) device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                else device.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            }
+            val matches = expected != null && selected && actual && audio.mode == AudioManager.MODE_IN_COMMUNICATION
+            val now = SystemClock.uptimeMillis()
+            if (!matches) stableSince = null
+            else if (stableSince == null) stableSince = now
+            if (matches && now - stableSince!! >= SETTLE_MS) {
+                timer?.let(handler::removeCallbacks); timer = null
+                publish(expected!!)
+            } else {
+                if (state.ready) publish(state.copy(ready = false, label = "Connecting call audio…"))
+                waitForRoute()
+                routeCheck = Runnable { checkPlaybackRoute() }.also { handler.postDelayed(it, 50) }
+            }
+        } catch (_: Exception) { stop("Could not confirm call audio. You can answer on screen.") }
     }
     private fun canToggle(routes: List<AudioDeviceInfo>) = routes.any { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER } &&
         routes.any { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE || external(it.type) }
@@ -196,6 +236,9 @@ class StudyCallAudio(private val context: Context, initialSpeaker: Boolean = fal
         val wasActive = active
         active = false
         timer?.let(handler::removeCallbacks); timer = null
+        routeCheck?.let(handler::removeCallbacks); routeCheck = null
+        stableSince = null; candidate = null
+        try { playback.close() } catch (_: Exception) {}
         if (wasActive) {
             try { audio.unregisterAudioDeviceCallback(devices) } catch (_: Exception) {}
             if (Build.VERSION.SDK_INT >= 31) {

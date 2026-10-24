@@ -252,6 +252,16 @@ microphone; actual microphone support also depends on the recognition service.
 Pausing, ending or destroying the screen releases the communication device,
 Bluetooth connection request, call mode and audio focus.
 
+Speech focus is acquired before preparing output. A looping zero-PCM
+communication track opens and holds the audio path without speaking. The call
+waits until the track's actual playback output matches the selected device and
+remains stable for 350 ms; selecting a device alone is insufficient. Changing
+focus or playback routes closes this speech gate again. On Android 16+, all
+reported playback outputs must match, so a simultaneous loudspeaker output does
+not pass the private-route check. If confirmation fails, the question stays on
+screen instead of being read through an unconfirmed output. The quiet track is
+released with the call's other audio resources.
+
 Study-call notifications use their own native channel and alarm identities;
 the existing review scheduler's cancel-all operation must not remove them.
 

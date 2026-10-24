@@ -7,6 +7,7 @@ import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Looper
+import android.os.Build
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
@@ -38,6 +39,22 @@ class StudyCallAudioTest {
         shadowOf(audio).setAvailableCommunicationDevices(devices.toList())
     }
     private fun idle() { shadowOf(Looper.getMainLooper()).idle() }
+    private fun settle() { shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(StudyCallAudio.SETTLE_MS)) }
+    private fun session(changed: (StudyCallAudio.State) -> Unit = {}): StudyCallAudio {
+        val output = FakeCallPlayback {
+            if (Build.VERSION.SDK_INT >= 31) listOfNotNull(audio.communicationDevice)
+            else {
+                val devices = audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+                val route = when {
+                    audio.isBluetoothScoOn -> devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                    audio.isSpeakerphoneOn -> devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                    else -> devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
+                }
+                listOfNotNull(route)
+            }
+        }
+        return StudyCallAudio(context, playback = output, changed = changed)
+    }
     @Before fun setup() {
         context = Robolectric.buildActivity(Activity::class.java).setup().get()
         audio = context.getSystemService(AudioManager::class.java)!!
@@ -46,8 +63,8 @@ class StudyCallAudioTest {
     @Test fun answeredAudioUsesTheReceiverAndReleasesItsModeAndDevice() {
         val receiver = device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE)
         devices(device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER), receiver)
-        val session = StudyCallAudio(context) {}
-        assertTrue(session.start())
+        val session = session()
+        assertFalse(session.start()); settle(); assertTrue(session.state.ready)
         assertEquals(AudioManager.MODE_IN_COMMUNICATION, audio.mode)
         assertEquals(receiver.id, audio.communicationDevice!!.id)
         assertFalse(session.state.speaker)
@@ -66,8 +83,8 @@ class StudyCallAudioTest {
             AudioDeviceInfo.TYPE_BLE_HEADSET, AudioDeviceInfo.TYPE_HEARING_AID)) {
             val headset = device(type)
             devices(device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE), device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER), headset)
-            val session = StudyCallAudio(context) {}
-            assertTrue(session.start())
+            val session = session()
+            assertFalse(session.start()); settle(); assertTrue(session.state.ready)
             assertEquals(headset.id, audio.communicationDevice!!.id)
             assertFalse(session.state.speaker)
             session.stop(); idle()
@@ -78,12 +95,12 @@ class StudyCallAudioTest {
         val headset = device(AudioDeviceInfo.TYPE_BLE_HEADSET)
         val speaker = device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
         devices(speaker, headset, device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE))
-        val session = StudyCallAudio(context) {}
-        assertTrue(session.start()); assertTrue(session.state.canToggleSpeaker)
-        session.setSpeaker(true)
+        val session = session()
+        assertFalse(session.start()); settle(); assertTrue(session.state.ready); assertTrue(session.state.canToggleSpeaker)
+        session.setSpeaker(true); settle()
         assertEquals(speaker.id, audio.communicationDevice!!.id)
         assertTrue(session.state.speaker)
-        session.setSpeaker(false)
+        session.setSpeaker(false); settle()
         assertEquals(headset.id, audio.communicationDevice!!.id)
         assertFalse(session.state.speaker)
         session.stop()
@@ -93,25 +110,25 @@ class StudyCallAudioTest {
         val receiver = device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE)
         devices(receiver, device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER))
         val states = mutableListOf<StudyCallAudio.State>()
-        val session = StudyCallAudio(context) { states += it }
-        session.start(); idle()
+        val session = session { states += it }
+        session.start(); settle()
         val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
-        shadowOf(audio).addAvailableCommunicationDevice(headset, true); idle()
+        shadowOf(audio).addAvailableCommunicationDevice(headset, true); settle()
         assertEquals(headset.id, audio.communicationDevice!!.id)
-        shadowOf(audio).removeAvailableCommunicationDevice(headset, true); idle()
+        shadowOf(audio).removeAvailableCommunicationDevice(headset, true); settle()
         assertEquals(receiver.id, audio.communicationDevice!!.id)
         assertFalse(states.any { it.speaker })
         assertTrue(states.any { !it.ready })
         session.stop()
         val count = states.size
-        shadowOf(audio).addAvailableCommunicationDevice(headset, true); idle()
+        shadowOf(audio).addAvailableCommunicationDevice(headset, true); settle()
         assertNull(audio.communicationDevice)
         assertEquals(count, states.size)
     }
 
     @Test fun anotherCallIsNotTakenOverAndRefusedRoutesDoNotRemainActive() {
         audio.mode = AudioManager.MODE_IN_CALL
-        val session = StudyCallAudio(context) {}
+        val session = session()
         assertFalse(session.start())
         assertEquals(AudioManager.MODE_IN_CALL, audio.mode)
         audio.mode = AudioManager.MODE_NORMAL
@@ -122,14 +139,14 @@ class StudyCallAudioTest {
         assertEquals(AudioManager.MODE_NORMAL, audio.mode)
         assertNull(audio.communicationDevice)
         shadowOf(audio).lockCommunicationDevice(false)
-        assertTrue(session.start())
+        assertFalse(session.start()); settle(); assertTrue(session.state.ready)
         session.stop()
     }
 
     @Test fun aTabletUsesItsSpeakerOnlyWhenNoPrivateRouteExists() {
         devices(device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER))
-        val session = StudyCallAudio(context) {}
-        assertTrue(session.start())
+        val session = session()
+        assertFalse(session.start()); settle(); assertTrue(session.state.ready)
         assertTrue(session.state.speaker)
         assertFalse(session.state.canToggleSpeaker)
         session.stop()
@@ -139,12 +156,12 @@ class StudyCallAudioTest {
     fun communicationAudioWaitsUntilTheRequestedDeviceIsActuallyActive() {
         val headset = device(AudioDeviceInfo.TYPE_BLE_HEADSET)
         devices(headset, device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE))
-        val session = StudyCallAudio(context) {}
+        val session = session()
         assertFalse(session.start())
         assertFalse(session.state.ready)
         assertNull(audio.communicationDevice)
         Shadow.extract<DelayedRouteAudioManager>(audio).completeRoute()
-        idle()
+        settle()
         assertTrue(session.state.ready)
         assertEquals(headset.id, audio.communicationDevice!!.id)
         session.stop()
@@ -154,7 +171,7 @@ class StudyCallAudioTest {
     fun legacyBluetoothWaitsForScoAndDisconnectsCleanly() {
         val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
         shadowOf(audio).setOutputDevices(listOf(headset, device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE)))
-        val session = StudyCallAudio(context) {}
+        val session = session()
         assertFalse(session.start())
         assertFalse(session.state.ready)
         val legacy = Shadow.extract<LegacyScoAudioManager>(audio)
@@ -165,7 +182,7 @@ class StudyCallAudioTest {
         idle(); assertFalse(session.state.ready); assertEquals(1, legacy.starts)
         context.sendBroadcast(Intent(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
             .putExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, AudioManager.SCO_AUDIO_STATE_CONNECTED))
-        idle()
+        settle()
         assertTrue(session.state.ready)
         assertTrue(audio.isBluetoothScoOn)
         session.stop()
@@ -177,12 +194,76 @@ class StudyCallAudioTest {
     @Test @Config(sdk = [24], shadows = [LegacyScoAudioManager::class])
     fun legacyConnectionTimeoutReleasesAudioWithoutReadingThroughTheSpeaker() {
         shadowOf(audio).setOutputDevices(listOf(device(AudioDeviceInfo.TYPE_BLUETOOTH_SCO)))
-        val session = StudyCallAudio(context) {}
+        val session = session()
         assertFalse(session.start())
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(31))
         assertFalse(session.state.ready)
         assertEquals(AudioManager.MODE_NORMAL, audio.mode)
         assertFalse(audio.isBluetoothScoOn)
+    }
+
+    @Test fun selectedEarpieceDoesNotPermitSpeechWhilePlaybackStillUsesTheSpeaker() {
+        val receiver = device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE)
+        val speaker = device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+        devices(receiver, speaker)
+        var hardware = listOf(speaker)
+        val output = FakeCallPlayback { hardware }
+        val session = StudyCallAudio(context, playback = output) {}
+        assertFalse(session.start())
+        assertEquals(receiver.id, audio.communicationDevice!!.id)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+        assertFalse("Selected device is not proof of actual playback routing", session.state.ready)
+        hardware = listOf(receiver); output.changed?.invoke()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(StudyCallAudio.SETTLE_MS - 1))
+        assertFalse(session.state.ready)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(1))
+        assertTrue(session.state.ready)
+        session.stop(); assertFalse(output.opened)
+    }
+
+    @Test fun aBriefCorrectRouteOrSimultaneousSpeakerOutputCannotPassTheGate() {
+        val receiver = device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE)
+        val speaker = device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+        devices(receiver, speaker)
+        var hardware = listOf(receiver)
+        val output = FakeCallPlayback { hardware }
+        val session = StudyCallAudio(context, playback = output) {}
+        session.start()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(200))
+        hardware = listOf(receiver, speaker); output.changed?.invoke()
+        settle(); assertFalse(session.state.ready)
+        hardware = listOf(receiver); output.changed?.invoke()
+        settle(); assertTrue(session.state.ready)
+        hardware = listOf(speaker); output.changed?.invoke()
+        assertFalse("A playback route change immediately pauses speech", session.state.ready)
+        val staleCallback = output.changed
+        session.stop(); staleCallback?.invoke(); settle()
+        assertFalse(session.state.ready)
+        assertNull(audio.communicationDevice)
+    }
+
+    @Test fun aNewAudioFocusRequestRequiresThePlaybackRouteToSettleAgain() {
+        devices(device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE))
+        val session = session()
+        session.start(); settle(); assertTrue(session.state.ready)
+        assertFalse(session.start(recheck = true))
+        settle(); assertTrue(session.state.ready)
+        session.stop()
+    }
+
+    @Test fun playbackConfirmationTimeoutNeverPublishesReadyAndReleasesTheQuietTrack() {
+        val receiver = device(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE)
+        val speaker = device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+        devices(receiver, speaker)
+        val output = FakeCallPlayback { listOf(speaker) }
+        val states = mutableListOf<StudyCallAudio.State>()
+        val session = StudyCallAudio(context, playback = output) { states += it }
+        session.start()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(31))
+        assertFalse(states.any { it.ready })
+        assertFalse(output.opened)
+        assertEquals(AudioManager.MODE_NORMAL, audio.mode)
+        assertNull(audio.communicationDevice)
     }
 }
 
@@ -209,4 +290,12 @@ class DelayedRouteAudioManager : ShadowAudioManager() {
             callOnCommunicationDeviceChangedListeners(it)
         }
     }
+}
+
+private class FakeCallPlayback(private val routes: () -> List<AudioDeviceInfo>) : StudyCallPlayback {
+    var opened = false
+    var changed: (() -> Unit)? = null
+    override fun start(onRoutingChanged: () -> Unit) { opened = true; changed = onRoutingChanged }
+    override fun routedDevices() = if (opened) routes() else emptyList()
+    override fun close() { opened = false; changed = null }
 }
