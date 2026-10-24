@@ -149,4 +149,26 @@ class StudyCallInteractionTest {
             assertEquals("declined", StudyCalls.find(context, row.getString("id"))!!.getString("status"))
         } finally { controller.pause().stop().destroy() }
     }
+    @Test fun unavailableServiceKeepsVoiceRetryAndSettingsVisibleAndServiceErrorsDoNotUseAttempts() {
+        val row = StudyCalls.validate(args() + mapOf("voice_response" to true), 1, true)
+            .put("status", "answered").put("answered_at", System.currentTimeMillis())
+        store(row)
+        val controller = Robolectric.buildActivity(StudyCallActivity::class.java,
+            Intent(context, StudyCallActivity::class.java).putExtra("id", row.getString("id"))).setup()
+        try {
+            val screen = controller.get()
+            fun descendants(view: View): List<View> = listOf(view) + if (view is ViewGroup)
+                (0 until view.childCount).flatMap { descendants(view.getChildAt(it)) } else emptyList()
+            val buttons = descendants(screen.findViewById(android.R.id.content)).filterIsInstance<Button>()
+            assertTrue(buttons.any { it.text.toString() == "Answer by voice" })
+            val voice = ReflectionHelpers.getField<StudyCallVoice>(screen, "voice")
+            val onFailure = ReflectionHelpers.getField<(String, Boolean) -> Unit>(voice, "onFailure")
+            onFailure("The speech service is busy (error 8).", false)
+            assertEquals(0, StudyCalls.find(context, row.getString("id"))!!.getJSONArray("attempts").length())
+            assertEquals("answered", StudyCalls.find(context, row.getString("id"))!!.getString("status"))
+            buttons.single { it.text.toString() == "Speech recognition settings" }.performClick()
+            assertEquals(android.provider.Settings.ACTION_VOICE_INPUT_SETTINGS, requireNotNull(shadowOf(screen).nextStartedActivity).action)
+        } finally { controller.pause().stop().destroy() }
+    }
+
 }

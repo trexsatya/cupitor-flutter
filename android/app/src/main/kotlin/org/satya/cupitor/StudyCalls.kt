@@ -653,7 +653,6 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private var voiceButton: Button? = null
     private var voice: StudyCallVoice? = null
     private var voiceResponse = true
-    private var voiceAvailable = false
     private var pendingVoicePermission = false
     private var listenOnResume = false
     private var speechBatch = 0
@@ -688,7 +687,6 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         needsInitialReading = !paused
         voiceResponse = row.optBoolean("voice_response", true)
         responseType = row.optString("response_type", "choice")
-        voiceAvailable = StudyCallVoice.available(this)
         body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val pad = (24 * resources.displayMetrics.density).toInt(); setPadding(pad, pad, pad, pad)
@@ -726,9 +724,9 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             onStatus = { showVoiceStatus(it) },
             onListening = { voiceButton?.text = if (it) "Stop listening" else "Answer by voice" },
             onResult = { acceptSpeech(it) },
-            onFailure = { text, retryable ->
-                if (retryable && (paused || repeatPending)) listenForControlsAgain()
-                else if (retryable) recordAttempt("", responseMode = "voice", reason = "no_input")
+            onFailure = { text, countsAsAnswer ->
+                if (countsAsAnswer && (paused || repeatPending)) listenForControlsAgain()
+                else if (countsAsAnswer) recordAttempt("", responseMode = "voice", reason = "no_input")
                 else showVoiceStatus(text)
             })
         render()
@@ -814,8 +812,11 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
                     completeChoice(i)
                 }
             }
-            if (voiceResponse && voiceAvailable) {
-                showVoiceStatus(retryFeedback.ifBlank { if (responseType == "text") "After the question, say your answer."
+            if (voiceResponse) {
+                val voiceAvailable = StudyCallVoice.available(this)
+                showVoiceStatus(retryFeedback.ifBlank { if (!voiceAvailable)
+                    "Android's speech service is not ready. You can retry voice input or open Speech recognition settings."
+                    else if (responseType == "text") "After the question, say your answer."
                     else "After the question, say a number or an alternative." })
                 voiceButton = button("Answer by voice") {
                     if (voice?.listening == true) {
@@ -823,14 +824,20 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
                         showVoiceStatus("Listening stopped. You can answer on screen or tap Answer by voice.")
                     } else beginVoiceAnswer()
                 }
-            } else if (voiceResponse) {
-                showVoiceStatus("Speech recognition is unavailable. You can answer on screen.")
+                button("Speech recognition settings") {
+                    voice?.cancel()
+                    try { startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)) }
+                    catch (_: Exception) {
+                        try { startActivity(Intent(Settings.ACTION_SETTINGS)) }
+                        catch (_: Exception) { showVoiceStatus("Open Android Settings to choose a speech recognition service.") }
+                    }
+                }
             } else showVoiceStatus(retryFeedback.ifBlank { "Answer on screen." })
             pauseButton = button(if (paused) "Continue" else "Pause") {
                 if (paused) continueQuestion() else pauseQuestion()
             }
             button("Read again") { repeatQuestion() }
-            if (voiceResponse && voiceAvailable) body.addView(TextView(this).apply {
+            if (voiceResponse) body.addView(TextView(this).apply {
                 text = StudyCallControls.hint(row.getString("language")); textSize = 15f; setTextColor(Color.DKGRAY)
             })
             button("End call") { StudyCalls.finish(this, id, "interrupted"); finish() }
@@ -878,7 +885,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         // chunks, keeping the complete question and all numbered alternatives.
         val swedish = row.getString("language").startsWith("sv")
         val instruction = when {
-            !voiceResponse || !voiceAvailable -> ""
+            !voiceResponse -> ""
             responseType == "text" -> if (swedish) ". Svara med ord eller en mening." else ". Say your answer."
             swedish -> ". Svara med numret eller alternativet."
             else -> ". Say the number or the alternative."
@@ -890,7 +897,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         needsInitialReading = false
         val chunks = spoken.chunked(3000)
         val batch = ++speechBatch
-        autoListenUtterance = if (voiceResponse && voiceAvailable) "study-$id-$batch-${chunks.lastIndex}" else null
+        autoListenUtterance = if (voiceResponse) "study-$id-$batch-${chunks.lastIndex}" else null
         lastReadUtterance = "study-$id-$batch-${chunks.lastIndex}"
         chunks.forEachIndexed { i, chunk ->
             if (tts?.speak(chunk, TextToSpeech.QUEUE_ADD, null, "study-$id-$batch-$i") == TextToSpeech.ERROR) {
@@ -952,10 +959,6 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private fun beginVoiceAnswer() {
         if (!voiceResponse || !isAnsweredAndResumed()) return
         stopReading()
-        if (!voiceAvailable) {
-            voiceStatus.text = "Speech recognition is unavailable. Tap an alternative to answer."
-            return
-        }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             if (!pendingVoicePermission) {
                 pendingVoicePermission = true
@@ -1068,7 +1071,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
 
     private fun listenForControlsAgain() {
         clearControlListen()
-        if (!voiceResponse || !voiceAvailable) return
+        if (!voiceResponse) return
         controlListenTask = Runnable {
             controlListenTask = null
             if ((paused || repeatPending) && isAnsweredAndResumed()) beginVoiceAnswer()
