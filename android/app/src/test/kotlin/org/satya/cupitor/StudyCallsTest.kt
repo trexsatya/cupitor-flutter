@@ -274,4 +274,22 @@ class StudyCallsTest {
         assertEquals(1, options.size); assertEquals("sv-test", options.single()["name"])
     }
 
+    @Test fun repetitionPauseCanInheritDefaultsOrOverridePerCallAndInvalidSettingsAreAtomic() {
+        assertEquals(3000L, StudyCallControls.pauseMillis(context, StudyCalls.validate(args(), 1, true)))
+        StudyCalls.setSettings(context, mapOf("repetition_pause_seconds" to 7.5))
+        val inherited = StudyCalls.validate(args(), 1, true)
+        assertFalse(inherited.has("repetition_pause_seconds"))
+        assertEquals(7500L, StudyCallControls.pauseMillis(context, inherited))
+        for (seconds in listOf(0.0, 0.5, 120.0)) {
+            val override = StudyCalls.validate(args() + mapOf("repetition_pause_seconds" to seconds), 1, true)
+            assertEquals((seconds * 1000).toLong(), StudyCallControls.pauseMillis(context, override))
+        }
+        for (bad in listOf<Any?>(null, "3", -1, 121, Double.NaN, Double.POSITIVE_INFINITY)) {
+            expectError("bad_timing") { StudyCalls.setSettings(context, mapOf("pending_limit" to 300, "repetition_pause_seconds" to bad)) }
+            expectError("bad_timing") { StudyCalls.validate(args() + mapOf("repetition_pause_seconds" to bad), 1, true) }
+        }
+        assertEquals(50, StudyCalls.pendingLimit(context))
+        assertEquals(7500L, StudyCallControls.pauseMillis(context, inherited))
+    }
+
 }

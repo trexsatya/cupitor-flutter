@@ -68,14 +68,16 @@ object StudyCalls {
                         "answer_types" to listOf("choice", "text"),
                         "default_retries" to StudyCallAnswer.DEFAULT_RETRIES,
                         "batch_schedule" to true, "edit_scheduled" to true, "pending_controls" to true, "history_limit" to MAX_HISTORY,
-                        "voice_selection" to true,
+                        "voice_selection" to true, "repetition_controls" to true,
+                        "command_languages" to StudyCallControls.supportedLanguages,
+                        "command_hints" to StudyCallControls.supportedLanguages.associateWith(StudyCallControls::hint),
                         "settings" to true, "pending_limit" to pendingLimit(activity),
                         "max_pending_limit" to MAX_PENDING_LIMIT, "armed_limit" to MAX_ARMED,
                         "pending_count" to read(activity).count { it.optString("status") !in terminal },
-                    ) + StudyCallSpeech.defaults(activity))
+                    ) + StudyCallSpeech.defaults(activity) + StudyCallControls.defaults(activity))
                     "setSettings" -> {
                         setSettings(activity, args)
-                        reply.success(mapOf("pending_limit" to pendingLimit(activity)) + StudyCallSpeech.defaults(activity))
+                        reply.success(mapOf("pending_limit" to pendingLimit(activity)) + StudyCallSpeech.defaults(activity) + StudyCallControls.defaults(activity))
                     }
                     "getVoices" -> StudyCallSpeech.getVoices(activity, reply)
                     "previewVoice" -> {
@@ -174,6 +176,7 @@ object StudyCalls {
 
     fun setSettings(context: Context, args: Map<*, *>) {
         val voice = StudyCallSpeech.validate(args)
+        val pause = StudyCallControls.validate(args)
         val limit = if (args.containsKey("pending_limit")) {
             val value = args["pending_limit"] as? Number ?: error("bad_limit")
             check(value.toDouble() == value.toInt().toDouble() && value.toInt() in 1..MAX_PENDING_LIMIT) { "bad_limit" }
@@ -182,6 +185,7 @@ object StudyCalls {
         val edit = context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).edit().putInt("pending_limit", limit)
         voice["voice_name"]?.let { edit.putString("voice_name", it as String) }
         voice["speech_rate"]?.let { edit.putFloat("speech_rate", (it as Number).toFloat()) }
+        pause?.let { edit.putFloat(StudyCallControls.PAUSE_KEY, it.toFloat()) }
         check(edit.commit()) { "storage_error" }
         // Lowering the limit never removes existing questions. It only blocks additions.
     }
@@ -357,6 +361,7 @@ object StudyCalls {
             .put("accepted_answers", JSONArray(accepted))
             .put("enabled", enabled).put("status", if (enabled) "scheduled" else "disabled")
         StudyCallSpeech.validate(args).forEach { (key, value) -> row.put(key, value) }
+        StudyCallControls.validate(args)?.let { row.put(StudyCallControls.PAUSE_KEY, it) }
         if (correctIndex != null) row.put("correct_choice_index", correctIndex)
         return row
     }
@@ -430,6 +435,31 @@ object StudyCalls {
         .setData(Uri.parse("cupitor-study-call://screen/$id/$answer"))
         .putExtra("id", id).putExtra("answer", answer)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+
+    fun declineIntent(context: Context, id: String) = Intent(context, StudyCallDeclineActivity::class.java)
+        .setData(Uri.parse("cupitor-study-call://decline-options/$id")).putExtra("id", id)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+
+    /** Reschedule the same declined question; late/duplicate actions cannot alter active calls. */
+    @Synchronized fun callBack(context: Context, id: String, minutes: Int,
+                              armCall: (Context, JSONObject) -> Unit = ::arm) {
+        check(minutes in setOf(5, 10, 15)) { "bad_time" }
+        check(permission(context) == "granted") { "permission_denied" }
+        val old = find(context, id) ?: error("unknown_call")
+        check(old.optString("status") == "declined") { "not_declined" }
+        check(read(context).count { it.optString("status") !in terminal } < pendingLimit(context)) { "too_many_calls" }
+        val replacement = validate(asMap(old) + mapOf("when_ms" to System.currentTimeMillis() + minutes * 60_000L,
+            "enabled" to true), old.getInt("profile_id"), false)
+            .put("id", id).put("created_at", old.getLong("created_at"))
+            .put("callback_count", old.optInt("callback_count") + 1)
+        mutate(context) { rows -> rows.removeAll { it.optString("id") == id }; rows.add(replacement) }
+        try { rearmScheduled(context, armCall) }
+        catch (error: Exception) {
+            mutate(context) { rows -> rows.removeAll { it.optString("id") == id }; rows.add(old) }
+            rearmBestEffort(context)
+            throw error
+        }
+    }
 
     private fun screenPending(context: Context, id: String, answer: Boolean) = PendingIntent.getActivity(context, 0,
         screenIntent(context, id, answer), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
@@ -541,6 +571,8 @@ object StudyCalls {
             Intent(context, StudyCallReceiver::class.java).setAction("decline")
                 .setData(Uri.parse("cupitor-study-call://decline/$id")).putExtra("id", id),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val declineOptions = PendingIntent.getActivity(context, 0, declineIntent(context, id),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(context, CHANNEL) else Notification.Builder(context)
         builder.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
             .setContentTitle(row.getString("title")).setContentText("Incoming study call")
@@ -548,7 +580,7 @@ object StudyCalls {
             .setVisibility(Notification.VISIBILITY_PRIVATE).setLocalOnly(true)
             .setContentIntent(screenPending(context, id, false)).setDeleteIntent(decline)
             .addAction(Notification.Action.Builder(null, "Answer", screenPending(context, id, true)).build())
-            .addAction(Notification.Action.Builder(null, "Decline", decline).build())
+            .addAction(Notification.Action.Builder(null, "Decline", declineOptions).build())
         if (Build.VERSION.SDK_INT >= 26) builder.setTimeoutAfter(RING_MS)
         else builder.setSound(sound).setVibrate(longArrayOf(0, 400, 400))
         if (fullScreenAllowed(context)) builder.setFullScreenIntent(screenPending(context, id, false), true)
@@ -594,6 +626,14 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private var started = false
     private var needsInitialReading = true
     private var focus: AudioFocusRequest? = null
+    private var speechFocusHeld = false
+    private var pendingFinalFeedback: String? = null
+    private var paused = false
+    private var repeatPending = false
+    private var repeatOnResume = false
+    private var repeatTask: Runnable? = null
+    private var controlListenTask: Runnable? = null
+    private var pauseButton: Button? = null
     private var callAudio: StudyCallAudio? = null
     private var audioStatus: TextView? = null
     private var speakerButton: Button? = null
@@ -601,6 +641,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private var lastReadUtterance: String? = null
     private val focusListener = AudioManager.OnAudioFocusChangeListener {
         if (it < 0) {
+            speechFocusHeld = false
             needsInitialReading = true
             stopReading(); voice?.cancel()
             callAudio?.stop("Audio interrupted. Tap Read again to resume.")
@@ -642,6 +683,9 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         val row = StudyCalls.find(this, id)
         if (row == null || row.optString("status") !in setOf("ringing", "answered")) { finish(); return }
         answered = row.optString("status") == "answered"
+        paused = savedInstanceState?.getBoolean("study_paused") == true
+        repeatOnResume = savedInstanceState?.getBoolean("study_repeat_pending") == true
+        needsInitialReading = !paused
         voiceResponse = row.optBoolean("voice_response", true)
         responseType = row.optString("response_type", "choice")
         voiceAvailable = StudyCallVoice.available(this)
@@ -671,8 +715,9 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
                 }
                 stopReading(); voice?.cancel()
             } else handler.post {
+                if (finalFeedback) { speakFinalFeedback(); return@post }
                 if (!isAnsweredAndResumed() || callAudio?.state?.ready != true) return@post
-                if (listenOnAudioReady) { listenOnAudioReady = false; beginVoiceAnswer() }
+                if (paused || repeatPending || listenOnAudioReady) { listenOnAudioReady = false; beginVoiceAnswer() }
                 else if (ready && needsInitialReading) speak()
             }
         }
@@ -682,7 +727,8 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             onListening = { voiceButton?.text = if (it) "Stop listening" else "Answer by voice" },
             onResult = { acceptSpeech(it) },
             onFailure = { text, retryable ->
-                if (retryable) recordAttempt("", responseMode = "voice", reason = "no_input")
+                if (retryable && (paused || repeatPending)) listenForControlsAgain()
+                else if (retryable) recordAttempt("", responseMode = "voice", reason = "no_input")
                 else showVoiceStatus(text)
             })
         render()
@@ -728,14 +774,14 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     private fun render() {
         while (body.childCount > 4) body.removeViewAt(4)
         voiceButton = null
-        audioStatus = null; speakerButton = null
+        audioStatus = null; speakerButton = null; pauseButton = null
         answerEntry = null
         val row = StudyCalls.find(this, id) ?: return
         voiceStatus.visibility = if (answered) View.VISIBLE else View.GONE
         if (!answered) {
             message.text = "Incoming study call"
             button("Answer") { answer() }
-            button("Decline") { StudyCalls.finish(this, id, "declined"); finish() }
+            button("Decline") { decline() }
         } else {
             message.text = row.getString("question")
             val audioState = callAudio?.state
@@ -780,7 +826,13 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             } else if (voiceResponse) {
                 showVoiceStatus("Speech recognition is unavailable. You can answer on screen.")
             } else showVoiceStatus(retryFeedback.ifBlank { "Answer on screen." })
-            button("Read again") { speak() }
+            pauseButton = button(if (paused) "Continue" else "Pause") {
+                if (paused) continueQuestion() else pauseQuestion()
+            }
+            button("Read again") { repeatQuestion() }
+            if (voiceResponse && voiceAvailable) body.addView(TextView(this).apply {
+                text = StudyCallControls.hint(row.getString("language")); textSize = 15f; setTextColor(Color.DKGRAY)
+            })
             button("End call") { StudyCalls.finish(this, id, "interrupted"); finish() }
         }
     }
@@ -803,16 +855,16 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     private fun speak() {
-        if (!ready || !answered || !started || isFinishing) return
+        if (!ready || !answered || !started || isFinishing || paused || repeatPending) return
         if (pendingVoicePermission) return
         acceptingAnswer = true
+        clearControlListen()
         stopReading()
         voice?.cancel()
         val row = StudyCalls.find(this, id) ?: return
         if (row.optString("status") != "answered") return
-        if (callAudio?.state?.ready != true) {
+        if (!prepareCallAudio()) {
             needsInitialReading = true
-            callAudio?.start()
             return
         }
         val language = tts?.let { StudyCallSpeech.configure(it, this, row) }
@@ -821,7 +873,6 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             return
         }
         tts?.setAudioAttributes(StudyCallAudio.attributes)
-        if (!requestSpeechFocus()) return
         val choices = row.getJSONArray("choices")
         // One utterance may exceed an engine's input limit: queue bounded
         // chunks, keeping the complete question and all numbered alternatives.
@@ -861,6 +912,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     private fun requestSpeechFocus(): Boolean {
+        if (speechFocusHeld) return true
         val audio = getSystemService(AudioManager::class.java) ?: return false
         val granted = if (Build.VERSION.SDK_INT >= 26) {
             if (focus == null) focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
@@ -875,10 +927,20 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             callAudio?.stop("Audio is busy. Tap Read again to resume.")
             return false
         }
+        speechFocusHeld = true
         return true
     }
 
+    private fun prepareCallAudio(): Boolean {
+        val changedFocus = !speechFocusHeld
+        // Acquiring focus can change audio policy, so it must happen before
+        // the quiet playback route is confirmed, never just before the words.
+        if (!requestSpeechFocus()) return false
+        return callAudio?.start(recheck = changedFocus) == true
+    }
+
     private fun abandonSpeechFocus() {
+        speechFocusHeld = false
         val audio = getSystemService(AudioManager::class.java) ?: return
         if (Build.VERSION.SDK_INT >= 26) focus?.let { audio.abandonAudioFocusRequest(it) }
         else {
@@ -901,11 +963,12 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             }
             return
         }
-        // Reading and listening never hold audio at the same time.
+        // Recognition owns focus while listening. Recheck the quiet route if
+        // releasing speech focus changes Android's audio policy.
+        val releasedFocus = speechFocusHeld
         abandonSpeechFocus()
-        if (callAudio?.state?.ready != true) {
+        if (callAudio?.start(recheck = releasedFocus) != true) {
             listenOnAudioReady = true
-            callAudio?.start()
             return
         }
         val row = StudyCalls.find(this, id) ?: return
@@ -932,7 +995,21 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     private fun acceptSpeech(heard: List<String>) {
+        if (!isAnsweredAndResumed()) return
         val row = StudyCalls.find(this, id) ?: return
+        val answers = if (paused) emptyList() else {
+            val values = row.getJSONArray(if (responseType == "text") "accepted_answers" else "choices")
+            (0 until values.length()).map { values.getString(it) }
+        }
+        // Only the first final hypothesis can be a command; a lower-ranked
+        // "again" must never override a spoken answer.
+        when (StudyCallControls.command(heard.firstOrNull { it.isNotBlank() }.orEmpty(), row.getString("language"), answers)) {
+            StudyCallControls.Command.WAIT -> { pauseQuestion(); return }
+            StudyCallControls.Command.CONTINUE -> { continueQuestion(); return }
+            StudyCallControls.Command.REPEAT -> { repeatQuestion(); return }
+            null -> {}
+        }
+        if (paused) { showVoiceStatus("Paused. Say the continue command, or tap Continue."); listenForControlsAgain(); return }
         if (responseType == "text") {
             val text = heard.firstOrNull { it.isNotBlank() }.orEmpty()
             recordAttempt(text, responseMode = "voice", transcript = text,
@@ -952,12 +1029,15 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         val row = StudyCalls.find(this, id)
         val used = row?.optJSONArray("attempts")?.length() ?: 0
         val limit = 1 + (row?.optInt("max_retries", StudyCallAnswer.DEFAULT_RETRIES) ?: StudyCallAnswer.DEFAULT_RETRIES)
-        voiceStatus.text = "Attempt ${minOf(used + 1, limit)} of $limit.\n$text"
+        voiceStatus.text = "Attempt ${minOf(used + 1, limit)} of $limit.\n" +
+            (if (paused) "Paused. " else if (repeatPending) "Waiting to repeat. " else "") + text
     }
 
     private fun recordAttempt(answer: String, choice: Int? = null, responseMode: String,
                               transcript: String? = null, reason: String? = null) {
-        if (!acceptingAnswer || !isAnsweredAndResumed()) return
+        if (paused || !acceptingAnswer || !isAnsweredAndResumed()) return
+        cancelRepeat()
+        clearControlListen()
         acceptingAnswer = false
         stopReading()
         voice?.cancel()
@@ -973,18 +1053,67 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
             return
         }
         retryFeedback = if (reason == null) "Not quite. Try again." else "The answer was not clear. Let's try again."
-        needsInitialReading = true
-        showVoiceStatus(retryFeedback)
-        handler.postDelayed({
-            if (isAnsweredAndResumed() && needsInitialReading) {
-                acceptingAnswer = true
-                render()
-                speak()
-            }
-        }, 500)
+        render()
+        repeatQuestion()
+    }
+
+    private fun clearControlListen() {
+        controlListenTask?.let(handler::removeCallbacks); controlListenTask = null
+    }
+
+    private fun cancelRepeat() {
+        repeatTask?.let(handler::removeCallbacks); repeatTask = null
+        repeatPending = false
+    }
+
+    private fun listenForControlsAgain() {
+        clearControlListen()
+        if (!voiceResponse || !voiceAvailable) return
+        controlListenTask = Runnable {
+            controlListenTask = null
+            if ((paused || repeatPending) && isAnsweredAndResumed()) beginVoiceAnswer()
+        }.also { handler.postDelayed(it, 750) }
+    }
+
+    private fun pauseQuestion() {
+        if (!isAnsweredAndResumed()) return
+        cancelRepeat(); clearControlListen()
+        paused = true; needsInitialReading = false; acceptingAnswer = true
+        stopReading(); voice?.cancel()
+        pauseButton?.text = "Continue"
+        showVoiceStatus("Say the continue command, or tap Continue.")
+        beginVoiceAnswer()
+    }
+
+    private fun continueQuestion() {
+        if (!isAnsweredAndResumed()) return
+        cancelRepeat(); clearControlListen()
+        paused = false; needsInitialReading = true; acceptingAnswer = true
+        pauseButton?.text = "Pause"
+        speak()
+    }
+
+    private fun repeatQuestion() {
+        if (!isAnsweredAndResumed()) return
+        val row = StudyCalls.find(this, id) ?: return
+        cancelRepeat(); clearControlListen()
+        paused = false; needsInitialReading = false; acceptingAnswer = true
+        stopReading(); voice?.cancel()
+        pauseButton?.text = "Pause"
+        repeatPending = true
+        val delay = StudyCallControls.pauseMillis(this, row)
+        showVoiceStatus("${retryFeedback} Repeating in ${delay / 1000.0} seconds. You can pause or answer now.".trim())
+        repeatTask = Runnable {
+            repeatTask = null
+            if (!isAnsweredAndResumed() || paused || !repeatPending) return@Runnable
+            repeatPending = false; needsInitialReading = true
+            clearControlListen(); speak()
+        }.also { handler.postDelayed(it, delay) }
+        if (delay > 0) beginVoiceAnswer()
     }
 
     private fun showFinalFeedback(correct: Boolean?) {
+        cancelRepeat(); clearControlListen(); paused = false
         finalFeedback = true
         while (body.childCount > 4) body.removeViewAt(4)
         voiceButton = null
@@ -1000,20 +1129,29 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         voiceStatus.visibility = View.VISIBLE
         voiceStatus.text = if (correct != false) row?.optString("answer").orEmpty() else "Your attempts have been saved."
         button("Close") { finish() }
-        if (ready && started && callAudio?.state?.ready == true && requestSpeechFocus()) {
+        pendingFinalFeedback = feedback
+        speakFinalFeedback()
+        handler.postDelayed({ if (!isFinishing) finish() }, 5000)
+    }
+
+    private fun speakFinalFeedback() {
+        val feedback = pendingFinalFeedback ?: return
+        if (ready && started && !isFinishing && prepareCallAudio()) {
+            pendingFinalFeedback = null
             tts?.setAudioAttributes(StudyCallAudio.attributes)
             tts?.speak(feedback, TextToSpeech.QUEUE_FLUSH, null, "result-$id")
         }
-        handler.postDelayed({ if (!isFinishing) finish() }, 5000)
     }
 
     override fun onResume() {
         super.onResume()
         started = true
         if (finalFeedback) return
+        if (answered && paused) { beginVoiceAnswer(); return }
+        if (answered && repeatOnResume) { repeatOnResume = false; repeatQuestion(); return }
         if (answered) {
             volumeControlStream = AudioManager.STREAM_VOICE_CALL
-            callAudio?.start()
+            prepareCallAudio()
         }
         if (needsInitialReading) acceptingAnswer = true
         if (answered && ready && needsInitialReading) speak()
@@ -1021,6 +1159,9 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     override fun onPause() {
+        repeatOnResume = repeatPending || repeatOnResume
+        cancelRepeat(); clearControlListen()
+        if (!paused) needsInitialReading = true
         started = false
         listenOnResume = false
         listenOnAudioReady = false
@@ -1039,6 +1180,7 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
+        cancelRepeat(); clearControlListen()
         handler.removeCallbacksAndMessages(null)
         stopReading(); tts?.shutdown()
         voice?.cancel()
@@ -1049,6 +1191,8 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putBoolean("study_speaker", callAudio?.speakerPreferred == true)
+        outState.putBoolean("study_paused", paused)
+        outState.putBoolean("study_repeat_pending", repeatPending || repeatOnResume)
         super.onSaveInstanceState(outState)
     }
 
@@ -1057,8 +1201,15 @@ class StudyCallActivity : Activity(), TextToSpeech.OnInitListener {
         endCall()
     }
 
+    private fun decline() {
+        StudyCalls.finish(this, id, "declined")
+        startActivity(StudyCalls.declineIntent(this, id))
+        finish()
+    }
+
     private fun endCall() {
-        StudyCalls.finish(this, id, if (answered) "interrupted" else "declined")
+        if (!answered) { decline(); return }
+        StudyCalls.finish(this, id, "interrupted")
         finish()
     }
 }

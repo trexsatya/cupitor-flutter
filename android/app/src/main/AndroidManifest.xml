@@ -68,6 +68,10 @@
             android:taskAffinity="" android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Material.Light.NoActionBar"
             android:showWhenLocked="true" android:turnScreenOn="true" />
+        <activity android:name=".StudyCallDeclineActivity" android:exported="false"
+            android:taskAffinity="" android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar"
+            android:showWhenLocked="true" android:turnScreenOn="true" />
         <receiver android:name=".StudyCallReceiver" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
