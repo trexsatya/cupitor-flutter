@@ -20,7 +20,7 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [24, 35], manifest = Config.NONE)
 class StudyCallMissedTest {
-    private val context = RuntimeEnvironment.getApplication<android.app.Application>()
+    private lateinit var context: android.app.Application
     private val notifications get() = context.getSystemService(NotificationManager::class.java)
     private fun row(profile: Int = 7) = StudyCalls.validate(mapOf("title" to "Swedish vocabulary", "question" to "Which article?",
         "choices" to listOf("ett", "en"), "correct_choice_index" to 1, "language" to "sv-SE"), profile, true)
@@ -30,6 +30,7 @@ class StudyCallMissedTest {
     private fun missed(id: String) = notifications.activeNotifications.singleOrNull { it.tag == id && it.id == 2 }?.notification
 
     @Before fun reset() {
+        context = RuntimeEnvironment.getApplication()
         context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).edit().clear().commit()
         context.getSharedPreferences("study_call_history", Context.MODE_PRIVATE).edit().clear().commit()
         notifications.cancelAll()
