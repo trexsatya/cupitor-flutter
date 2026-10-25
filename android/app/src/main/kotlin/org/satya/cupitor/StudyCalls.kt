@@ -42,6 +42,7 @@ import java.util.UUID
  * delivery and durable results so neither Flutter nor a live page is required. */
 object StudyCalls {
     const val CHANNEL = "cupitor_study_calls_v1"
+    const val MISSED_CHANNEL = "cupitor_missed_study_calls_v1"
     const val RING_MS = 45_000L
     const val MAX_HISTORY = 100
     const val DEFAULT_PENDING_LIMIT = 50
@@ -374,16 +375,22 @@ object StudyCalls {
         val now = System.currentTimeMillis()
         val rows = (0 until a.length()).map { a.getJSONObject(it) }.toMutableList()
         var changed = false
+        val newlyMissed = mutableListOf<JSONObject>()
         rows.forEach {
             if (it.optString("status") == "ringing" && now - it.optLong("fired_at") >= RING_MS) {
                 it.put("status", "missed").put("finished_at", now); changed = true
+                newlyMissed.add(it)
             } else if (it.optString("status") == "answered" &&
                 (visibleCallId != it.optString("id") || now - it.optLong("answered_at") > 10 * 60_000)) {
                 it.put("status", "interrupted").put("finished_at", now); changed = true
             }
         }
         val capped = retained(rows)
-        if (changed || capped.size != rows.size) save(context, capped)
+        if (changed || capped.size != rows.size) save(context, rows)
+        newlyMissed.filter { missed -> capped.any { it.optString("id") == missed.optString("id") } }.forEach {
+            dismiss(context, it.getString("id"))
+            postMissed(context, it)
+        }
         return capped.toMutableList()
     }
 
@@ -395,8 +402,11 @@ object StudyCalls {
     }
 
     private fun save(context: Context, rows: List<JSONObject>) {
+        val kept = retained(rows)
         check(context.getSharedPreferences("study_calls", Context.MODE_PRIVATE).edit()
-            .putString("calls", JSONArray(retained(rows)).toString()).commit()) { "storage_error" }
+            .putString("calls", JSONArray(kept).toString()).commit()) { "storage_error" }
+        val keptIds = kept.map { it.getString("id") }.toSet()
+        rows.filter { it.optString("id") !in keptIds }.forEach { manager(context).cancel(it.getString("id"), 2) }
     }
 
     @Synchronized private fun mutate(context: Context, fn: (MutableList<JSONObject>) -> Unit) {
@@ -470,6 +480,30 @@ object StudyCalls {
         manager(context).cancel(id, 1)
     }
 
+    private fun postMissed(context: Context, row: JSONObject) {
+        try {
+            if (permission(context) != "granted") return
+            val notifications = manager(context)
+            if (Build.VERSION.SDK_INT >= 26) {
+                notifications.createNotificationChannel(NotificationChannel(MISSED_CHANNEL, "Missed study calls", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                    description = "Unanswered study calls; tap to review the question and answer"
+                })
+            }
+            val tap = PendingIntent.getActivity(context, 0, StudyCallHistory.intent(context, row),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(context, MISSED_CHANNEL) else Notification.Builder(context)
+            builder.setSmallIcon(android.R.drawable.stat_notify_missed_call)
+                .setContentTitle("Missed study call").setContentText(row.getString("title"))
+                .setSubText("Tap to review the question and answer")
+                .setCategory(if (Build.VERSION.SDK_INT >= 31) Notification.CATEGORY_MISSED_CALL else Notification.CATEGORY_CALL)
+                .setVisibility(Notification.VISIBILITY_PRIVATE).setLocalOnly(true)
+                .setWhen(row.optLong("finished_at", System.currentTimeMillis())).setShowWhen(true)
+                .setAutoCancel(true).setOnlyAlertOnce(true).setContentIntent(tap)
+            if (Build.VERSION.SDK_INT < 26) builder.setDefaults(Notification.DEFAULT_ALL)
+            notifications.notify(row.getString("id"), 2, builder.build())
+        } catch (_: Exception) { /* History remains durable even if Android blocks the notification. */ }
+    }
+
     fun finish(context: Context, id: String, status: String, choice: Int? = null,
                responseMode: String = "tap", spokenResponse: String? = null) {
         if (status == "completed" && choice != null) {
@@ -479,11 +513,13 @@ object StudyCalls {
             return
         }
         var settled = false
+        var newlyMissed: JSONObject? = null
         update(context, id) {
             settled = terminal.contains(it.optString("status"))
             if (!terminal.contains(it.optString("status"))) {
                 if (choice != null && (it.optString("status") != "answered" || choice !in 0 until it.getJSONArray("choices").length())) return@update
                 it.put("status", status).put("finished_at", System.currentTimeMillis())
+                if (status == "missed") newlyMissed = it
                 if (choice != null) {
                     it.put("choice_index", choice).put("choice", it.getJSONArray("choices").getString(choice))
                         .put("response_mode", responseMode)
@@ -495,6 +531,7 @@ object StudyCalls {
             }
         }
         if (settled) { dismiss(context, id); rearmBestEffort(context) }
+        newlyMissed?.let { if (find(context, id)?.optString("status") == "missed") postMissed(context, it) }
     }
 
     /** Claim, grade and persist a final response together. Only an answered

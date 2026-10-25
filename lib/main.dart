@@ -25,6 +25,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:speech_to_text/speech_recognition_error.dart' as stt;
 import 'speech_hub.dart';
 import 'native_recording_start.dart';
+import 'study_call_history_bridge.dart';
 import 'caption_capture.dart';
 import 'video_note.dart';
 import 'lookup_video_hold.dart';
@@ -415,6 +416,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     activeProfileId: () => ProfileService.currentId,
     emit: _emitNotifEvent,
   );
+  final _profileInitComplete = Completer<void>();
+  late final StudyCallHistoryBridge _studyCallHistoryBridge = StudyCallHistoryBridge(
+    onOpen: _openStudyCallHistory,
+  );
+  Map<String, Object?>? _pendingStudyCallHistory;
   // Language-app ↔ Cupitor bridge for the account feature: GitHub device
   // sign-in / sign-out on the page's request. Contract:
   // docs/webapp-integration-spec.md §3 "AccountBridge". The token never
@@ -528,6 +534,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   @override
   void dispose() {
     _appBarTimer?.cancel();
+    _studyCallHistoryBridge.dispose();
+    if (!_profileInitComplete.isCompleted) _profileInitComplete.complete();
     ProfileService.active.removeListener(_onProfileChanged);
     WidgetsBinding.instance.removeObserver(this);
     _dialogAppLifecycle.dispose();
@@ -605,6 +613,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       }
       _sweepThenPush(); // resume catch-up + rearm (spec: sweep callers)
       _studyCallBridge.handle('{"op":"getCalls"}');
+      _studyCallHistoryBridge.checkPending();
     } else if (state == AppLifecycleState.paused) {
       WakelockPlus.disable();
       // Permission/teardown work must not open a microphone after backgrounding.
@@ -692,6 +701,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // included), unlike the sentence-tagging DB probe below which is
     // Android||iOS only — see _initNotifDelivery's doc comment.
     _initNotifDelivery();
+    _studyCallHistoryBridge.start();
     // Probe sentence-tagging DB readiness in the background. The toolbar
     // tiles check this flag and hide themselves if the open failed (e.g.
     // on macOS host where sqflite isn't wired up).
@@ -711,7 +721,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           // will fetch on load via the PlaylistBridge 'get' op.
           PlaylistService.changes.addListener(_pushPlaylistsToDialog);
         }
+      }).whenComplete(() {
+        if (!_profileInitComplete.isCompleted) _profileInitComplete.complete();
       });
+    } else {
+      _profileInitComplete.complete();
     }
     // Restore persisted segmentation-scope (NOT profile-scoped: it's a
     // UI preference, not a tagging-data preference).
@@ -8731,6 +8745,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 _pendingNotifOpenedEvent = null;
                 _emitNotifEvent('cupitorNotificationOpened', pendingOpened);
               }
+              _deliverStudyCallHistory();
             },
           ),
         );
@@ -10615,6 +10630,37 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// Set while a notification-tap navigation is loading; replayed by the
   /// dialog's onPageFinished so the (re)loaded page still gets the event.
   Map<String, Object?>? _pendingNotifOpenedEvent;
+
+  Future<void> _openStudyCallHistory(StudyCallHistoryTarget target) async {
+    await _profileInitComplete.future;
+    if (!mounted) return;
+    final profiles = await CupitorDb.instance.listProfiles();
+    if (!mounted) return;
+    if (profiles.any((profile) => profile.id == target.profileId) &&
+        ProfileService.currentId != target.profileId) {
+      await ProfileService.setActive(target.profileId);
+    }
+    if (!mounted) return;
+    _pendingStudyCallHistory = {'id': target.id, 'open_id': target.openId};
+    if (dialogController == null) {
+      _openDialogWithWebview('');
+    } else if (!_dialog1Loaded) {
+      _openDialogAtUrl(_dialogUrl);
+    } else {
+      _showDialog1();
+      await _deliverStudyCallHistory();
+    }
+  }
+
+  Future<void> _deliverStudyCallHistory() async {
+    final pending = _pendingStudyCallHistory;
+    if (pending == null || !_dialog1Loaded || !mounted) return;
+    // Push this profile's durable snapshot before selecting the history row.
+    await _studyCallBridge.handle('{"op":"getCalls"}');
+    if (!mounted || !_dialog1Loaded || !identical(pending, _pendingStudyCallHistory)) return;
+    _pendingStudyCallHistory = null;
+    _emitNotifEvent('cupitorStudyCallOpened', pending);
+  }
 
   /// Foreground action button → grade via the shared service path, then
   /// mirror to the webpage so its state doesn't drift (spec:
