@@ -168,6 +168,12 @@ class MainActivity : FlutterActivity() {
         loadCustomHosts()
     }
 
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        StudyCallHistory.capture(this, intent)
+    }
+
     private fun loadCustomHosts() {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val saved = prefs.getStringSet(PREFS_CUSTOM_HOSTS, emptySet()) ?: emptySet()
@@ -185,6 +191,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         StudyCalls.install(this, flutterEngine.dartExecutor.binaryMessenger)
+        StudyCallHistory.install(this, flutterEngine.dartExecutor.binaryMessenger)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cupitor/youtube_controls")
             .setMethodCallHandler { call, result ->
                 if (call.method != "install") {

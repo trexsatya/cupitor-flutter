@@ -14,6 +14,24 @@ schedule a one-off call, import JSON files, and manage pending calls. Add, edit,
 enable/disable or remove a scheduled call. History is hidden behind its button
 and contains at most the latest 100 finished calls across profiles.
 
+Unanswered calls leave a separate **Missed study call** notification after
+ringing expires. It uses normal notification sound/priority rather than the
+ringtone/full-screen alert. Tapping it opens the exact question-and-answer
+history item, switching to its owning profile if that profile still exists.
+The host-only `cupitor/study_call_history` channel durably queues the tap during
+cold startup and also signals a running app. Dart waits for profile startup,
+opens the study page, pushes its call snapshot and emits
+`cupitorStudyCallOpened` with `{id,open_id}`. The webpage consumes the matching
+`window.__cupitorStudyCallOpened` value if its listener loads later. Back goes
+to call history, then pending calls. This does not answer, retry or grade a call.
+
+Expired ringing found after process death also produces the missed notification.
+Duplicate expiry/read events do not repost a dismissed notification. Declined,
+cancelled, answered and interrupted calls do not generate missed-call alerts.
+Notifications for calls evicted by the 100-entry history cap are removed; an
+already-tapped expired/deleted-profile item shows an unavailable-details message.
+Android notification permission and channel settings still apply.
+
 The bridge mirrors `NotifBridge`: JSON over a WebView channel and CustomEvents
 back to the page, with one acknowledgement for every request.
 
