@@ -36,6 +36,7 @@ import 'ai_prompt.dart';
 import 'youtube_urls.dart';
 import 'youtube_controls.dart';
 import 'youtube_sidebar_subtitles.dart';
+import 'main_subtitle_capture_button.dart';
 import 'local_subtitles.dart';
 import 'stable_dialog_chrome.dart';
 import 'dialog_app_lifecycle.dart';
@@ -6837,6 +6838,33 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
   }
 
+  Future<void> _openMainSubtitleCapture() async {
+    if (_youtubeSidebarDownloadBusy) return;
+    final page = _controller;
+    final url = await page.currentUrl() ?? '';
+    if (!mounted || !identical(page, _controller) || _youtubeSidebarDownloadBusy ||
+        youtubeSubtitleVideoId(url) == null) return;
+    _youtubeSidebarDownloadBusy = true;
+    try {
+      var opened = false;
+      try {
+        final result = await page.runJavaScriptReturningResult(
+          'Boolean(window.__cupOpenSubtitlePanel && window.__cupOpenSubtitlePanel())',
+        ).timeout(const Duration(seconds: 2));
+        opened = result.toString() == 'true';
+      } catch (_) { /* The native download flow also works without the snippet. */ }
+      if (!opened && mounted && identical(page, _controller) &&
+          youtubeSubtitleVideoId(await page.currentUrl() ?? '') == youtubeSubtitleVideoId(url)) {
+        // Use the actual playing page without a URL prompt. The existing
+        // full-track dialog supports translation, selection and capture even
+        // when page injection failed or an older snippet is still cached.
+        await _startYouTubeSubtitleDownload(context, videoUrl: url);
+      }
+    } finally {
+      _youtubeSidebarDownloadBusy = false;
+    }
+  }
+
   Future<void> _downloadYouTubeSubtitlesForPage(
       WebViewController page, JavaScriptMessage message) async {
     if (!mounted || !identical(page, _controller) || _youtubeSidebarDownloadBusy) return;
@@ -6947,11 +6975,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// the standalone flow prompts for a URL and keeps its full-file dialog.
   Future<void> _startYouTubeSubtitleDownload(BuildContext ctx, {
     WebViewController? sidebarTarget,
+    String? videoUrl,
   }) async {
     // Pre-fill from clipboard if it looks like a YouTube URL — common case
     // is the user just copied the link from the YouTube share sheet.
-    String initial = sidebarTarget != null ? await sidebarTarget.currentUrl() ?? '' : '';
-    if (sidebarTarget == null) try {
+    String initial = videoUrl ?? (sidebarTarget != null ? await sidebarTarget.currentUrl() ?? '' : '');
+    if (sidebarTarget == null && videoUrl == null) try {
       final clip = await Clipboard.getData('text/plain');
       final t = (clip?.text ?? '').trim();
       if (_extractYouTubeVideoId(t) != null) initial = t;
@@ -6959,7 +6988,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (!mounted) return;
 
     final urlCtrl = TextEditingController(text: initial);
-    final urlInput = sidebarTarget != null ? initial : await showDialog<String>(
+    final urlInput = sidebarTarget != null || videoUrl != null ? initial : await showDialog<String>(
       context: ctx,
       builder: (dctx) => AlertDialog(
         title: const Text('YouTube subtitles'),
@@ -11977,6 +12006,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 onHide: () => _setVideoNoteEnabled(false),
                 onMoved: (pos) => _videoNoteChipPos = pos,
               ),
+            MainSubtitleCaptureButton(
+              address: _urlController,
+              onPressed: _openMainSubtitleCapture,
+            ),
             // Over a fullscreen video too, like the other floating buttons.
             if (_studyFsChipEnabled)
               TagCaptureFloatingChip(
