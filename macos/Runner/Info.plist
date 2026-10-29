@@ -27,7 +27,7 @@
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Microphone access is needed for voice input to look up words.</string>
+	<string>Microphone access is used to record audio for cards and for voice lookup.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Speech recognition is used for voice word lookup.</string>
 	<key>NSPrincipalClass</key>

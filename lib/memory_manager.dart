@@ -348,19 +348,15 @@ class _MemoryManagerScreenState extends State<MemoryManagerScreen> {
                 _storageRow(theme, 'Voice recordings', _voiceBytes,
                     subtitle: '$_voiceFileCount clip(s) from manual cards',
                     icon: Icons.mic_none_outlined,
-                    trailing: _voiceFileCount == 0
-                        ? null
-                        : const Icon(Icons.chevron_right),
-                    onTap: _voiceFileCount == 0
-                        ? null
-                        : () async {
-                            await Navigator.of(context).push(
-                              MaterialPageRoute<void>(
-                                builder: (_) => const VoiceRecordingsScreen(),
-                              ),
-                            );
-                            if (mounted) await _reload();
-                          }),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () async {
+                      await Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => const VoiceRecordingsScreen(),
+                        ),
+                      );
+                      if (mounted) await _reload();
+                    }),
                 _storageRow(theme, 'Database', _dbBytes,
                     subtitle: 'sqlite (tags, sentences, playlists…)',
                     icon: Icons.storage_outlined),

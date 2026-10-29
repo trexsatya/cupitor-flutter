@@ -53,6 +53,11 @@ saved `file://` URLs contain the original device's directory. The bundle contain
 the audio files; card/playlist definitions still use the existing webapp sync or
 playlist export.
 
+On macOS, the card editor records through the native microphone bridge and saves
+AAC audio in `.m4a` files. Cupitor asks for microphone access on the first
+recording; cancelled or failed takes are discarded. The Voice recordings screen
+opens even when no clips exist, so a fresh device can import a recording bundle.
+
 ## YouTube subtitle sidebar
 
 The SRT panel also has **Open SRT** for local subtitle files on supported video

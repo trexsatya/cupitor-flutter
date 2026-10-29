@@ -12,6 +12,15 @@ class MainFlutterWindow: NSWindow {
 
     RegisterGeneratedPlugins(registry: flutterViewController)
 
+    let recordingChannel = FlutterMethodChannel(
+      name: "cupitor/perms",
+      binaryMessenger: flutterViewController.engine.binaryMessenger)
+    recordingChannel.setMethodCallHandler { [weak self] call, result in
+      guard let self = self else { result(nil); return }
+      self.audioRecording.handle(call, result: result)
+    }
+    self.recordingChannel = recordingChannel
+
     // Dart passes a WebView's identifier (lib/mac_webview.dart) and we patch
     // the native WKWebView for what webview_flutter can't configure.
     let webviewChannel = FlutterMethodChannel(
@@ -57,6 +66,9 @@ class MainFlutterWindow: NSWindow {
     self.webviewChannel = webviewChannel
 
     let center = NotificationCenter.default
+    center.addObserver(forName: NSWindow.willCloseNotification, object: self, queue: .main) { [weak self] _ in
+      self?.audioRecording.cancel()
+    }
     for name in [NSWindow.willEnterFullScreenNotification, NSWindow.willExitFullScreenNotification] {
       center.addObserver(forName: name, object: self, queue: .main) { [weak self] _ in
         self?.fullscreenTransitioning = true
@@ -90,6 +102,8 @@ class MainFlutterWindow: NSWindow {
   }
 
   private var webviewChannel: FlutterMethodChannel?
+  private var recordingChannel: FlutterMethodChannel?
+  private let audioRecording = NativeAudioRecording()
   private let frameScripts = FrameScriptInstaller()
   /// The window is fullscreen because a page asked, not because the user did.
   private var windowFullscreenIsOurs = false
