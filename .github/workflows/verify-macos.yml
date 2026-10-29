@@ -19,5 +19,5 @@ jobs:
           cache: true
       - run: flutter pub get --enforce-lockfile
       - run: flutter build macos --debug
-      - name: Verify native document-start registration
+      - name: Verify native WebView and recording behavior
         run: xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner -configuration Debug -destination 'platform=macOS' test CODE_SIGNING_ALLOWED=NO
