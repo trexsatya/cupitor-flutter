@@ -2,9 +2,52 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:cupitor/youtube_sidebar_subtitles.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+
+class CaptionPage extends Fake implements WebViewController {
+  String url = 'https://m.youtube.com/watch?v=abcdefghijk';
+  Object result = false;
+  bool throwOnOpen = false;
+  void Function()? onOpen;
+  @override
+  Future<String?> currentUrl() async => url;
+  @override
+  Future<Object> runJavaScriptReturningResult(String script) async {
+    onOpen?.call();
+    if (throwOnOpen) throw StateError('TrustedHTML assignment blocked');
+    return result;
+  }
+}
 
 void main() {
   const id = 'abcdefghijk';
+  test('main CC fallback targets the playing page when launcher is absent or throws', () async {
+    for (final throws in [false, true]) {
+      final page = CaptionPage()..throwOnOpen = throws;
+      var downloads = 0;
+      await openMainYouTubeSubtitleCapture(page: page, isCurrent: () => true,
+        downloadToPage: (target, url) async {
+          downloads++;
+          expect(identical(target, page), isTrue);
+          expect(url, page.url);
+        });
+      expect(downloads, 1);
+    }
+  });
+  test('opening the page panel avoids download; navigation/replacement cancels fallback', () async {
+    for (final mode in ['opened', 'navigated', 'replaced', 'not-video']) {
+      final page = CaptionPage();
+      var current = true;
+      if (mode == 'opened') page.result = true;
+      if (mode == 'not-video') page.url = 'https://m.youtube.com/';
+      page.onOpen = () {
+        if (mode == 'navigated') page.url = 'https://m.youtube.com/watch?v=lmnopqrstuv';
+        if (mode == 'replaced') current = false;
+      };
+      await openMainYouTubeSubtitleCapture(page: page, isCurrent: () => current,
+        downloadToPage: (_, __) async => fail('Unexpected download for $mode'));
+    }
+  });
   test('accepts supported YouTube URL forms and rejects lookalike hosts', () {
     for (final url in [
       id,

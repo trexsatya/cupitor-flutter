@@ -6,6 +6,13 @@ import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 
 const _channel = MethodChannel('cupitor/webview');
+final _macConfiguration = Expando<Future<void>>();
+
+/// Native code keeps this script for existing and subsequently created views.
+Future<void> installMacFrameScript(String script) async {
+  if (!Platform.isMacOS) return;
+  await _channel.invokeMethod<void>('installFrameScript', {'script': script});
+}
 
 /// macOS: native WKWebView setup webview_flutter has no API for — the HTML
 /// Fullscreen API, and native alert/confirm/prompt panels
@@ -17,7 +24,7 @@ extension MacWebView on WebViewController {
     if (!Platform.isMacOS) return;
     final platform = this.platform;
     if (platform is! WebKitWebViewController) return;
-    _channel
+    _macConfiguration[this] = _channel
         .invokeMethod<bool>('configureWebView', platform.webViewIdentifier)
         .then((ok) {
           if (ok != true) debugPrint('configureMacWebView: WebView not found');
@@ -26,6 +33,9 @@ extension MacWebView on WebViewController {
           debugPrint('configureMacWebView failed: $e');
         });
   }
+
+  Future<void> get macConfigurationReady =>
+      _macConfiguration[this] ?? Future<void>.value();
 }
 
 /// macOS: put the app window into (or out of) native fullscreen. Leaving only

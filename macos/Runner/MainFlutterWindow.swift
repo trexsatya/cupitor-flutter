@@ -18,6 +18,16 @@ class MainFlutterWindow: NSWindow {
       name: "cupitor/webview",
       binaryMessenger: flutterViewController.engine.binaryMessenger)
     webviewChannel.setMethodCallHandler { [weak self, weak flutterViewController] call, result in
+      if call.method == "installFrameScript" {
+        guard let args = call.arguments as? [String: Any],
+          let script = args["script"] as? String, !script.isEmpty else {
+          result(FlutterError(code: "invalid_script", message: "Missing frame script", details: nil))
+          return
+        }
+        self?.frameScripts.setSource(script)
+        result(nil)
+        return
+      }
       if call.method == "setWindowFullscreen" {
         self?.setPageFullscreen(call.arguments as? Bool ?? false)
         result(nil)
@@ -41,6 +51,7 @@ class MainFlutterWindow: NSWindow {
         webView.configuration.preferences.isElementFullscreenEnabled = true
       }
       JSPanelUIDelegate.install(on: webView)
+      self?.frameScripts.configure(webView)
       result(true)
     }
     self.webviewChannel = webviewChannel
@@ -79,6 +90,7 @@ class MainFlutterWindow: NSWindow {
   }
 
   private var webviewChannel: FlutterMethodChannel?
+  private let frameScripts = FrameScriptInstaller()
   /// The window is fullscreen because a page asked, not because the user did.
   private var windowFullscreenIsOurs = false
   private var pageWantsFullscreen = false
@@ -105,6 +117,38 @@ class MainFlutterWindow: NSWindow {
       toggledByUs = true
       toggleFullScreen(nil)
     }
+  }
+}
+
+/// Install in the page world at document start, including cross-origin
+/// YouTube frames. Keep other user scripts (notably Flutter's JS channels)
+/// when refreshing our remote source. Weak references avoid retaining dialogs.
+final class FrameScriptInstaller {
+  private let views = NSHashTable<WKWebView>.weakObjects()
+  private var source: String?
+
+  func configure(_ webView: WKWebView) {
+    views.add(webView)
+    if let source = source { install(source, replacing: nil, on: webView) }
+  }
+
+  func setSource(_ script: String) {
+    guard script != source else { return }
+    let old = source
+    source = script
+    for webView in views.allObjects { install(script, replacing: old, on: webView) }
+  }
+
+  private func install(_ script: String, replacing old: String?, on webView: WKWebView) {
+    let content = webView.configuration.userContentController
+    if content.userScripts.contains(where: { $0.source == script }) { return }
+    if let old = old, content.userScripts.contains(where: { $0.source == old }) {
+      let retained = content.userScripts.filter { $0.source != old }
+      content.removeAllUserScripts()
+      for item in retained { content.addUserScript(item) }
+    }
+    content.addUserScript(WKUserScript(source: script,
+      injectionTime: .atDocumentStart, forMainFrameOnly: false))
   }
 }
 

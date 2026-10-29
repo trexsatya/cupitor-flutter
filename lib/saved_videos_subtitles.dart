@@ -80,6 +80,33 @@ int defaultCaptionTrackIndex(List<Map<String, dynamic>> tracks, String lang) {
 String baseLanguageCode(String code) =>
     code.trim().toLowerCase().split(RegExp('[-_]')).first;
 
+/// Display order only: keep original indices so choosing a row downloads the
+/// same track. Put the study language, original audio and device languages
+/// before the long list of machine translations. Preserve source order for
+/// ties, with manual captions before original ASR before translated ASR.
+List<int> captionTrackDisplayOrder(
+  List<Map<String, dynamic>> tracks,
+  Iterable<String> languages,
+) {
+  final preferred = languages.map(baseLanguageCode).where((s) => s.isNotEmpty).toSet().toList();
+  String code(int i) => (tracks[i]['languageCode'] as String? ?? '').trim().toLowerCase();
+  bool original(int i) => code(i).endsWith('-orig');
+  bool manual(int i) => tracks[i]['kind'] != 'asr' && !original(i);
+  int languageRank(int i) {
+    final rank = preferred.indexOf(baseLanguageCode(code(i)));
+    if (rank == 0) return 0;
+    if (original(i)) return 1;
+    return rank > 0 ? rank + 1 : preferred.length + 2;
+  }
+  int kindRank(int i) => manual(i) ? 0 : original(i) ? 1 : 2;
+  return List.generate(tracks.length, (i) => i)..sort((a, b) {
+    final language = languageRank(a).compareTo(languageRank(b));
+    if (language != 0) return language;
+    final kind = kindRank(a).compareTo(kindRank(b));
+    return kind != 0 ? kind : a.compareTo(b);
+  });
+}
+
 /// The translation half of a `capturedSubtitle` payload. Only lines with a
 /// translation are included, keyed by their own index/start/end; with none,
 /// `targetLang` is left out so the page writes no target file. A blank cue
