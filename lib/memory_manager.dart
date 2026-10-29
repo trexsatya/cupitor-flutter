@@ -676,6 +676,7 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text(result.message),
         action: result.conflicts.isEmpty ? null : SnackBarAction(label: 'Details', onPressed: () {
+          if (!mounted) return;
           showDialog<void>(context: context, builder: (ctx) => AlertDialog(
             title: const Text('Existing recordings kept'),
             content: SingleChildScrollView(child: Text(result.conflicts.join('\n'))),
