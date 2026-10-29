@@ -25,6 +25,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:speech_to_text/speech_recognition_error.dart' as stt;
 import 'speech_hub.dart';
 import 'native_recording_start.dart';
+import 'recording_urls.dart';
 import 'study_call_history_bridge.dart';
 import 'caption_capture.dart';
 import 'video_note.dart';
@@ -2715,7 +2716,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// back from cache in milliseconds while the fetch is still in flight.
   /// Registering from preferences turns that wait into a file read.
   Future<void> _warmAndInstallFrameScript() async {
-    if (!Platform.isAndroid) return;
+    if (!Platform.isAndroid && !Platform.isMacOS) return;
     try {
       await _warmAndInstallFrameScriptInner();
     } finally {
@@ -2740,16 +2741,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       final prefs = await SharedPreferences.getInstance();
       cached = prefs.getString(_kFrameScriptCachePref);
     } catch (_) {}
-    if (cached != null && cached.trim().isNotEmpty) {
-      _frameScriptSource = cached;
-      _reportFrameAgent('stored copy -> ${await _registerFrameScript(cached)}');
+    // A first launch/offline restore still needs the hook before player code.
+    // The remote copy can update it on subsequent navigations.
+    if (cached == null || cached.trim().isEmpty) {
+      cached = await rootBundle.loadString('assets/js/frame_boot.js');
     }
+    _frameScriptSource = cached;
+    _reportFrameAgent('stored/bundled copy -> ${await _registerFrameScript(cached)}');
 
     final fresh = await _fetchFrameScript();
     if (fresh == null) {
-      if (cached == null || cached.trim().isEmpty) {
-        _reportFrameAgent('no stored copy, and the fetch failed');
-      }
+      _reportFrameAgent('remote refresh unavailable; using stored/bundled copy');
       return;
     }
     if (fresh == cached) return; // registered above, and unchanged
@@ -2802,6 +2804,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// than anything reachable from here. This then polls a cheap status call
   /// rather than re-sending the script, which is 40KB a time over the channel.
   Future<String> _registerFrameScript(String script) async {
+    if (Platform.isMacOS) {
+      try {
+        await installMacFrameScript(script);
+        if (!_frameScriptReady.isCompleted) _frameScriptReady.complete();
+        return 'registered for macOS webviews';
+      } catch (error) {
+        return 'macOS install failed: $error';
+      }
+    }
     String armed;
     try {
       armed = await _permsChannel.invokeMethod<String>(
@@ -2842,11 +2853,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// Issues [c]'s first navigation once the frame agent is registered.
   void _loadWhenFrameScriptReady(WebViewController c, String url) {
     final target = Uri.parse(url);
-    if (!Platform.isAndroid) {
+    if (!Platform.isAndroid && !Platform.isMacOS) {
       c.loadRequest(target);
       return;
     }
-    _awaitFrameScript().then((_) {
+    _awaitFrameScript().then((_) async {
+      await c.macConfigurationReady;
       if (!mounted) return;
       try {
         c.loadRequest(target);
@@ -2862,7 +2874,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// Bounded, because a page that never loads is a worse failure than a page
   /// that loads without the agent.
   Future<void> _awaitFrameScript() async {
-    if (!Platform.isAndroid) return;
+    if (!Platform.isAndroid && !Platform.isMacOS) return;
     try {
       await _frameScriptReady.future.timeout(const Duration(seconds: 3));
     } catch (_) {}
@@ -5214,8 +5226,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             }).catchError((_) {});
           }
         },
-      ))
-      ..loadRequest(Uri.parse(url));
+      ));
+    _loadWhenFrameScriptReady(dialog2Controller, url);
     _enableThirdPartyCookies(dialog2Controller);
 
     // Store the new dialog instance
@@ -6841,25 +6853,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   Future<void> _openMainSubtitleCapture() async {
     if (_youtubeSidebarDownloadBusy) return;
     final page = _controller;
-    final url = await page.currentUrl() ?? '';
-    if (!mounted || !identical(page, _controller) || _youtubeSidebarDownloadBusy ||
-        youtubeSubtitleVideoId(url) == null) return;
     _youtubeSidebarDownloadBusy = true;
     try {
-      var opened = false;
-      try {
-        final result = await page.runJavaScriptReturningResult(
-          'Boolean(window.__cupOpenSubtitlePanel && window.__cupOpenSubtitlePanel())',
-        ).timeout(const Duration(seconds: 2));
-        opened = result.toString() == 'true';
-      } catch (_) { /* The native download flow also works without the snippet. */ }
-      if (!opened && mounted && identical(page, _controller) &&
-          youtubeSubtitleVideoId(await page.currentUrl() ?? '') == youtubeSubtitleVideoId(url)) {
-        // Use the actual playing page without a URL prompt. The existing
-        // full-track dialog supports translation, selection and capture even
-        // when page injection failed or an older snippet is still cached.
-        await _startYouTubeSubtitleDownload(context, videoUrl: url);
-      }
+      await openMainYouTubeSubtitleCapture(
+        page: page,
+        isCurrent: () => mounted && identical(page, _controller),
+        downloadToPage: (target, url) =>
+            _startYouTubeSubtitleDownload(context, sidebarTarget: target, videoUrl: url),
+      );
+    } catch (error) {
+      if (mounted) _showCaptureError('Could not open YouTube subtitles', '$error');
     } finally {
       _youtubeSidebarDownloadBusy = false;
     }
@@ -7071,6 +7074,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (!mounted) return;
 
     if (sidebarTarget != null) {
+      if (!identical(sidebarTarget, _controller)) return;
+      final currentUrl = await sidebarTarget.currentUrl() ?? '';
+      if (!mounted || !identical(sidebarTarget, _controller)) return;
+      if (youtubeSubtitleVideoId(currentUrl) != videoId) {
+        _showCaptureError('Could not attach subtitles',
+            'The video changed while downloading. Download subtitles again for the current video.');
+        return;
+      }
       final payload = youtubeSidebarSubtitlePayload(
         videoId: videoId,
         language: baseLanguageCode((picked['languageCode'] as String?) ?? _selectedLanguage),
@@ -7104,6 +7115,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   Future<int?> _pickCaptionTrack(
       BuildContext ctx, List<Map<String, dynamic>> tracks) async {
     int selected = _defaultCaptionTrackIndex(tracks);
+    final order = captionTrackDisplayOrder(tracks, [
+      _selectedLanguage,
+      ...WidgetsBinding.instance.platformDispatcher.locales.map((locale) => locale.languageCode),
+      'en',
+    ]);
+    // Keep the existing default on the first screen too, including when no
+    // matching study-language track exists and it falls back to a manual one.
+    order.remove(selected);
+    order.insert(0, selected);
     return showDialog<int>(
       context: ctx,
       builder: (dctx) => StatefulBuilder(
@@ -7116,10 +7136,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               child: ListView.builder(
                 shrinkWrap: true,
                 itemCount: tracks.length,
-                itemBuilder: (_, i) {
+                itemBuilder: (_, row) {
+                  final i = order[row];
                   final t = tracks[i];
                   final isAsr = (t['kind'] as String? ?? '') == 'asr';
-                  final name = (t['name'] as String? ?? '').trim();
+                  final name = (t['name'] as String? ?? '')
+                      .replaceFirst(RegExp(r'\s*\(auto-generated\)\s*$', caseSensitive: false), '').trim();
                   final lang = (t['languageCode'] as String? ?? '').trim();
                   final label = [
                     if (name.isNotEmpty) name,
@@ -8591,6 +8613,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (ctrl == null) return;
     final serial = ++_dialog1LoadSerial;
     await _dialog1YouTubeControlsReady;
+    await _awaitFrameScript();
+    await ctrl.macConfigurationReady;
     if (!mounted || !identical(ctrl, dialogController) ||
         serial != _dialog1LoadSerial) return;
     await ctrl.loadRequest(uri);
@@ -9690,7 +9714,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final dir = await _manualAudioDir();
     // Collapses `..` before checking, so a URL that only leaves the
     // directory through a dot segment is refused too.
-    final path = filePathInsideDir(url, dir.path);
+    final path = recordingPathFromUrl(url, dir.path);
     return path == null ? null : File(path);
   }
 

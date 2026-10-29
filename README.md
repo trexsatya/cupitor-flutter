@@ -38,6 +38,21 @@ Run the document reader tests with:
 flutter test test/docx_document_test.dart test/docx_reader_test.dart
 ```
 
+## Voice recording export and import
+
+Open **Tools → Memory manager → Voice recordings**. Use **Export all recordings**
+for a portable `cupitor-recordings-YYYY-MM-DD.zip`, or long-press clips and use
+**Export selected recordings**. **Import recordings** is available on an empty
+device too. Bundles preserve audio bytes, filenames and modification dates.
+
+Import adds missing clips, skips identical clips and reports same-name conflicts
+while keeping the existing audio. It validates the whole bundle before writing
+and does not rename recordings, since their filenames identify card attachments.
+Existing manual cards can play restored clips on another device even when their
+saved `file://` URLs contain the original device's directory. The bundle contains
+the audio files; card/playlist definitions still use the existing webapp sync or
+playlist export.
+
 ## YouTube subtitle sidebar
 
 The SRT panel also has **Open SRT** for local subtitle files on supported video
@@ -68,6 +83,18 @@ track, download it, then use the complete transcript beside the player.
 The panel follows playback, supports seeking and previous/next cues, and keeps
 the existing translation, replay strategies and select-lines/send-to-lookup
 controls. A downloaded track replaces the live harvested lines for that video.
+
+The floating **CC** button opens this same main-page panel. Its fallback
+downloads into the current page too. Only the panel's explicit selected-line
+capture sends subtitles to the lookup webapp. The track picker puts the selected
+study language, original audio, device languages and English above unrelated
+machine translations, with the default selected track visible first.
+
+On macOS, the frame agent now runs at document start in each WKWebView and its
+frames, before YouTube reads its player configuration. A bundled copy covers a
+first or offline launch; the existing remote source refreshes it for later
+navigations. The native test workflow verifies registration and preservation
+of Flutter's JavaScript channel scripts. This requires a new macOS app build.
 
 The last five downloaded tracks are kept in the page's tab session so returning
 to a video or reloading it can restore its transcript. **Clear transcript**

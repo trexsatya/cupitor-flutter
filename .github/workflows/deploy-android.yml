@@ -107,7 +107,7 @@ jobs:
         run: |
           cupitor_browser_tests="$RUNNER_TEMP/cupitor-browser-tests"
           npm install --prefix "$cupitor_browser_tests" --no-package-lock --ignore-scripts playwright-core@1.62.1
-          NODE_PATH="$cupitor_browser_tests/node_modules" node --test test/browser/youtube_controls.test.cjs
+          NODE_PATH="$cupitor_browser_tests/node_modules" node --test test/browser/*.test.cjs
 
       # PRs and manual runs on other branches never receive signing secrets.
       - name: Configure release signing

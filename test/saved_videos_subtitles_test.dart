@@ -7,6 +7,23 @@ Map<String, dynamic> track(String code, {bool auto = false}) =>
     {'languageCode': code, 'kind': auto ? 'asr' : ''};
 
 void main() {
+  group('captionTrackDisplayOrder', () {
+    test('study, original and device languages precede unrelated translated tracks', () {
+      final tracks = [track('ab', auto: true), track('aa', auto: true),
+        track('sv', auto: true), track('sv-orig', auto: true), track('sv-SE'),
+        track('en', auto: true), track('de', auto: true)];
+      final order = captionTrackDisplayOrder(tracks, ['sv', 'en']);
+      expect(order, [4, 3, 2, 5, 0, 1, 6]);
+      expect(tracks[order[0]]['languageCode'], 'sv-SE');
+      expect(tracks.first['languageCode'], 'ab', reason: 'source indices remain unchanged');
+    });
+    test('original audio is near the top when study language is translated', () {
+      final tracks = [track('ab', auto: true), track('en-orig', auto: true),
+        track('sv', auto: true), track('es'), track('en')];
+      expect(captionTrackDisplayOrder(tracks, ['SV_se', 'en', 'en']), [2, 1, 4, 3, 0]);
+      expect(captionTrackDisplayOrder([], ['sv']), isEmpty);
+    });
+  });
   group('defaultCaptionTrackIndex', () {
     test('sv-orig beats the plain sv auto track and a manual English track', () {
       final tracks = [track('en'), track('sv', auto: true), track('sv-orig', auto: true)];

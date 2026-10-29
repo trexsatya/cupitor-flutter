@@ -11,6 +11,8 @@ import 'db.dart';
 import 'epub_reader.dart' show EpubLibrary, EpubLibraryEntry;
 import 'media_store.dart';
 import 'recording_selection.dart';
+import 'recording_transfer.dart';
+import 'recording_transfer_actions.dart';
 import 'save_file.dart';
 import 'search_index.dart';
 
@@ -627,6 +629,74 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
     return Directory('${docs.path}/manual_audio');
   }
 
+  Future<void> _exportRecordings() async {
+    if (_busy || _loading) return;
+    final rows = _rows.where((row) => !_selecting || _selectedPaths.contains(row.file.path)).toList();
+    if (rows.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      final bytes = await RecordingTransfer.exportBundle(
+        directory: await _dir(), names: rows.map((row) => row.name),
+      );
+      if (!mounted) return;
+      final path = await saveBytesToPickedFile(
+        dialogTitle: 'Export recordings',
+        fileName: 'cupitor-recordings-${DateTime.now().toIso8601String().substring(0, 10)}.zip',
+        bytes: bytes,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(
+        path == null ? 'Export cancelled' : 'Exported ${rows.length} recording(s)',
+      )));
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Export failed: $error')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _importRecordings() async {
+    if (_busy || _loading) return;
+    setState(() => _busy = true);
+    try {
+      final picked = await FilePicker.platform.pickFiles(
+        dialogTitle: 'Import recordings bundle', type: FileType.custom,
+        allowedExtensions: ['zip'], allowMultiple: false,
+      );
+      if (picked == null || picked.files.isEmpty || !mounted) return;
+      final selected = picked.files.single;
+      if (selected.size > maxRecordingBundleBytes) throw const FormatException('Recording bundle is too large.');
+      final bytes = selected.bytes ?? (selected.path == null ? null : await File(selected.path!).readAsBytes());
+      if (bytes == null) throw const FormatException('Could not read this recording bundle.');
+      final result = await RecordingTransfer.importBundle(directory: await _dir(), bytes: bytes);
+      if (!mounted) return;
+      await _reload();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(result.message),
+        action: result.conflicts.isEmpty ? null : SnackBarAction(label: 'Details', onPressed: () {
+          if (!mounted) return;
+          showDialog<void>(context: context, builder: (ctx) => AlertDialog(
+            title: const Text('Existing recordings kept'),
+            content: SingleChildScrollView(child: Text(result.conflicts.join('\n'))),
+            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
+          ));
+        }),
+      ));
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Import failed: $error')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Widget _transferActions() => RecordingTransferActions(
+    selectedCount: _selectedPaths.length, totalCount: _rows.length,
+    busy: _busy || _loading, onExport: _exportRecordings, onImport: _importRecordings,
+  );
+
   Future<void> _reload() async {
     setState(() => _loading = true);
     final rows = <_VoiceRecordingRow>[];
@@ -776,6 +846,7 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
         if (!didPop) _exitSelection();
       },
       child: Scaffold(
+      bottomNavigationBar: _busy ? const LinearProgressIndicator(minHeight: 3) : null,
       appBar: _selecting
           ? AppBar(
               leading: IconButton(
@@ -785,6 +856,7 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
               ),
               title: Text('${_selectedPaths.length} selected'),
               actions: [
+                _transferActions(),
                 IconButton(
                   icon: Icon(allSelected
                       ? Icons.deselect_outlined
@@ -803,6 +875,7 @@ class _VoiceRecordingsScreenState extends State<VoiceRecordingsScreen> {
           : AppBar(
               title: const Text('Voice recordings'),
               actions: [
+                _transferActions(),
                 IconButton(
                   icon: const Icon(Icons.refresh),
                   tooltip: 'Reload',
