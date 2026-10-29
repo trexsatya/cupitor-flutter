@@ -38,6 +38,21 @@ Run the document reader tests with:
 flutter test test/docx_document_test.dart test/docx_reader_test.dart
 ```
 
+## Voice recording export and import
+
+Open **Tools → Memory manager → Voice recordings**. Use **Export all recordings**
+for a portable `cupitor-recordings-YYYY-MM-DD.zip`, or long-press clips and use
+**Export selected recordings**. **Import recordings** is available on an empty
+device too. Bundles preserve audio bytes, filenames and modification dates.
+
+Import adds missing clips, skips identical clips and reports same-name conflicts
+while keeping the existing audio. It validates the whole bundle before writing
+and does not rename recordings, since their filenames identify card attachments.
+Existing manual cards can play restored clips on another device even when their
+saved `file://` URLs contain the original device's directory. The bundle contains
+the audio files; card/playlist definitions still use the existing webapp sync or
+playlist export.
+
 ## YouTube subtitle sidebar
 
 The SRT panel also has **Open SRT** for local subtitle files on supported video

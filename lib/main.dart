@@ -25,6 +25,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:speech_to_text/speech_recognition_error.dart' as stt;
 import 'speech_hub.dart';
 import 'native_recording_start.dart';
+import 'recording_urls.dart';
 import 'study_call_history_bridge.dart';
 import 'caption_capture.dart';
 import 'video_note.dart';
@@ -9713,7 +9714,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final dir = await _manualAudioDir();
     // Collapses `..` before checking, so a URL that only leaves the
     // directory through a dot segment is refused too.
-    final path = filePathInsideDir(url, dir.path);
+    final path = recordingPathFromUrl(url, dir.path);
     return path == null ? null : File(path);
   }
 
