@@ -1,8 +1,9 @@
 import 'dart:convert';
 import 'package:webview_flutter/webview_flutter.dart';
 
-/// Both main-page capture buttons open/import into this controller. A failed
-/// page-side launcher must not fall through to the standalone lookup dialog.
+/// The native CC button lists caption tracks for the playing page, then
+/// imports the selected track into that page. The injected SRT launcher owns
+/// panel visibility; opening that panel must not swallow the native CC action.
 Future<void> openMainYouTubeSubtitleCapture({
   required WebViewController page,
   required bool Function() isCurrent,
@@ -12,18 +13,6 @@ Future<void> openMainYouTubeSubtitleCapture({
   final url = await page.currentUrl() ?? '';
   final videoId = youtubeSubtitleVideoId(url);
   if (!isCurrent() || videoId == null) return;
-  var opened = false;
-  try {
-    final result = await page
-        .runJavaScriptReturningResult(
-          'Boolean(window.__cupOpenSubtitlePanel && window.__cupOpenSubtitlePanel())',
-        )
-        .timeout(const Duration(seconds: 2));
-    opened = result.toString() == 'true';
-  } catch (_) {
-    /* Missing or outdated panel: download into the same page. */
-  }
-  if (opened || !isCurrent()) return;
   final currentId = youtubeSubtitleVideoId(await page.currentUrl() ?? '');
   if (!isCurrent() || currentId != videoId) return;
   await downloadToPage(page, url);

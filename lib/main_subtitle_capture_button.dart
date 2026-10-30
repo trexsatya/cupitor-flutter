@@ -26,7 +26,7 @@ class MainSubtitleCaptureButton extends StatelessWidget {
         bottom: MediaQuery.of(context).padding.bottom + 318,
         child: FloatingActionButton.small(
           heroTag: 'main-subtitle-capture',
-          tooltip: 'Capture SRT subtitles',
+          tooltip: 'Choose caption track',
           onPressed: onPressed,
           child: const Icon(Icons.closed_caption_outlined),
         ),

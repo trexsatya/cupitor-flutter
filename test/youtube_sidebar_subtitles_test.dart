@@ -6,41 +6,41 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 class CaptionPage extends Fake implements WebViewController {
   String url = 'https://m.youtube.com/watch?v=abcdefghijk';
-  Object result = false;
-  bool throwOnOpen = false;
-  void Function()? onOpen;
+  int reads = 0;
+  void Function()? afterFirstRead;
   @override
-  Future<String?> currentUrl() async => url;
+  Future<String?> currentUrl() async {
+    final current = url;
+    if (++reads == 1) afterFirstRead?.call();
+    return current;
+  }
   @override
   Future<Object> runJavaScriptReturningResult(String script) async {
-    onOpen?.call();
-    if (throwOnOpen) throw StateError('TrustedHTML assignment blocked');
-    return result;
+    fail('Native CC must list tracks without calling the panel launcher');
   }
 }
 
 void main() {
   const id = 'abcdefghijk';
-  test('main CC fallback targets the playing page when launcher is absent or throws', () async {
-    for (final throws in [false, true]) {
-      final page = CaptionPage()..throwOnOpen = throws;
-      var downloads = 0;
+  test('native CC lists caption tracks on every press, using the playing page', () async {
+    final page = CaptionPage();
+    var downloads = 0;
+    for (var press = 0; press < 2; press++) {
       await openMainYouTubeSubtitleCapture(page: page, isCurrent: () => true,
         downloadToPage: (target, url) async {
           downloads++;
           expect(identical(target, page), isTrue);
           expect(url, page.url);
         });
-      expect(downloads, 1);
+      expect(downloads, press + 1);
     }
   });
-  test('opening the page panel avoids download; navigation/replacement cancels fallback', () async {
-    for (final mode in ['opened', 'navigated', 'replaced', 'not-video']) {
+  test('navigation or controller replacement cancels caption-track listing', () async {
+    for (final mode in ['navigated', 'replaced', 'not-video']) {
       final page = CaptionPage();
       var current = true;
-      if (mode == 'opened') page.result = true;
       if (mode == 'not-video') page.url = 'https://m.youtube.com/';
-      page.onOpen = () {
+      page.afterFirstRead = () {
         if (mode == 'navigated') page.url = 'https://m.youtube.com/watch?v=lmnopqrstuv';
         if (mode == 'replaced') current = false;
       };
