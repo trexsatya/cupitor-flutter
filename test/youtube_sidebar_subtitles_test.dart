@@ -2,52 +2,9 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:cupitor/youtube_sidebar_subtitles.dart';
-import 'package:webview_flutter/webview_flutter.dart';
-
-class CaptionPage extends Fake implements WebViewController {
-  String url = 'https://m.youtube.com/watch?v=abcdefghijk';
-  int reads = 0;
-  void Function()? afterFirstRead;
-  @override
-  Future<String?> currentUrl() async {
-    final current = url;
-    if (++reads == 1) afterFirstRead?.call();
-    return current;
-  }
-  @override
-  Future<Object> runJavaScriptReturningResult(String script) async {
-    fail('Native CC must list tracks without calling the panel launcher');
-  }
-}
 
 void main() {
   const id = 'abcdefghijk';
-  test('native CC lists caption tracks on every press, using the playing page', () async {
-    final page = CaptionPage();
-    var downloads = 0;
-    for (var press = 0; press < 2; press++) {
-      await openMainYouTubeSubtitleCapture(page: page, isCurrent: () => true,
-        downloadToPage: (target, url) async {
-          downloads++;
-          expect(identical(target, page), isTrue);
-          expect(url, page.url);
-        });
-      expect(downloads, press + 1);
-    }
-  });
-  test('navigation or controller replacement cancels caption-track listing', () async {
-    for (final mode in ['navigated', 'replaced', 'not-video']) {
-      final page = CaptionPage();
-      var current = true;
-      if (mode == 'not-video') page.url = 'https://m.youtube.com/';
-      page.afterFirstRead = () {
-        if (mode == 'navigated') page.url = 'https://m.youtube.com/watch?v=lmnopqrstuv';
-        if (mode == 'replaced') current = false;
-      };
-      await openMainYouTubeSubtitleCapture(page: page, isCurrent: () => current,
-        downloadToPage: (_, __) async => fail('Unexpected download for $mode'));
-    }
-  });
   test('accepts supported YouTube URL forms and rejects lookalike hosts', () {
     for (final url in [
       id,

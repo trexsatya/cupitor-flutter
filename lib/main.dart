@@ -37,7 +37,6 @@ import 'ai_prompt.dart';
 import 'youtube_urls.dart';
 import 'youtube_controls.dart';
 import 'youtube_sidebar_subtitles.dart';
-import 'main_subtitle_capture_button.dart';
 import 'local_subtitles.dart';
 import 'stable_dialog_chrome.dart';
 import 'dialog_app_lifecycle.dart';
@@ -6850,24 +6849,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
   }
 
-  Future<void> _openMainSubtitleCapture() async {
-    if (_youtubeSidebarDownloadBusy) return;
-    final page = _controller;
-    _youtubeSidebarDownloadBusy = true;
-    try {
-      await openMainYouTubeSubtitleCapture(
-        page: page,
-        isCurrent: () => mounted && identical(page, _controller),
-        downloadToPage: (target, url) =>
-            _startYouTubeSubtitleDownload(context, sidebarTarget: target, videoUrl: url),
-      );
-    } catch (error) {
-      if (mounted) _showCaptureError('Could not open YouTube subtitles', '$error');
-    } finally {
-      _youtubeSidebarDownloadBusy = false;
-    }
-  }
-
   Future<void> _downloadYouTubeSubtitlesForPage(
       WebViewController page, JavaScriptMessage message) async {
     if (!mounted || !identical(page, _controller) || _youtubeSidebarDownloadBusy) return;
@@ -12030,10 +12011,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 onHide: () => _setVideoNoteEnabled(false),
                 onMoved: (pos) => _videoNoteChipPos = pos,
               ),
-            MainSubtitleCaptureButton(
-              address: _urlController,
-              onPressed: _openMainSubtitleCapture,
-            ),
             // Over a fullscreen video too, like the other floating buttons.
             if (_studyFsChipEnabled)
               TagCaptureFloatingChip(
