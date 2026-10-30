@@ -7,11 +7,11 @@ The remote caption module exposes **⤓CC** only when the host provides
 {"op":"download"}
 ```
 
-The native floating **CC** button opens the caption-track list directly on
-every press. It does not call the page's panel launcher or toggle visibility.
-The page's **SRT · Capture** launcher remains the panel visibility control.
+The page's **SRT · Capture** launcher controls panel visibility. Use **⤓CC**
+inside that panel to choose and download a caption track. There is no separate
+floating native CC button over the video or subtitles.
 
-Both CC download buttons read the video URL from the actual main WebView controller, then
+The host reads the video URL from the actual main WebView controller, then
 reuses `_startYouTubeSubtitleDownload` with that controller as `sidebarTarget`.
 The existing yt-dlp track list, language picker, busy/error dialogs and JSON3 /
 VTT parsing are shared with the standalone CC download flow. That flow keeps

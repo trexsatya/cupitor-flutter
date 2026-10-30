@@ -1,22 +1,4 @@
 import 'dart:convert';
-import 'package:webview_flutter/webview_flutter.dart';
-
-/// The native CC button lists caption tracks for the playing page, then
-/// imports the selected track into that page. The injected SRT launcher owns
-/// panel visibility; opening that panel must not swallow the native CC action.
-Future<void> openMainYouTubeSubtitleCapture({
-  required WebViewController page,
-  required bool Function() isCurrent,
-  required Future<void> Function(WebViewController page, String url)
-  downloadToPage,
-}) async {
-  final url = await page.currentUrl() ?? '';
-  final videoId = youtubeSubtitleVideoId(url);
-  if (!isCurrent() || videoId == null) return;
-  final currentId = youtubeSubtitleVideoId(await page.currentUrl() ?? '');
-  if (!isCurrent() || currentId != videoId) return;
-  await downloadToPage(page, url);
-}
 
 /// Accepts a video id or a YouTube watch/share/embed/shorts/live URL.
 String? youtubeSubtitleVideoId(String input) {
