@@ -1,4 +1,4 @@
-// Cupitor frame agent. Bundled fallback from trexsatya.github.io/db/js/frame-boot.js.
+// Cupitor frame agent. Bundled fallback from cupitor/frontend/vue3/cupitor-frontend/public/page-scripts/frame-boot.js.
 //
 // Injected by the host at DOCUMENT START into EVERY frame, via
 // WebViewCompat.addDocumentStartJavaScript or macOS WKUserScript. This reaches a

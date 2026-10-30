@@ -1,7 +1,7 @@
 // Pausing the page's videos while the lookup dialog is open, and playing them
 // again when it closes (lib/lookup_video_hold.dart), together with the caption
 // sidebar that also pauses and plays the video (snippet.js, sibling repo
-// trexsatya.github.io, src/20-caption-sidebar.js).
+// cupitor, public/language/caption-sidebar.js).
 //
 // Runs the real scripts: the hold/release JS is read out of the Dart file, the
 // sidebar from its source. jsdom comes from $CUPITOR_JSDOM or the frontend
@@ -17,9 +17,9 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../..');
-const PROJECTS = path.resolve(ROOT, '../..');
+const PROJECTS = path.resolve(ROOT, '..');
 const SIDEBAR_SRC = process.env.CUPITOR_SIDEBAR_SRC ||
-  path.join(PROJECTS, 'trexsatya.github.io/db/js/src/20-caption-sidebar.js');
+  path.join(PROJECTS, 'cupitor/frontend/vue3/cupitor-frontend/public/language/caption-sidebar.js');
 
 function loadJsdom() {
   const candidates = [
@@ -47,11 +47,7 @@ const HOLD = dartConst('kHoldVideosForLookupJs').replace('$_videosJs', VIDEOS);
 const RELEASE = dartConst('kReleaseVideosAfterLookupJs');
 assert.ok(!HOLD.includes('$') && !RELEASE.includes('$'), 'unfilled Dart interpolation');
 
-function boot(bodyHtml = '', { prefs } = {}) {
-  const dom = new JSDOM(`<!DOCTYPE html><html><body>${bodyHtml}</body></html>`, {
-    runScripts: 'outside-only', pretendToBeVisual: true, url: 'https://example.test/watch',
-  });
-  const { window } = dom;
+function mockMedia(window) {
   // jsdom has no media playback; this behaves like a browser's for the parts
   // used here: `paused` flips synchronously, the event follows as a task.
   const P = window.HTMLMediaElement.prototype;
@@ -68,6 +64,14 @@ function boot(bodyHtml = '', { prefs } = {}) {
     setTimeout(() => this.dispatchEvent(new window.Event('play')));
     return Promise.resolve();
   };
+}
+
+function boot(bodyHtml = '', { prefs } = {}) {
+  const dom = new JSDOM(`<!DOCTYPE html><html><body>${bodyHtml}</body></html>`, {
+    runScripts: 'outside-only', pretendToBeVisual: true, url: 'https://example.test/watch',
+  });
+  const { window } = dom;
+  mockMedia(window);
   const logs = [];
   window.console = { log: (...a) => logs.push(a.join(' ')), warn() {}, error() {}, info() {} };
   const translateRequests = [];
@@ -104,7 +108,7 @@ test('Spotify lookup holds its adapter once and resumes through its own player c
     toggles++;
     button.setAttribute('aria-label', button.getAttribute('aria-label') === 'Pause' ? 'Play' : 'Pause');
   };
-  window.eval(fs.readFileSync(path.join(path.dirname(SIDEBAR_SRC), '25-spotify-player.js'), 'utf8'));
+  window.eval(fs.readFileSync(path.join(path.dirname(SIDEBAR_SRC), '../page-scripts/src/25-spotify-player.js'), 'utf8'));
   const adapter = window.__cupShared.createSpotifyPlayer();
   window.__cupCaptionPlayer = adapter;
   window.eval(HOLD); await tick();
@@ -179,6 +183,7 @@ test('given a held video the page played meanwhile, when released, then it is le
 
 test('given a video in a same-origin iframe, when held and released, then it pauses and resumes', async () => {
   const { window, document } = boot('<iframe></iframe>');
+  mockMedia(document.querySelector('iframe').contentWindow);
   const fdoc = document.querySelector('iframe').contentDocument;
   fdoc.body.innerHTML = '<video id="f"></video>';
   const f = fdoc.getElementById('f');

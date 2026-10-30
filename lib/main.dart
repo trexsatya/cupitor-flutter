@@ -2662,9 +2662,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     );
   }
 
+  // Runtime source and shared subtitle UI are owned by the Cupitor repository.
+  static const String _pageScriptBaseUrl =
+      'https://raw.githubusercontent.com/trexsatya/cupitor/refs/heads/master/frontend/vue3/cupitor-frontend/public/page-scripts';
+  static const String _remoteSnippetUrl = '$_pageScriptBaseUrl/snippet.js';
+
   void _injectRemoteSnippet() {
     http.get(
-      Uri.parse('https://raw.githubusercontent.com/trexsatya/trexsatya.github.io/refs/heads/gh-pages/db/js/snippet.js'),
+      Uri.parse(_remoteSnippetUrl),
     ).timeout(const Duration(seconds: 5)).then((response) {
       if (response.statusCode == 200) {
         _cachedRemoteSnippet = response.body;
@@ -2694,7 +2699,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// Where the frame agent lives. Remote like `snippet.js`, so a reader that
   /// changes its markup can be handled without an app release.
   static const String _frameBootUrl =
-      'https://raw.githubusercontent.com/trexsatya/trexsatya.github.io/refs/heads/gh-pages/db/js/frame-boot.js';
+      '$_pageScriptBaseUrl/frame-boot.js';
 
   /// Fetches the frame agent and registers it as a document-start script.
   ///
@@ -3028,7 +3033,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   void _warmRemoteSnippetCache() {
     if (_cachedRemoteSnippet != null) return;
     http.get(
-      Uri.parse('https://raw.githubusercontent.com/trexsatya/trexsatya.github.io/refs/heads/gh-pages/db/js/snippet.js'),
+      Uri.parse(_remoteSnippetUrl),
     ).timeout(const Duration(seconds: 8)).then((response) {
       if (response.statusCode == 200) _cachedRemoteSnippet = response.body;
     }).catchError((_) { /* offline / down — handled by the runtime fetch */ });
