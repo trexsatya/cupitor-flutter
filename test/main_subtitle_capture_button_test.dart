@@ -11,7 +11,7 @@ void main() {
       const Positioned.fill(child: ColoredBox(color: Colors.black)),
       MainSubtitleCaptureButton(address: address, onPressed: () => calls++),
     ]))));
-    final capture = find.byTooltip('Capture SRT subtitles');
+    final capture = find.byTooltip('Choose caption track');
     expect(capture, findsOneWidget);
     await tester.tap(capture);
     expect(calls, 1);
