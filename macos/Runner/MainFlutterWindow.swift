@@ -21,6 +21,14 @@ class MainFlutterWindow: NSWindow {
     }
     self.recordingChannel = recordingChannel
 
+    let adBlockChannel = FlutterMethodChannel(
+      name: "cupitor/adblock",
+      binaryMessenger: flutterViewController.engine.binaryMessenger)
+    adBlockChannel.setMethodCallHandler { [weak self] call, result in
+      self?.adBlocker.handle(call, result: result)
+    }
+    self.adBlockChannel = adBlockChannel
+
     // Dart passes a WebView's identifier (lib/mac_webview.dart) and we patch
     // the native WKWebView for what webview_flutter can't configure.
     let webviewChannel = FlutterMethodChannel(
@@ -61,7 +69,13 @@ class MainFlutterWindow: NSWindow {
       }
       JSPanelUIDelegate.install(on: webView)
       self?.frameScripts.configure(webView)
-      result(true)
+      self?.adBlocker.configure(webView) { error in
+        if let error = error {
+          result(FlutterError(code: "adblock_rules", message: error.localizedDescription, details: nil))
+        } else {
+          result(true)
+        }
+      }
     }
     self.webviewChannel = webviewChannel
 
@@ -103,6 +117,8 @@ class MainFlutterWindow: NSWindow {
 
   private var webviewChannel: FlutterMethodChannel?
   private var recordingChannel: FlutterMethodChannel?
+  private var adBlockChannel: FlutterMethodChannel?
+  private let adBlocker = MacAdBlocker()
   private let audioRecording = NativeAudioRecording()
   private let frameScripts = FrameScriptInstaller()
   /// The window is fullscreen because a page asked, not because the user did.
@@ -130,6 +146,147 @@ class MainFlutterWindow: NSWindow {
       windowFullscreenIsOurs = false
       toggledByUs = true
       toggleFullScreen(nil)
+    }
+  }
+}
+
+/// WKWebView does not use Android's shouldInterceptRequest client. Install
+/// compiled WebKit rules before navigation, on every browser and dialog view.
+/// Own only our list; Flutter's user scripts and other rule lists stay intact.
+final class MacAdBlocker {
+  static let builtInHosts: Set<String> = [
+    "googlesyndication.com", "doubleclick.net", "googleadservices.com",
+    "adservice.google.com", "adservice.google.co.uk", "adnxs.com",
+    "advertising.com", "amazon-adsystem.com", "ads.yahoo.com", "taboola.com",
+    "outbrain.com", "moatads.com", "adsafeprotected.com", "scorecardresearch.com",
+    "static.ads-twitter.com", "ads.twitter.com", "ads.linkedin.com",
+    "googletagservices.com", "criteo.com", "rubiconproject.com", "openx.net",
+    "pubmatic.com", "contextweb.com", "bidswitch.net", "casalemedia.com",
+  ]
+  private let views = NSHashTable<WKWebView>.weakObjects()
+  private let defaults: UserDefaults
+  private let store: WKContentRuleListStore
+  private let identifier: String
+  private var customHosts: Set<String>
+  private var enabled = true
+  private var rules: WKContentRuleList?
+  private var compiling = false
+  private var revision = 0
+  private var ready: [(Error?) -> Void] = []
+  private static let hostsKey = "cupitor.adblock.customHosts"
+
+  init(defaults: UserDefaults = .standard, store: WKContentRuleListStore = .default(),
+       identifier: String = "cupitor-ad-hosts") {
+    self.defaults = defaults
+    self.store = store
+    self.identifier = identifier
+    customHosts = Set((defaults.stringArray(forKey: Self.hostsKey) ?? []).compactMap(Self.host))
+  }
+
+  static func host(_ input: String) -> String? {
+    let host = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    // Accept a DNS hostname, never a URL/regex: a pasted path or metacharacter
+    // must not turn a custom rule into a block on unrelated sites.
+    guard host.utf8.count <= 253, host.contains("."),
+      host.split(separator: ".", omittingEmptySubsequences: false).allSatisfy({ label in
+        !label.isEmpty && label.utf8.count <= 63 && label.first != "-" && label.last != "-" &&
+          label.utf8.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 45 }
+      }) else { return nil }
+    return host
+  }
+
+  static func encodedRules(hosts: Set<String>) -> String {
+    let list: [[String: Any]] = hosts.sorted().map { host in
+      // Anchor at the hostname boundary, including subdomains, without
+      // matching good.example/?next=doubleclick.net or doubleclick.net.evil.
+      ["trigger": ["url-filter": "^https?://([^/:]+\\.)?" +
+        host.replacingOccurrences(of: ".", with: "\\.") + "(:[0-9]+)?/"],
+       "action": ["type": "block"]]
+    }
+    return String(data: try! JSONSerialization.data(withJSONObject: list), encoding: .utf8)!
+  }
+
+  func configure(_ webView: WKWebView, completion: @escaping (Error?) -> Void) {
+    views.add(webView)
+    if rules != nil {
+      apply(to: webView)
+      completion(nil)
+    } else {
+      ready.append(completion)
+      compile()
+    }
+  }
+
+  private func apply(to view: WKWebView) {
+    guard let rules = rules else { return }
+    let content = view.configuration.userContentController
+    content.remove(rules)
+    if enabled { content.add(rules) }
+  }
+
+  private func compile() {
+    guard !compiling else { return }
+    compiling = true
+    let current = revision
+    let json = Self.encodedRules(hosts: Self.builtInHosts.union(customHosts))
+    store.compileContentRuleList(forIdentifier: identifier, encodedContentRuleList: json) {
+      [weak self] compiled, error in
+      guard let self = self else { return }
+      self.compiling = false
+      // A host change during compilation must not install stale rules or
+      // release a waiting first navigation with an incomplete host list.
+      if self.revision != current { self.compile(); return }
+      if let compiled = compiled {
+        for view in self.views.allObjects {
+          if let old = self.rules { view.configuration.userContentController.remove(old) }
+        }
+        self.rules = compiled
+        for view in self.views.allObjects { self.apply(to: view) }
+      }
+      let callbacks = self.ready
+      self.ready.removeAll()
+      for callback in callbacks { callback(error) }
+    }
+  }
+
+  func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let args = call.arguments as? [String: Any] ?? [:]
+    switch call.method {
+    case "getCustomHosts": result(customHosts.sorted())
+    case "setEnabled":
+      enabled = args["enabled"] as? Bool ?? true
+      for view in views.allObjects { apply(to: view) }
+      result(nil)
+    case "addHost", "removeHost":
+      guard let raw = args["host"] as? String, let host = Self.host(raw) else {
+        result(FlutterError(code: "BAD_ARG", message: "Enter a hostname such as ads.example.com", details: nil))
+        return
+      }
+      let changed: Bool
+      if call.method == "addHost" {
+        changed = !Self.builtInHosts.contains(host) && customHosts.insert(host).inserted
+      } else {
+        changed = customHosts.remove(host) != nil
+      }
+      guard changed else { result(false); return }
+      defaults.set(customHosts.sorted(), forKey: Self.hostsKey)
+      revision += 1
+      ready.append { error in
+        if let error = error {
+          result(FlutterError(code: "adblock_rules", message: error.localizedDescription, details: nil))
+        } else { result(true) }
+      }
+      compile()
+    case "attach":
+      if rules != nil { result(nil) } else {
+        ready.append { error in
+          if let error = error {
+            result(FlutterError(code: "adblock_rules", message: error.localizedDescription, details: nil))
+          } else { result(nil) }
+        }
+        compile()
+      }
+    default: result(FlutterMethodNotImplemented)
     }
   }
 }
