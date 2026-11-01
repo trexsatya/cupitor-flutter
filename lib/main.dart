@@ -1004,6 +1004,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               if (Platform.isAndroid) _attachAndroidAdBlocker();
               _injectJs();
               _injectAdBlocker();
+              _injectYouTubeAdBlocker();
               c.runJavaScript(_linkLongPressJs);
               if (Platform.isAndroid) c.runJavaScript(_fullscreenWatcherJs);
               if (Platform.isMacOS) c.runJavaScript(kInPageFullscreenJs);
@@ -3632,7 +3633,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   /// Adds [host] to the runtime ad-host list and persists it.
   Future<bool> addAdHost(String host) async {
-    if (!Platform.isAndroid) return false;
+    if (!Platform.isAndroid && !Platform.isMacOS) return false;
     try {
       final added = await _adBlockChannel.invokeMethod<bool>('addHost', {'host': host});
       return added ?? false;
@@ -3641,7 +3642,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   /// Removes [host] from the runtime ad-host list and persists the change.
   Future<bool> removeAdHost(String host) async {
-    if (!Platform.isAndroid) return false;
+    if (!Platform.isAndroid && !Platform.isMacOS) return false;
     try {
       final removed = await _adBlockChannel.invokeMethod<bool>('removeHost', {'host': host});
       return removed ?? false;
@@ -3650,7 +3651,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   /// Returns only custom (user-added + auto-detected) ad hosts.
   Future<List<String>> getAdHosts() async {
-    if (!Platform.isAndroid) return [];
+    if (!Platform.isAndroid && !Platform.isMacOS) return [];
     try {
       final list = await _adBlockChannel.invokeMethod<List>('getCustomHosts');
       return list?.cast<String>() ?? [];
@@ -3658,7 +3659,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   Future<void> setAdBlockEnabled(bool enabled) async {
-    if (!Platform.isAndroid) return;
+    if (!Platform.isAndroid && !Platform.isMacOS) return;
     setState(() => _adBlockEnabled = enabled);
     try {
       await _adBlockChannel.invokeMethod<void>('setEnabled', {'enabled': enabled});
@@ -3821,30 +3822,31 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           (document.head || document.documentElement).appendChild(style);
 
           function clickSkip() {
-            const btn = document.querySelector(
+            const buttons = document.querySelectorAll(
               '.ytp-skip-ad-button, .ytp-ad-skip-button, ' +
               '.ytp-skip-ad-button-modern, .ytp-ad-skip-button-modern, ' +
-              '.ytp-ad-skip-button-slot button, .ytp-ad-overlay-close-button'
+              '.ytp-ad-skip-button-slot button, .ytp-ad-skip-button-container button, ' +
+              '.ytp-ad-overlay-close-button'
             );
-            if (btn) btn.click();
+            for (const btn of buttons) {
+              if (!btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+                btn.click();
+                return;
+              }
+            }
           }
 
           function attach(player) {
             if (player._ytAdObserverAttached) return;
             player._ytAdObserverAttached = true;
-            new MutationObserver((mutations) => {
-              for (const m of mutations) {
-                if (m.type !== 'childList') continue;
-                for (const node of m.addedNodes) {
-                  if (node.nodeType !== 1) continue;
-                  if (node.matches && node.matches(
-                    '.ytp-skip-ad-button, .ytp-ad-skip-button, ' +
-                    '.ytp-skip-ad-button-modern, .ytp-ad-skip-button-modern, ' +
-                    '.ytp-ad-skip-button-slot'
-                  )) { clickSkip(); return; }
-                }
-              }
-            }).observe(player, { childList: true, subtree: true });
+            // YouTube inserts whole subtrees, reuses existing buttons and
+            // changes disabled/class attributes when its countdown ends.
+            // Inspect the live descendants, not just each added root node.
+            new MutationObserver(clickSkip).observe(player, {
+              childList: true, subtree: true, attributes: true,
+              attributeFilter: ['class', 'disabled', 'aria-disabled'],
+            });
+            clickSkip(); // also handle a button already present at injection
           }
 
           const existing = document.querySelector('.html5-video-player');
@@ -5191,6 +5193,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         },
         onPageFinished: (finishedUrl) {
           _injectAdBlocker(dialog2Controller);
+          _injectYouTubeAdBlocker(dialog2Controller);
           dialog2Controller.runJavaScript(_linkLongPressJs);
           // Auto-unmute any YouTube/HTML5 media that autoplayed muted.
           dialog2Controller.runJavaScript(_autoUnmuteYouTubeJs);
@@ -8725,6 +8728,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               ctrl.runJavaScript(kDialogChromeActivityJs);
               _dialog1ChromeActivity.value++;
               _injectAdBlocker(dialogController);
+              _injectYouTubeAdBlocker(dialogController);
               // Let this WebView answer its own requests for the background
               // music files. Attached per page load because a fresh dialog
               // WebView starts unwrapped.

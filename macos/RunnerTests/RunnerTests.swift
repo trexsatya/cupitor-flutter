@@ -3,6 +3,7 @@ import FlutterMacOS
 import XCTest
 import WebKit
 import AVFoundation
+import Network
 @testable import cupitor
 
 @MainActor
@@ -35,6 +36,107 @@ class RunnerTests: XCTestCase {
     installer.setSource("window.newAgent = true")
     XCTAssertEqual(content.userScripts.map { $0.source },
       ["window.FlutterChannel = true", "window.newAgent = true"])
+  }
+}
+
+/// A real loopback server lets WKWebView prove that a request was blocked,
+/// rather than treating a DNS/network failure as successful ad suppression.
+private final class AdBlockHTTPServer {
+  let listener: NWListener
+  init() throws {
+    listener = try NWListener(using: .tcp, on: .any)
+    listener.newConnectionHandler = { connection in
+      connection.start(queue: .main)
+      connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, _ in
+        let request = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let body = request.contains("/blocked.js") ? "window.blockedLoaded = true" : "window.allowedLoaded = true"
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nCache-Control: no-store\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n" + body
+        connection.send(content: response.data(using: .utf8), completion: .contentProcessed { _ in connection.cancel() })
+      }
+    }
+  }
+  deinit { listener.cancel() }
+}
+
+private final class AdBlockNavigation: NSObject, WKNavigationDelegate {
+  var finished: (() -> Void)?
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { finished?() }
+}
+
+@MainActor
+final class MacAdBlockerTests: XCTestCase {
+  private func call(_ blocker: MacAdBlocker, _ method: String, _ arguments: Any? = nil) -> Any? {
+    let done = expectation(description: method)
+    var value: Any?
+    blocker.handle(FlutterMethodCall(methodName: method, arguments: arguments)) { value = $0; done.fulfill() }
+    wait(for: [done], timeout: 15)
+    XCTAssertFalse(value is FlutterError, "\(String(describing: value))")
+    return value
+  }
+
+  func testHostRulesAreBoundedAndRejectURLsAndRegex() throws {
+    XCTAssertEqual(MacAdBlocker.host("  ADS.Example.COM  "), "ads.example.com")
+    for invalid in ["https://ads.example.com/path", "ads.*", "example.com/", "a..com", "-ads.example.com"] {
+      XCTAssertNil(MacAdBlocker.host(invalid))
+    }
+    let data = MacAdBlocker.encodedRules(hosts: ["doubleclick.net"]).data(using: .utf8)!
+    let rules = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+    let trigger = try XCTUnwrap(rules[0]["trigger"] as? [String: String])
+    let regex = try NSRegularExpression(pattern: XCTUnwrap(trigger["url-filter"]))
+    for (url, blocked) in [
+      ("https://doubleclick.net/ad", true), ("https://a.b.doubleclick.net:443/ad", true),
+      ("https://example.com/?url=doubleclick.net/", false), ("https://doubleclick.net.example.com/ad", false),
+      ("https://youtube.com/watch?v=abc", false), ("https://rr1.googlevideo.com/videoplayback", false),
+    ] {
+      XCTAssertEqual(regex.firstMatch(in: url, range: NSRange(url.startIndex..., in: url)) != nil, blocked, url)
+    }
+  }
+
+  func testRealWebViewsBlockHostsAndHonorDisableRemoveAndPersistence() throws {
+    let suite = "cupitor-adblock-test-" + UUID().uuidString
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let blocker = MacAdBlocker(defaults: defaults, identifier: suite)
+    XCTAssertEqual(call(blocker, "addHost", ["host": "127.0.0.1"]) as? Bool, true)
+    XCTAssertEqual(call(MacAdBlocker(defaults: defaults), "getCustomHosts") as? [String], ["127.0.0.1"])
+    let server = try AdBlockHTTPServer()
+    let listening = expectation(description: "loopback listening")
+    server.listener.stateUpdateHandler = { state in if case .ready = state { listening.fulfill() } }
+    server.listener.start(queue: .main)
+    wait(for: [listening], timeout: 10)
+    let port = try XCTUnwrap(server.listener.port).rawValue
+    let first = WKWebView()
+    let second = WKWebView()
+    for view in [first, second] {
+      let ready = expectation(description: "rules installed before first navigation")
+      blocker.configure(view) { error in XCTAssertNil(error); ready.fulfill() }
+      wait(for: [ready], timeout: 15)
+    }
+    let navigation = AdBlockNavigation()
+    func check(_ view: WKWebView, blocked: Bool) {
+      let loaded = expectation(description: "page and scripts loaded")
+      navigation.finished = { loaded.fulfill() }
+      view.navigationDelegate = navigation
+      view.loadHTMLString("<script src='http://127.0.0.1:\(port)/blocked.js'></script><script src='http://localhost:\(port)/allowed.js'></script>", baseURL: URL(string: "http://localhost:\(port)/"))
+      wait(for: [loaded], timeout: 15)
+      let checked = expectation(description: "verify resource outcomes")
+      view.evaluateJavaScript("[window.blockedLoaded === true, window.allowedLoaded === true]") { value, error in
+        XCTAssertNil(error)
+        XCTAssertEqual(value as? [Bool], [!blocked, true], "ordinary resources must still load")
+        checked.fulfill()
+      }
+      wait(for: [checked], timeout: 10)
+    }
+    check(first, blocked: true)
+    check(second, blocked: true) // future dialogs receive the same rules
+    call(blocker, "setEnabled", ["enabled": false])
+    check(first, blocked: false)
+    call(blocker, "setEnabled", ["enabled": true])
+    check(second, blocked: true)
+    XCTAssertEqual(call(blocker, "removeHost", ["host": "127.0.0.1"]) as? Bool, true)
+    check(first, blocked: false)
+    XCTAssertEqual(call(MacAdBlocker(defaults: defaults), "getCustomHosts") as? [String], [])
+    server.listener.cancel()
   }
 }
 

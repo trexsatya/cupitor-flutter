@@ -66,3 +66,43 @@ test('SPA player and mobile get_watch responses are pruned for fetch and XHR', a
     }
   });
 });
+
+// The host also runs this after navigation, when early evaluation may have
+// landed in the outgoing document. Exercise its DOM defences independently
+// of JSON pruning (which is already installed by the frame agent).
+const mainDart = fs.readFileSync(path.join(__dirname, '../../lib/main.dart'), 'utf8');
+const hostScript = mainDart.split('void _injectYouTubeAdBlocker(')[1].match(/const js = r'''([\s\S]*?)'''/)[1];
+test('late host injection skips existing, nested and countdown-enabled ad buttons', async () => {
+  await fixture(async page => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<div class="html5-video-player"><button class="ytp-ad-skip-button">Skip</button><button id="play">Play</button></div>';
+      window.skipClicks = 0;
+      window.playClicks = 0;
+      document.querySelector('.ytp-ad-skip-button').onclick = () => window.skipClicks++;
+      document.querySelector('#play').onclick = () => window.playClicks++;
+    });
+    await page.evaluate(hostScript);
+    assert.equal(await page.evaluate(() => window.skipClicks), 1, 'already present button is clicked');
+    await page.evaluate(() => {
+      document.querySelector('.ytp-ad-skip-button').remove();
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = '<div class="ytp-ad-skip-button-container"><button disabled>Skip</button></div>';
+      wrapper.querySelector('button').onclick = () => window.skipClicks++;
+      document.querySelector('.html5-video-player').appendChild(wrapper);
+    });
+    assert.equal(await page.evaluate(() => window.skipClicks), 1, 'disabled countdown is not clicked');
+    await page.evaluate(() => { document.querySelector('.ytp-ad-skip-button-container button').disabled = false; });
+    await page.waitForFunction(() => window.skipClicks === 2);
+    assert.equal(await page.evaluate(() => window.playClicks), 0, 'ordinary playback controls are untouched');
+    await page.evaluate(() => {
+      document.querySelector('.ytp-ad-skip-button-container').remove();
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = '<div><button class="ytp-skip-ad-button">Skip</button></div>';
+      wrapper.querySelector('button').onclick = () => window.skipClicks++;
+      document.querySelector('.html5-video-player').appendChild(wrapper);
+    });
+    await page.waitForFunction(() => window.skipClicks === 3);
+    await page.evaluate(hostScript);
+    assert.equal(await page.evaluate(() => window.skipClicks), 3, 'repeated page-finished injection is idempotent');
+  });
+});
