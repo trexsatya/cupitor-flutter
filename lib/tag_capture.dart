@@ -1092,8 +1092,15 @@ class _TagCaptureSheetState extends State<_TagCaptureSheet> {
     // The send opens the webapp over this sheet, so the sheet can be gone by
     // the time we get back.
     if (!mounted) return;
+    // A null message is the sender's success contract. Dismiss this sheet
+    // after successful delivery; keep it open when there is an error so
+    // the user can retry without losing their edits.
+    if (message == null) {
+      Navigator.of(context).pop();
+      return;
+    }
     setState(() => _sendingToPlaylist = false);
-    if (message != null && message.isNotEmpty) {
+    if (message.isNotEmpty) {
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text(message)));
     }

@@ -59,10 +59,11 @@ class _Platform extends WebViewPlatform {
 
 void main() {
   testWidgets(
-    'Search sends selected text through the Open lookup dialog callback',
+    'Translate selected text without triggering a lookup',
     (tester) async {
       SharedPreferences.setMockInitialValues({});
       final lookups = <String>[];
+      final translations = <String>[];
       final platform = _Platform();
       WebViewPlatform.instance = platform;
       final book = EpubBook(
@@ -94,23 +95,31 @@ void main() {
           home: EpubReaderScreen(
             book: book,
             onLookup: (text, _) => lookups.add(text),
+            onTranslate: (text) async {
+              translations.add(text);
+              return 'Searchable Swedish text.';
+            },
           ),
         ),
       );
       await tester.pumpAndSettle();
       platform.controller.select('Sökbar svensk text.');
       await tester.pump();
-      await tester.tap(find.text('Search'));
+      await tester.tap(find.text('Translate'));
       await tester.pumpAndSettle();
-      expect(lookups, ['Sökbar svensk text.']);
+      expect(translations, ['Sökbar svensk text.']);
+      expect(lookups, isEmpty);
+      expect(find.textContaining('Searchable Swedish text.'), findsOneWidget);
+      await tester.tap(find.text('Close'));
+      await tester.pumpAndSettle();
       expect(find.byType(TextField), findsNothing);
-      expect(find.text('Search'), findsNothing);
+      expect(find.text('Translate'), findsNothing);
       expect(platform.controller.loadedUrls, ['cupitor-epub://chapter/0']);
       await tester.tap(find.byTooltip('More'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Open lookup dialog'));
       await tester.pumpAndSettle();
-      expect(lookups, ['Sökbar svensk text.', '']);
+      expect(lookups, ['']);
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump();
     },

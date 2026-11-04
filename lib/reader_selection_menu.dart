@@ -11,7 +11,7 @@ class ReaderSelectionMenu extends StatelessWidget {
     required this.foreground,
     required this.onDismiss,
     required this.onLookup,
-    required this.onSearch,
+    required this.onTranslate,
     required this.onHighlight,
     required this.onNote,
     required this.onCopy,
@@ -22,7 +22,7 @@ class ReaderSelectionMenu extends StatelessWidget {
   final Color foreground;
   final VoidCallback onDismiss;
   final VoidCallback onLookup;
-  final VoidCallback onSearch;
+  final VoidCallback onTranslate;
   final VoidCallback onHighlight;
   final VoidCallback onNote;
   final VoidCallback onCopy;
@@ -48,8 +48,8 @@ class ReaderSelectionMenu extends StatelessWidget {
             padding: const EdgeInsets.all(4),
             child: Row(
               children: [
-                _button(Icons.translate, 'Lookup', onLookup),
-                _button(Icons.travel_explore, 'Search', onSearch),
+                _button(Icons.menu_book_outlined, 'Lookup', onLookup),
+                _button(Icons.translate, 'Translate', onTranslate),
                 _button(Icons.brush, 'Highlight', onHighlight),
                 _button(Icons.sticky_note_2_outlined, 'Note', onNote),
                 _button(Icons.copy, 'Copy', onCopy),
