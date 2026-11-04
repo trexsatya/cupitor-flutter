@@ -4113,6 +4113,27 @@ $chapterHtml
     var w = wordAt(range.startContainer, range.startOffset);
     vlog('[epub] lookup: wordAt=' + (w ? w.word : 'null'));
     if (!w) { post({ type: 'tapBackground' }); return; }
+    // caretRangeFromPoint returns the NEAREST insertion point, including
+    // clicks in whitespace. A lookup is only intentional when the pointer
+    // really lies over the rendered word. Test the word's glyph rectangle(s)
+    // rather than the caret (which has zero width).
+    var onGlyph = false;
+    try {
+      var wordRange = document.createRange();
+      wordRange.setStart(w.node, w.start);
+      wordRange.setEnd(w.node, w.end);
+      var rects = wordRange.getClientRects();
+      for (var ri = 0; ri < rects.length; ri++) {
+        var rect = rects[ri];
+        if (rect.width > 0 && rect.height > 0 &&
+            x >= rect.left - 1 && x <= rect.right + 1 &&
+            y >= rect.top - 1 && y <= rect.bottom + 1) {
+          onGlyph = true;
+          break;
+        }
+      }
+    } catch (e) {}
+    if (!onGlyph) { post({ type: 'tapBackground' }); return; }
     // Compute a context excerpt: ~100 chars on each side, joined from the
     // node and its siblings up to a sentence break.
     var ctx = '';
