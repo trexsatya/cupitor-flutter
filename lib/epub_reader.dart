@@ -5157,12 +5157,13 @@ $chapterHtml
     _clearSelection();
     final translate = widget.onTranslate;
     if (translate == null || !mounted) return;
+    final translation = translate(text);
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Translate'),
         content: FutureBuilder<String>(
-          future: translate(text),
+          future: translation,
           builder: (ctx, snapshot) {
             if (snapshot.hasError) {
               return SelectableText('Could not translate: ${snapshot.error}');
@@ -5172,7 +5173,7 @@ $chapterHtml
                 child: Center(child: CircularProgressIndicator()));
             }
             return SingleChildScrollView(
-              child: SelectableText('$text\\n\\n${snapshot.data}'),
+              child: SelectableText('$text\n\n${snapshot.data}'),
             );
           },
         ),
