@@ -15,6 +15,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
@@ -49,6 +50,15 @@ import 'text_transform.dart';
 import 'mac_webview.dart';
 import 'page_cursor.dart';
 import 'reader_selection_menu.dart';
+
+// WebKit on macOS does not register cupitor-epub:// as a loadable URL
+// scheme. HTML is injected locally, with images and fonts already inlined;
+// the reserved .invalid origin supplies a conventional base URL without
+// requiring a network server. Keep the existing base on other platforms.
+String epubChapterBaseUrl(int idx, {bool? macOS}) =>
+    (macOS ?? Platform.isMacOS)
+        ? 'https://reader.cupitor.invalid/chapter/$idx/'
+        : 'cupitor-epub://chapter/$idx';
 
 // ─── Library: previously-opened EPUBs ────────────────────────────────────
 // Persisted in SharedPreferences under `epub_library` as a JSON list. We
@@ -342,7 +352,11 @@ class EpubBook {
   static Future<EpubBook> openFile(File file) async {
     final bytes = await file.readAsBytes();
     final key = sha1.convert(bytes).toString();
-    return _parse(bytes, key, file.path);
+    final path = file.path;
+    // ZipDecoder and XML/HTML rewriting are CPU-intensive and previously ran
+    // synchronously on the Flutter UI isolate despite _parse being async.
+    // Large books could freeze the Mac window before the reader appeared.
+    return Isolate.run(() => _parse(bytes, key, path));
   }
 
   static Future<EpubBook> _parse(Uint8List bytes, String key, String filePath) async {
@@ -1135,7 +1149,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     final ch = book.chapters[idx];
     final html = _wrapChapter(ch);
     _state.chapterIdx = idx;
-    await _controller?.loadHtmlString(html, baseUrl: 'cupitor-epub://chapter/$idx');
+    await _controller?.loadHtmlString(html, baseUrl: epubChapterBaseUrl(idx));
     // Wait for the page to lay out, then scroll to remembered position.
     if (restoreScroll && _state.scrollPct > 0) {
       Future<void>.delayed(const Duration(milliseconds: 350), () async {
@@ -1164,7 +1178,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
         if (h > 0) _state.scrollPct = (y / h).clamp(0.0, 1.0);
       }
     } catch (_) {}
-    await _controller?.loadHtmlString(html, baseUrl: 'cupitor-epub://chapter/${_state.chapterIdx}');
+    await _controller?.loadHtmlString(html, baseUrl: epubChapterBaseUrl(_state.chapterIdx));
     Future<void>.delayed(const Duration(milliseconds: 250), () async {
       await _controller?.runJavaScript(
         'window.__cupEpubRestoreScroll && window.__cupEpubRestoreScroll(${_state.scrollPct});',
