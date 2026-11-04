@@ -864,6 +864,7 @@ Future<void> openEpubReader(
   required File file,
   required EpubLibrary library,
   required void Function(String word, String context) onLookup,
+  Future<String> Function(String text)? onTranslate,
   String? initialHighlight,
   Future<String?> Function({
     required String text,
@@ -894,6 +895,7 @@ Future<void> openEpubReader(
     builder: (_) => EpubReaderScreen(
       book: book,
       onLookup: onLookup,
+      onTranslate: onTranslate,
       initialHighlight: initialHighlight,
       onSendToPlaylist: onSendToPlaylist,
     ),
@@ -908,12 +910,14 @@ class EpubReaderScreen extends StatefulWidget {
     super.key,
     required this.book,
     required this.onLookup,
+    this.onTranslate,
     this.initialHighlight,
     this.onSendToPlaylist,
   });
 
   final EpubBook book;
   final void Function(String word, String context) onLookup;
+  final Future<String> Function(String text)? onTranslate;
 
   /// Sends one sentence to the language webapp to be filed in a playlist.
   /// Lives in the host because only it holds the webapp's WebView. Null
@@ -5129,7 +5133,7 @@ $chapterHtml
       _clearSelection();
       widget.onLookup(text, '');
     },
-    onSearch: _searchSelection,
+    onTranslate: _translateSelection,
     onHighlight: _addHighlightFromSelection,
     onNote: () async {
       final note = await _promptForNote();
@@ -5147,11 +5151,37 @@ $chapterHtml
     },
   );
 
-  void _searchSelection() {
-    final text = _selectionText;
+  Future<void> _translateSelection() async {
+    final text = _selectionText.trim();
     if (text.isEmpty) return;
     _clearSelection();
-    widget.onLookup(text, '');
+    final translate = widget.onTranslate;
+    if (translate == null || !mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Translate'),
+        content: FutureBuilder<String>(
+          future: translate(text),
+          builder: (ctx, snapshot) {
+            if (snapshot.hasError) {
+              return SelectableText('Could not translate: ${snapshot.error}');
+            }
+            if (!snapshot.hasData) {
+              return const SizedBox(height: 48,
+                child: Center(child: CircularProgressIndicator()));
+            }
+            return SingleChildScrollView(
+              child: SelectableText('$text\\n\\n${snapshot.data}'),
+            );
+          },
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Close')),
+        ],
+      ),
+    );
   }
 
   Widget _buildBookSearchOverlay(_ThemeColors theme) {
