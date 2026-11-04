@@ -4586,6 +4586,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // pre-fill a "context" field.
         _openDialogWithWebview(word);
       },
+      onTranslate: (text) => _translateText(text, 'auto', 'en'),
       onSendToPlaylist: ({required text, required title, required url}) =>
           _sendSentenceToWebappPlaylist(text: text, title: title, url: url),
     );
