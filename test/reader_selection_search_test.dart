@@ -58,6 +58,13 @@ class _Platform extends WebViewPlatform {
 }
 
 void main() {
+  test('EPUB chapter origins use an HTTPS base on Mac and retain other platforms', () {
+    expect(epubChapterBaseUrl(4, macOS: true),
+        'https://reader.cupitor.invalid/chapter/4/');
+    expect(epubChapterBaseUrl(4, macOS: false),
+        'cupitor-epub://chapter/4');
+  });
+
   testWidgets(
     'Translate selected text without triggering a lookup',
     (tester) async {
@@ -114,7 +121,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.byType(TextField), findsNothing);
       expect(find.text('Translate'), findsNothing);
-      expect(platform.controller.loadedUrls, ['cupitor-epub://chapter/0']);
+      expect(platform.controller.loadedUrls, [epubChapterBaseUrl(0)]);
       await tester.tap(find.byTooltip('More'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Open lookup dialog'));
