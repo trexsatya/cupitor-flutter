@@ -38,7 +38,7 @@ void main() {
     foreground: const Color(0xFF202124),
     onDismiss: () => calls.add('dismiss'),
     onLookup: () => calls.add('lookup'),
-    onSearch: () => calls.add('search'),
+    onTranslate: () => calls.add('translate'),
     onHighlight: () => calls.add('highlight'),
     onNote: () => calls.add('note'),
     onCopy: () => calls.add('copy'),
@@ -103,14 +103,14 @@ void main() {
   }
 
   testWidgets(
-    'Search and all existing actions dispatch the correct callbacks',
+    'Translate and all reader actions dispatch the correct callbacks',
     (tester) async {
       await pump(tester);
-      for (final label in ['Lookup', 'Search', 'Highlight', 'Note', 'Copy']) {
+      for (final label in ['Lookup', 'Translate', 'Highlight', 'Note', 'Copy']) {
         await tester.tap(find.text(label));
         await tester.pump();
       }
-      expect(calls, ['lookup', 'search', 'highlight', 'note', 'copy']);
+      expect(calls, ['lookup', 'translate', 'highlight', 'note', 'copy']);
       await tester.tapAt(const Offset(5, 190));
       expect(calls.last, 'dismiss');
     },
@@ -145,7 +145,7 @@ void main() {
     try {
       if (output != null) debugDisableShadows = false;
       await pump(tester);
-      expect(find.text('Search'), findsOneWidget);
+      expect(find.text('Translate'), findsOneWidget);
       if (output != null) {
         await tester.runAsync(() async {
           final boundary =
