@@ -113,6 +113,9 @@ void notifWorkmanagerDispatcher() {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // The sentence-tagging and playlist databases use SQLite FFI on macOS.
+  // Install the desktop factory before services can open a database.
+  initializeSqliteForPlatform();
   // Hydrate the E-ink toggle from SharedPreferences before the first
   // frame so `einkMode.value` is correct when the shell + any restored
   // route (EPUB reader) build. Fire-and-forget — the default (`true`)
@@ -698,14 +701,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _warmAndInstallFrameScript();
     _permsChannel.setMethodCallHandler(_handlePermsCall);
     _installRenderGuardSoon();
-    // Notification delivery must init on EVERY platform (Windows/web/Linux
-    // included), unlike the sentence-tagging DB probe below which is
-    // Android||iOS only — see _initNotifDelivery's doc comment.
+    // Notification delivery must init on every supported platform,
+    // including those where the sentence-tagging database is unavailable.
     _initNotifDelivery();
     _studyCallHistoryBridge.start();
     // Probe sentence-tagging DB readiness in the background. The toolbar
     // tiles check this flag and hide themselves if the open failed (e.g.
-    // on macOS host where sqflite isn't wired up).
+    // if native/FFI SQLite initialization failed).
     if (isSqlitePlatform) {
       CupitorDb.instance.isReady().then((ok) async {
         if (!mounted) return;
