@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'notif/notif_dao.dart';
 import 'notif/schedules.dart' show builtinSchedules;
@@ -73,6 +74,7 @@ class CupitorDb {
   /// rule). All DAO methods do this check internally and silently no-op.
   Future<Database?> _open() async {
     if (_failed) return null;
+    initializeSqliteForPlatform();
     if (_db != null) return _db;
     try {
       final dir = await getApplicationDocumentsDirectory();
@@ -1916,7 +1918,16 @@ Map<String, String> canonSelfTest() {
   return out;
 }
 
-/// Pretty toolbar/platform check: are we on a platform sqflite supports?
-/// Android is fine; macOS host needs sqflite_common_ffi which we
-/// deliberately did not include. Used to hide toolbar buttons on host.
-bool get isSqlitePlatform => Platform.isAndroid || Platform.isIOS;
+/// Register the FFI SQLite factory before any database opens on macOS.
+/// Android/iOS retain the native sqflite platform implementation.
+bool _macSqliteInitialized = false;
+void initializeSqliteForPlatform() {
+  if (!Platform.isMacOS || _macSqliteInitialized) return;
+  sqfliteFfiInit();
+  databaseFactory = databaseFactoryFfi;
+  _macSqliteInitialized = true;
+}
+
+/// Sentence tagging, profiles, and playlists can use SQLite on these hosts.
+bool get isSqlitePlatform =>
+    Platform.isAndroid || Platform.isIOS || Platform.isMacOS;
