@@ -1079,7 +1079,6 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     final ctrl = WebViewController()
       ..configureForMac()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setBackgroundColor(_themeBg(_state.theme))
       ..addJavaScriptChannel('CupEpub', onMessageReceived: _onJsMessage)
       // Sentence-tagging bridges — same protocol as the main WebView so
       // the Dart-side capture sheet and DB layer can be shared.
@@ -1096,6 +1095,13 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
           JsLogSink.add(raw.substring(0, pipe), raw.substring(pipe + 1));
         }
       });
+    // webview_flutter_wkwebview's macOS implementation throws
+    // UnimplementedError('opaque is not implemented on macOS') from
+    // setBackgroundColor. The chapter HTML/CSS and Flutter Scaffold already
+    // provide the themed background on macOS.
+    if (!Platform.isMacOS) {
+      await ctrl.setBackgroundColor(_themeBg(_state.theme));
+    }
     if (isSqlitePlatform) {
       CupitorDb.instance.isReady().then((ok) async {
         if (!mounted) return;
@@ -5027,7 +5033,12 @@ $chapterHtml
                               _state.theme = t;
                               setSheet(() {});
                               if (mounted) setState(() {});
-                              _controller?.setBackgroundColor(_themeBg(t));
+                              // macOS WKWebView cannot set native opacity/
+                              // background color; the HTML theme is updated
+                              // by _rerenderForSettings instead.
+                              if (!Platform.isMacOS) {
+                                _controller?.setBackgroundColor(_themeBg(t));
+                              }
                               _rerenderForSettings();
                               _scheduleSave();
                             },
