@@ -956,6 +956,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
   late EpubReadingState _state;
   WebViewController? _controller;
   bool _ready = false;
+  String? _readerLoadError;
   bool _chromeVisible = true;
   Timer? _chromeHideTimer;
   static const Duration _chromeIdleHide = Duration(seconds: 5);
@@ -1024,7 +1025,10 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     if (_pendingHighlight != null && _pendingHighlight!.isEmpty) {
       _pendingHighlight = null;
     }
-    _bootstrap();
+    _bootstrap().catchError((Object error, StackTrace stack) {
+      JsLogSink.add('error', 'EPUB reader initialization failed: $error\n$stack');
+      if (mounted) setState(() => _readerLoadError = error.toString());
+    });
     // Hide the chrome shortly after the reader opens so the page starts
     // distraction-free; any scroll or center-tap brings it back.
     _scheduleChromeHide();
@@ -1129,6 +1133,10 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
       }
     }
     if (!mounted) return;
+    // Native WKWebView configuration is asynchronous on macOS. Do not race
+    // its setup against loading the first chapter.
+    await ctrl.macConfigurationReady.timeout(const Duration(seconds: 10));
+    if (!mounted) return;
     _controller = ctrl;
     setState(() => _ready = true);
     // When opened via a deep-link highlight (global search / webapp
@@ -1149,7 +1157,18 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     final ch = book.chapters[idx];
     final html = _wrapChapter(ch);
     _state.chapterIdx = idx;
-    await _controller?.loadHtmlString(html, baseUrl: epubChapterBaseUrl(idx));
+    try {
+      await _controller?.loadHtmlString(html, baseUrl: epubChapterBaseUrl(idx))
+          .timeout(const Duration(seconds: 20));
+    } catch (error, stack) {
+      JsLogSink.add('error', 'EPUB chapter ${idx + 1} failed to load: $error\n$stack');
+      if (mounted) setState(() => _readerLoadError =
+          'Could not display chapter ${idx + 1}: $error');
+      return;
+    }
+    if (_readerLoadError != null && mounted) {
+      setState(() => _readerLoadError = null);
+    }
     // Wait for the page to lay out, then scroll to remembered position.
     if (restoreScroll && _state.scrollPct > 0) {
       Future<void>.delayed(const Duration(milliseconds: 350), () async {
@@ -4498,6 +4517,29 @@ $chapterHtml
 
   @override
   Widget build(BuildContext context) {
+    if (_readerLoadError != null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Could not open book')),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.error_outline, size: 40),
+                const SizedBox(height: 12),
+                SelectableText(_readerLoadError!, textAlign: TextAlign.center),
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Back to library'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
     if (!_ready || _controller == null) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
