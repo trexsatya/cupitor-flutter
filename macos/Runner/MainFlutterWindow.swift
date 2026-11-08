@@ -4,6 +4,19 @@ import WebKit
 import webview_flutter_wkwebview
 
 class MainFlutterWindow: NSWindow {
+  // Native WKWebView text input handles key equivalents before Flutter sees
+  // them. Catch Cmd+F at window level so Find works even with the page focused.
+  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+    if event.type == .keyDown && !event.isARepeat &&
+        modifiers == .command &&
+        event.charactersIgnoringModifiers?.lowercased() == "f" {
+      webviewChannel?.invokeMethod("findShortcut", arguments: nil)
+      return true
+    }
+    return super.performKeyEquivalent(with: event)
+  }
+
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
     let windowFrame = self.frame
