@@ -1407,14 +1407,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         _closeFindBar();
         return true;
       }
-      final enterDirection = _findFocusNode.hasFocus
-          ? findEnterDirection(event.logicalKey,
-              shiftPressed: keyboard.isShiftPressed)
-          : 0;
-      if (enterDirection != 0) {
-        _findInPage(_findController.text, forward: enterDirection > 0);
-        return true;
-      }
+      // The focused TextField handles Enter itself. Handling it again here
+      // would advance two matches when both keyboard listeners receive it.
       final direction = findNavigationDirection(
         key: event.logicalKey,
         metaPressed: keyboard.isMetaPressed,
@@ -1917,7 +1911,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
     _findMatchState.value =
         const FindMatchState(current: 0, total: 0, searching: true);
-    _findSearchDebounce = Timer(const Duration(milliseconds: 110), () {
+    _findSearchDebounce = Timer(const Duration(milliseconds: 170), () {
       _findInPage(query, navigate: false);
     });
   }
