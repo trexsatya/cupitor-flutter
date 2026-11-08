@@ -4,11 +4,23 @@ import WebKit
 import webview_flutter_wkwebview
 
 class MainFlutterWindow: NSWindow {
+  // An embedded WKContentView may be the first responder rather than its
+  // enclosing WKWebView. Walk the view ancestry to find the actual owner.
+  // Do not consume Cmd+F from Flutter-only screens such as the EPUB reader.
+  private var webViewHasFocus: Bool {
+    var view = firstResponder as? NSView
+    while let current = view {
+      if current is WKWebView { return true }
+      view = current.superview
+    }
+    return false
+  }
+
   // Native WKWebView text input handles key equivalents before Flutter sees
-  // them. Catch Cmd+F at window level so Find works even with the page focused.
+  // them. Catch Cmd+F only when a page has focus; Flutter handles its own keys.
   override func performKeyEquivalent(with event: NSEvent) -> Bool {
     let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
-    if event.type == .keyDown && !event.isARepeat &&
+    if webViewHasFocus && event.type == .keyDown && !event.isARepeat &&
         modifiers == .command &&
         event.charactersIgnoringModifiers?.lowercased() == "f" {
       webviewChannel?.invokeMethod("findShortcut", arguments: nil)
