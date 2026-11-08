@@ -41,6 +41,7 @@ import 'local_subtitles.dart';
 import 'stable_dialog_chrome.dart';
 import 'dialog_app_lifecycle.dart';
 import 'mac_webview.dart';
+import 'find_page_shortcut.dart';
 import 'history_store.dart';
 import 'history_screen.dart';
 import 'speech_session.dart';
@@ -328,7 +329,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   bool get _autoHideAppBar => Platform.isAndroid || Platform.isMacOS;
   String? _githubToken;
   int _pdfTextFontSize = 15;
-  bool _showFindBar = false;
+  // Root overlay stays above dialog routes and native WebView platform views.
+  OverlayEntry? _findOverlay;
+  WebViewController? _findTarget;
+  final FocusNode _findFocusNode = FocusNode();
+  final List<String> _visibleDialog2Ids = [];
   bool _urlBarFocused = false;
   String _pdfSelectedText = '';
   // The one process-wide recognizer. Reached through SpeechHub so the
@@ -545,7 +550,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _dialogAppLifecycle.dispose();
     SpeechHub.release(_speechHubListener);
     _videoNotePoller.dispose();
+    HardwareKeyboard.instance.removeHandler(_onFindPageKey);
     HardwareKeyboard.instance.removeHandler(_onMacFullscreenEscape);
+    _findOverlay?.remove();
+    _findOverlay?.dispose();
+    _findOverlay = null;
+    _findFocusNode.dispose();
     _notifTimer.stop();
     WakelockPlus.disable();
     _adBlockChannel.setMethodCallHandler(null); // stop receiving callbacks
@@ -656,7 +666,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       if (mounted && ctrl != null) await ctrl.runJavaScript(script);
     });
     WakelockPlus.enable();
-    onMacWindowExitedFullscreen(() => _setMacPageFullscreen(false));
+    onMacWindowExitedFullscreen(
+      () => _setMacPageFullscreen(false),
+      onFindShortcut: () {
+        if (_isControllerReady && _hasVisibleWebViewForFind()) {
+          _showFindFor(_visiblePageForFind());
+        }
+      },
+    );
+    HardwareKeyboard.instance.addHandler(_onFindPageKey);
     HardwareKeyboard.instance.addHandler(_onMacFullscreenEscape);
     // Record why we died last time — a system kill leaves no crash report at
     // all, so this log is the only evidence such a death ever happened. Runs
@@ -827,6 +845,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('SelectionChannel', onMessageReceived: (_) {
           if (_autoHideAppBar && !_showAppBar) _showAppBarWithTimer();
         })
+        ..addJavaScriptChannel('FindInPageShortcut', onMessageReceived: (_) {
+          if (identical(c, _controller)) _showFindFor(c);
+        })
         // Page-side fallback for app-bar gestures. On macOS the WKWebView is
         // a native NSView that swallows pointer events before Flutter's
         // Listener can see them, so the Flutter-level double-tap / long-press
@@ -988,6 +1009,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               _injectRemoteSnippetEarly();
             },
             onPageFinished: (url) {
+              _injectFindShortcut(c);
               if (identical(c, _controller)) _pageLoading.finished();
               if (_isShowingOurHtml) {
                 _injectJs(); // only need word-click JS on our own text page
@@ -1342,6 +1364,56 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   void _onWebFullscreenChange(JavaScriptMessage msg) {
     if (Platform.isMacOS) _setMacPageFullscreen(msg.message == 'mac-enter');
     if (Platform.isAndroid) _setVideoLandscape(msg.message == 'landscape');
+  }
+
+  bool _hasVisibleWebViewForFind() {
+    if (_visibleDialog2Ids.any((id) =>
+        !_minimizedDialog2s.contains(id) && _dialog2Controllers[id] != null)) {
+      return true;
+    }
+    if (_dialog1Visible && dialogController != null) return true;
+    // A PDF is displayed by a Flutter overlay, not the hidden browser behind it.
+    if (_currentPdfUrl != null && !_isTextView) return false;
+    // Other Flutter routes (EPUB reader, settings, etc.) must own their keys.
+    return ModalRoute.of(context)?.isCurrent ?? false;
+  }
+
+  WebViewController _visiblePageForFind() {
+    // Native macOS key equivalents go to the window, not the WebView.
+    // Resolve the topmost visible dialog rather than a minimized controller.
+    for (final id in _visibleDialog2Ids.reversed) {
+      if (_minimizedDialog2s.contains(id)) continue;
+      final ctrl = _dialog2Controllers[id];
+      if (ctrl != null) return ctrl;
+    }
+    if (_dialog1Visible && dialogController != null) return dialogController!;
+    return _controller;
+  }
+
+  bool _onFindPageKey(KeyEvent event) {
+    if (!_isControllerReady ||
+        !(Platform.isMacOS || Platform.isWindows || Platform.isLinux) ||
+        event is! KeyDownEvent) return false;
+    if (event.logicalKey == LogicalKeyboardKey.escape && _findOverlay != null) {
+      _closeFindBar();
+      return true;
+    }
+    final keyboard = HardwareKeyboard.instance;
+    if (!isDesktopFindShortcut(
+      key: event.logicalKey,
+      metaPressed: keyboard.isMetaPressed,
+      controlPressed: keyboard.isControlPressed,
+      altPressed: keyboard.isAltPressed,
+      shiftPressed: keyboard.isShiftPressed,
+    )) return false;
+    if (!_hasVisibleWebViewForFind()) return false;
+    _showFindFor(_visiblePageForFind());
+    return true;
+  }
+
+  void _injectFindShortcut(WebViewController controller) {
+    if (!(Platform.isMacOS || Platform.isWindows || Platform.isLinux)) return;
+    controller.runJavaScript(kDesktopFindShortcutJs).catchError((Object _) {});
   }
 
   /// Esc while a Flutter widget (a floating chip, say) holds keyboard focus;
@@ -1785,13 +1857,94 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String _esc(String s) =>
       s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 
+  /// A single Find control shared by the browser and all popup WebViews.
+  /// Its root overlay stays above Flutter's Navigator dialog routes.
+  void _showFindFor(WebViewController controller) {
+    if (!mounted) return;
+    if (_findOverlay != null && !identical(_findTarget, controller)) {
+      _clearFindHighlights();
+      _findController.clear();
+    }
+    _findTarget = controller;
+    if (_findOverlay == null) {
+      _findOverlay = OverlayEntry(builder: (overlayContext) {
+        final media = MediaQuery.of(overlayContext);
+        return Positioned(
+          top: media.padding.top + 8,
+          right: 10,
+          child: Material(
+            elevation: 8,
+            borderRadius: BorderRadius.circular(8),
+            clipBehavior: Clip.antiAlias,
+            child: SizedBox(
+              width: math.min(430.0, media.size.width - 20),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                child: Row(children: [
+                  Expanded(child: TextField(
+                    controller: _findController,
+                    focusNode: _findFocusNode,
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      hintText: 'Find in page...',
+                      isDense: true,
+                      contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                      border: OutlineInputBorder(),
+                    ),
+                    onSubmitted: (q) => _findInPage(q),
+                    textInputAction: TextInputAction.search,
+                  )),
+                  IconButton(
+                    tooltip: 'Previous match',
+                    icon: const Icon(Icons.keyboard_arrow_up, size: 20),
+                    onPressed: () => _findInPage(_findController.text, forward: false),
+                  ),
+                  IconButton(
+                    tooltip: 'Next match',
+                    icon: const Icon(Icons.keyboard_arrow_down, size: 20),
+                    onPressed: () => _findInPage(_findController.text),
+                  ),
+                  IconButton(
+                    tooltip: 'Close Find (Esc)',
+                    icon: const Icon(Icons.close, size: 20),
+                    onPressed: _closeFindBar,
+                  ),
+                ]),
+              ),
+            ),
+          ),
+        );
+      });
+      Overlay.of(context, rootOverlay: true).insert(_findOverlay!);
+      setState(() {});
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _findOverlay == null) return;
+      _findFocusNode.requestFocus();
+      _findController.selection = TextSelection(
+        baseOffset: 0, extentOffset: _findController.text.length);
+    });
+  }
+
+  void _closeFindBar() {
+    if (_findOverlay == null) return;
+    _findOverlay!.remove();
+    _findOverlay!.dispose();
+    _findOverlay = null;
+    _findFocusNode.unfocus();
+    _clearFindHighlights();
+    _findController.clear();
+    _findTarget = null;
+    if (mounted) setState(() {});
+  }
+
   void _findInPage(String query, {bool forward = true}) {
     if (query.isEmpty) {
       _clearFindHighlights();
       return;
     }
     final jsStr = jsonEncode(query);
-    _controller.runJavaScript('''
+    (_findTarget ?? _controller).runJavaScript('''
       (function() {
         // If query changed, rebuild highlights
         if (window._findQuery !== $jsStr) {
@@ -1843,7 +1996,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   void _clearFindHighlights() {
-    _controller.runJavaScript('''
+    (_findTarget ?? _controller).runJavaScript('''
       (function() {
         document.querySelectorAll('mark._fh').forEach(function(m) {
           var p = m.parentNode;
@@ -5170,6 +5323,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       ..setUserAgent(_userAgent)
       ..addJavaScriptChannel('FilmotBridge', onMessageReceived: (msg) => _handleFilmotMessage(dialogIdForBridge, msg.message))
       ..addJavaScriptChannel('WiktCollect', onMessageReceived: (msg) => _handleWiktCollectMessage(msg.message))
+      ..addJavaScriptChannel('FindInPageShortcut', onMessageReceived: (_) {
+        if (identical(_dialog2Controllers[dialogIdForBridge], dialog2Controller)) {
+          _showFindFor(dialog2Controller);
+        }
+      })
       ..addJavaScriptChannel('LinkLongPress', onMessageReceived: (msg) => _handleLinkLongPress(msg.message))
       // Shared log sink — without it the scroll probe's output from this
       // WebView would be thrown away by its own try/catch.
@@ -5195,6 +5353,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           }
         },
         onPageFinished: (finishedUrl) {
+          _injectFindShortcut(dialog2Controller);
           _injectAdBlocker(dialog2Controller);
           _injectYouTubeAdBlocker(dialog2Controller);
           dialog2Controller.runJavaScript(_linkLongPressJs);
@@ -5253,6 +5412,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (controller == null || errorNotifier == null || url == null) return;
 
     _minimizedDialog2s.remove(dialogId); // Mark as not minimized
+    if (_findOverlay != null) _closeFindBar();
+    _visibleDialog2Ids.remove(dialogId);
+    _visibleDialog2Ids.add(dialogId);
     _bumpMinimizedVersion();
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
@@ -5289,6 +5451,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             child: _buildDialog2Content(ctx, dialogId, url, controller, errorNotifier, screenWidth, screenHeight),
           ),
     ).then((_) {
+      _visibleDialog2Ids.remove(dialogId);
+      if (identical(_findTarget, controller)) _closeFindBar();
       // Dialog closed - but keep controller alive to avoid reloading.
       // Only dispose error notifier if dialog was fully closed (not minimized).
       if (!_minimizedDialog2s.contains(dialogId)) {
@@ -8635,6 +8799,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // it's absent, so registering it is what turns the feature on.
         // Protocol: docs/speech-bridge-spec.md.
         ..addJavaScriptChannel('SpeechBridge', onMessageReceived: _handleSpeechBridge)
+        ..addJavaScriptChannel('FindInPageShortcut', onMessageReceived: (_) {
+          if (_dialog1Visible && identical(ctrl, dialogController)) _showFindFor(ctrl);
+        })
         ..addJavaScriptChannel('DialogChromeActivity', onMessageReceived: (_) {
           if (mounted && identical(ctrl, dialogController)) _dialog1ChromeActivity.value++;
         })
@@ -8727,6 +8894,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             },
             onPageFinished: (url) {
               if (!mounted || !identical(ctrl, dialogController)) return;
+              _injectFindShortcut(ctrl);
               _dialogAppLifecycle.sendCurrent();
               ctrl.runJavaScript(kDialogChromeActivityJs);
               _dialog1ChromeActivity.value++;
@@ -8829,6 +8997,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       return;
     }
     setState(() => _dialog1Minimized = false);
+    if (_findOverlay != null) _closeFindBar();
     _bumpMinimizedVersion();
     if (_dialog1BackgroundOnly) {
       _dialog1BackgroundOnly = false;
@@ -8908,6 +9077,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         );
       },
     ).then((_) {
+      if (identical(_findTarget, dialogController)) _closeFindBar();
       // Dialog closed - but keep controller alive to avoid reloading.
       // Controller will be cleaned up only when app is disposed or language changes.
       // This prevents unnecessary reloads when reopening the dialog.
@@ -11703,16 +11873,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               ),
         ]),
         IconButton(
-          icon: Icon(_showFindBar ? Icons.search_off : Icons.search),
-          tooltip: _showFindBar ? 'Close find' : 'Find in page',
+          icon: Icon(_findOverlay != null ? Icons.search_off : Icons.search),
+          tooltip: _findOverlay != null ? 'Close find' : 'Find in page (Cmd/Ctrl+F)',
           onPressed: () {
-            setState(() {
-              _showFindBar = !_showFindBar;
-              if (!_showFindBar) {
-                _findController.clear();
-                _clearFindHighlights();
-              }
-            });
+            if (_findOverlay != null) _closeFindBar();
+            else _showFindFor(_visiblePageForFind());
           },
         ),
         GestureDetector(
@@ -11924,58 +12089,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 child: SafeArea(
                   bottom: false,
                   child: appBar,
-                ),
-              ),
-            // Find-in-page bar
-            if (_showFindBar && !_webFullscreen)
-              Positioned(
-                top: _showAppBar ? kToolbarHeight + MediaQuery.of(context).padding.top : 0,
-                left: 0, right: 0,
-                child: Material(
-                  elevation: 4,
-                  child: Container(
-                    color: Colors.white,
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: _findController,
-                            autofocus: true,
-                            decoration: const InputDecoration(
-                              hintText: 'Find in page...',
-                              isDense: true,
-                              contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-                              border: OutlineInputBorder(),
-                            ),
-                            onSubmitted: (q) => _findInPage(q),
-                            textInputAction: TextInputAction.search,
-                          ),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.keyboard_arrow_up, size: 20),
-                          tooltip: 'Previous',
-                          onPressed: () => _findInPage(_findController.text, forward: false),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.keyboard_arrow_down, size: 20),
-                          tooltip: 'Next',
-                          onPressed: () => _findInPage(_findController.text),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.close, size: 20),
-                          tooltip: 'Close',
-                          onPressed: () {
-                            setState(() {
-                              _showFindBar = false;
-                              _findController.clear();
-                              _clearFindHighlights();
-                            });
-                          },
-                        ),
-                      ],
-                    ),
-                  ),
                 ),
               ),
             // Minimized-dialog chips live on the root overlay (see
