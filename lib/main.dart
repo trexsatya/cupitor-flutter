@@ -669,7 +669,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     onMacWindowExitedFullscreen(
       () => _setMacPageFullscreen(false),
       onFindShortcut: () {
-        if (_isControllerReady) _showFindFor(_visiblePageForFind());
+        if (_isControllerReady && _hasVisibleWebViewForFind()) {
+          _showFindFor(_visiblePageForFind());
+        }
       },
     );
     HardwareKeyboard.instance.addHandler(_onFindPageKey);
@@ -1364,6 +1366,18 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (Platform.isAndroid) _setVideoLandscape(msg.message == 'landscape');
   }
 
+  bool _hasVisibleWebViewForFind() {
+    if (_visibleDialog2Ids.any((id) =>
+        !_minimizedDialog2s.contains(id) && _dialog2Controllers[id] != null)) {
+      return true;
+    }
+    if (_dialog1Visible && dialogController != null) return true;
+    // A PDF is displayed by a Flutter overlay, not the hidden browser behind it.
+    if (_currentPdfUrl != null && !_isTextView) return false;
+    // Other Flutter routes (EPUB reader, settings, etc.) must own their keys.
+    return ModalRoute.of(context)?.isCurrent ?? false;
+  }
+
   WebViewController _visiblePageForFind() {
     // Native macOS key equivalents go to the window, not the WebView.
     // Resolve the topmost visible dialog rather than a minimized controller.
@@ -1392,6 +1406,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       altPressed: keyboard.isAltPressed,
       shiftPressed: keyboard.isShiftPressed,
     )) return false;
+    if (!_hasVisibleWebViewForFind()) return false;
     _showFindFor(_visiblePageForFind());
     return true;
   }
