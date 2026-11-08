@@ -56,11 +56,12 @@ int findNavigationDirection({
 }
 
 class FindMatchState {
-  const FindMatchState({required this.current, required this.total});
+  const FindMatchState({required this.current, required this.total, this.searching = false});
   final int current;
   final int total;
+  final bool searching;
 
-  String get label => total == 0 ? 'No matches' : '$current of $total';
+  String get label => searching ? 'Searching…' : total == 0 ? 'No matches' : '$current of $total';
 
   static const empty = FindMatchState(current: 0, total: 0);
 }
@@ -79,7 +80,7 @@ FindMatchState parseFindMatchState(Object? raw) {
   final total = (value['total'] as num?)?.toInt() ?? 0;
   final current = (value['current'] as num?)?.toInt() ?? 0;
   if (total <= 0) return FindMatchState.empty;
-  return FindMatchState(current: current.clamp(1, total), total: total);
+  return FindMatchState(current: current.clamp(1, total).toInt(), total: total);
 }
 
 /// Search the displayed document without moving keyboard focus out of the
