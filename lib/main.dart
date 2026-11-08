@@ -1449,15 +1449,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     try {
       bool handled = false;
       try {
-        final result = await target.runJavaScriptReturningResult(r'''
-          (function() {
-            var api = document.getElementById('cupPageFindBar')?.__cupPageFind;
-            if (!api || typeof api.open !== 'function') return 'not-handled';
-            api.open();
-            return 'cupitor-web-find-opened';
-          })()
-        ''').timeout(const Duration(milliseconds: 700));
-        handled = result.toString().contains('cupitor-web-find-opened');
+        final result = await target.runJavaScriptReturningResult(
+          kEmbeddedCupitorFindProbeJs,
+        ).timeout(const Duration(milliseconds: 700));
+        handled = embeddedPageHandledFind(result);
       } catch (_) {
         // Third-party pages and old Cupitor deployments are not expected
         // to expose the embedded Find API. Use the native bar as before.
