@@ -21,6 +21,55 @@ void main() {
       key: LogicalKeyboardKey.keyF, metaPressed: false, controlPressed: true, altPressed: true), isFalse);
   });
 
+  test('Enter and Shift+Enter navigate forward/backward', () {
+    expect(findEnterDirection(LogicalKeyboardKey.enter), 1);
+    expect(findEnterDirection(LogicalKeyboardKey.numpadEnter), 1);
+    expect(findEnterDirection(LogicalKeyboardKey.enter, shiftPressed: true), -1);
+    expect(findEnterDirection(LogicalKeyboardKey.numpadEnter, shiftPressed: true), -1);
+    expect(findEnterDirection(LogicalKeyboardKey.keyF, shiftPressed: true), 0);
+  });
+
+  test('F3 and Cmd/Ctrl+G support next/previous, without hijacking other keys', () {
+    expect(findNavigationDirection(
+      key: LogicalKeyboardKey.f3, metaPressed: false, controlPressed: false), 1);
+    expect(findNavigationDirection(
+      key: LogicalKeyboardKey.f3, metaPressed: false, controlPressed: false,
+      shiftPressed: true), -1);
+    expect(findNavigationDirection(
+      key: LogicalKeyboardKey.keyG, metaPressed: true, controlPressed: false), 1);
+    expect(findNavigationDirection(
+      key: LogicalKeyboardKey.keyG, metaPressed: false, controlPressed: true,
+      shiftPressed: true), -1);
+    expect(findNavigationDirection(
+      key: LogicalKeyboardKey.keyG, metaPressed: false, controlPressed: false), 0);
+    expect(findNavigationDirection(
+      key: LogicalKeyboardKey.keyG, metaPressed: true, controlPressed: false,
+      altPressed: true), 0);
+  });
+
+  test('match counter handles WebKit, Android and no-results responses', () {
+    expect(parseFindMatchState('{"current":2,"total":7}').label, '2 of 7');
+    expect(parseFindMatchState('"{\\"current\\":3,\\"total\\":5}"').label, '3 of 5');
+    expect(parseFindMatchState(<String, int>{'current': 6, 'total': 6}).label, '6 of 6');
+    expect(parseFindMatchState('{"current":0,"total":0}').label, 'No matches');
+    expect(parseFindMatchState('broken').label, 'No matches');
+    expect(parseFindMatchState('{"current":100,"total":3}').label, '3 of 3');
+    expect(const FindMatchState(current:0,total:0,searching:true).label, 'Searching…');
+  });
+
+  test('Find JS wraps, highlights active match and excludes editable controls', () {
+    final script = pageFindJavaScript('foo"\\\\bar', navigate: false);
+    expect(script, contains('var navigate = false;'));
+    expect(script, contains('var forward = true;'));
+    expect(script, contains('window._findMarks'));
+    expect(script, contains("box-shadow', '0 0 0 2px #155eef'"));
+    expect(script, contains('[contenteditable="true"]'));
+    expect(script, contains('current.scrollIntoView'));
+    expect(pageFindJavaScript('foo', forward: false),
+      contains('var forward = false;'));
+    expect(kClearFindJavaScript, contains("window._findQuery = '';"));
+  });
+
   test('web view fallback detects both platform modifiers', () {
     expect(kDesktopFindShortcutJs, contains('event.metaKey || event.ctrlKey'));
     expect(kDesktopFindShortcutJs, contains("event.preventDefault()"));
