@@ -107,6 +107,16 @@ void main() {
     expect(focusNode.hasFocus, isTrue);
   });
 
+  test('webapp handles desktop Find only when embedded Find is present', () {
+    expect(kEmbeddedCupitorFindProbeJs, contains("getElementById('cupPageFindBar')"));
+    expect(kEmbeddedCupitorFindProbeJs, contains("typeof api.open !== 'function'"));
+    expect(kEmbeddedCupitorFindProbeJs, contains("api.open()"));
+    expect(embeddedPageHandledFind('cupitor-web-find-opened'), isTrue);
+    expect(embeddedPageHandledFind('"cupitor-web-find-opened"'), isTrue);
+    expect(embeddedPageHandledFind('not-handled'), isFalse);
+    expect(embeddedPageHandledFind(null), isFalse);
+  });
+
   test('web view fallback detects both platform modifiers', () {
     expect(kDesktopFindShortcutJs, contains('event.metaKey || event.ctrlKey'));
     expect(kDesktopFindShortcutJs, contains("event.preventDefault()"));
