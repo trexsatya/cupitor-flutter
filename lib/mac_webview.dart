@@ -51,10 +51,11 @@ Future<void> setMacWindowFullscreen(bool on) async {
 
 /// macOS: [onExit] runs when the window leaves native fullscreen by any route
 /// (green button, Esc, menu), so page fullscreen can follow it out.
-void onMacWindowExitedFullscreen(VoidCallback onExit) {
+void onMacWindowExitedFullscreen(VoidCallback onExit, {VoidCallback? onFindShortcut}) {
   if (!Platform.isMacOS) return;
   _channel.setMethodCallHandler((call) async {
     if (call.method == 'windowExitedFullscreen') onExit();
+    if (call.method == 'findShortcut') onFindShortcut?.call();
   });
 }
 
