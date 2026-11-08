@@ -42,6 +42,7 @@ import 'stable_dialog_chrome.dart';
 import 'dialog_app_lifecycle.dart';
 import 'mac_webview.dart';
 import 'find_page_shortcut.dart';
+import 'tts_bridge_scope.dart';
 import 'history_store.dart';
 import 'history_screen.dart';
 import 'speech_session.dart';
@@ -1023,11 +1024,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             },
             onPageFinished: (url) {
               _injectFindShortcut(c);
-              final pageUri = Uri.tryParse(url);
-              if (pageUri != null &&
-                  (pageUri.host == 'trexsatya.github.io' ||
-                   pageUri.host == 'localhost' || pageUri.host == '127.0.0.1') &&
-                  pageUri.path.endsWith('/language.html')) {
+              if (shouldInjectCupitorLanguageTts(url)) {
                 // Install on the same WebView which owns Player and Practice.
                 // Other websites keep their own native speech APIs untouched.
                 c.runJavaScript(_ttsPolyfillJs);
