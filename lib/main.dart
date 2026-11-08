@@ -333,6 +333,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   OverlayEntry? _findOverlay;
   WebViewController? _findTarget;
   final FocusNode _findFocusNode = FocusNode();
+  final ValueNotifier<FindMatchState> _findMatchState =
+      ValueNotifier<FindMatchState>(FindMatchState.empty);
+  Timer? _findSearchDebounce;
+  int _findSearchGeneration = 0;
   final List<String> _visibleDialog2Ids = [];
   bool _urlBarFocused = false;
   String _pdfSelectedText = '';
@@ -555,6 +559,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _findOverlay?.remove();
     _findOverlay?.dispose();
     _findOverlay = null;
+    _findSearchDebounce?.cancel();
+    _findMatchState.dispose();
     _findFocusNode.dispose();
     _notifTimer.stop();
     WakelockPlus.disable();
@@ -660,6 +666,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   @override
   void initState() {
     super.initState();
+    _findFocusNode.onKeyEvent = _onFindFieldKey;
     WidgetsBinding.instance.addObserver(this);
     _dialogAppLifecycle = DialogAppLifecycleBridge(send: (script) async {
       final ctrl = dialogController;
@@ -1394,11 +1401,27 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (!_isControllerReady ||
         !(Platform.isMacOS || Platform.isWindows || Platform.isLinux) ||
         event is! KeyDownEvent) return false;
-    if (event.logicalKey == LogicalKeyboardKey.escape && _findOverlay != null) {
-      _closeFindBar();
-      return true;
-    }
     final keyboard = HardwareKeyboard.instance;
+    if (_findOverlay != null) {
+      if (event.logicalKey == LogicalKeyboardKey.escape) {
+        _closeFindBar();
+        return true;
+      }
+      // The focused TextField handles Enter itself. Handling it again here
+      // would advance two matches when both keyboard listeners receive it.
+      final direction = findNavigationDirection(
+        key: event.logicalKey,
+        metaPressed: keyboard.isMetaPressed,
+        controlPressed: keyboard.isControlPressed,
+        altPressed: keyboard.isAltPressed,
+        shiftPressed: keyboard.isShiftPressed,
+      );
+      if (direction != 0) {
+        _findInPage(_findController.text, forward: direction > 0);
+        _refocusFindField();
+        return true;
+      }
+    }
     if (!isDesktopFindShortcut(
       key: event.logicalKey,
       metaPressed: keyboard.isMetaPressed,
@@ -1857,6 +1880,42 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String _esc(String s) =>
       s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 
+  KeyEventResult _onFindFieldKey(FocusNode node, KeyEvent event) {
+    if (_findOverlay == null || event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey == LogicalKeyboardKey.escape) {
+      _closeFindBar();
+      return KeyEventResult.handled;
+    }
+    final enterDirection = findEnterDirection(event.logicalKey,
+        shiftPressed: HardwareKeyboard.instance.isShiftPressed);
+    if (enterDirection != 0) {
+      _findInPage(_findController.text, forward: enterDirection > 0);
+      // Prevent TextField's default submit action from surrendering focus.
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void _refocusFindField() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _findOverlay != null) _findFocusNode.requestFocus();
+    });
+  }
+
+  void _findQueryChanged(String query) {
+    _findSearchDebounce?.cancel();
+    ++_findSearchGeneration;
+    if (query.isEmpty) {
+      _clearFindHighlights();
+      return;
+    }
+    _findMatchState.value =
+        const FindMatchState(current: 0, total: 0, searching: true);
+    _findSearchDebounce = Timer(const Duration(milliseconds: 170), () {
+      _findInPage(query, navigate: false);
+    });
+  }
+
   /// A single Find control shared by the browser and all popup WebViews.
   /// Its root overlay stays above Flutter's Navigator dialog routes.
   void _showFindFor(WebViewController controller) {
@@ -1891,18 +1950,56 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
                       border: OutlineInputBorder(),
                     ),
-                    onSubmitted: (q) => _findInPage(q),
+                    onChanged: _findQueryChanged,
+                    // Submit on a soft keyboard must not dismiss Find.
+                    onEditingComplete: () {},
+                    onSubmitted: (q) {
+                      _findInPage(q);
+                      _refocusFindField();
+                    },
                     textInputAction: TextInputAction.search,
                   )),
-                  IconButton(
-                    tooltip: 'Previous match',
-                    icon: const Icon(Icons.keyboard_arrow_up, size: 20),
-                    onPressed: () => _findInPage(_findController.text, forward: false),
-                  ),
-                  IconButton(
-                    tooltip: 'Next match',
-                    icon: const Icon(Icons.keyboard_arrow_down, size: 20),
-                    onPressed: () => _findInPage(_findController.text),
+                  ValueListenableBuilder<FindMatchState>(
+                    valueListenable: _findMatchState,
+                    builder: (_, matches, __) => Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 82,
+                          child: Semantics(
+                            liveRegion: true,
+                            child: Text(
+                              _findController.text.isEmpty ? '' : matches.label,
+                              textAlign: TextAlign.center,
+                              maxLines: 1,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: _findController.text.isNotEmpty &&
+                                        !matches.searching && matches.total == 0
+                                    ? Colors.red.shade700
+                                    : null,
+                              ),
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Previous match (Shift+Enter)',
+                          icon: const Icon(Icons.keyboard_arrow_up, size: 20),
+                          onPressed: matches.total == 0 ? null : () {
+                            _findInPage(_findController.text, forward: false);
+                            _refocusFindField();
+                          },
+                        ),
+                        IconButton(
+                          tooltip: 'Next match (Enter)',
+                          icon: const Icon(Icons.keyboard_arrow_down, size: 20),
+                          onPressed: matches.total == 0 ? null : () {
+                            _findInPage(_findController.text);
+                            _refocusFindField();
+                          },
+                        ),
+                      ],
+                    ),
                   ),
                   IconButton(
                     tooltip: 'Close Find (Esc)',
@@ -1938,76 +2035,38 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (mounted) setState(() {});
   }
 
-  void _findInPage(String query, {bool forward = true}) {
+  Future<void> _findInPage(String query,
+      {bool forward = true, bool navigate = true}) async {
+    _findSearchDebounce?.cancel();
+    final generation = ++_findSearchGeneration;
     if (query.isEmpty) {
       _clearFindHighlights();
       return;
     }
-    final jsStr = jsonEncode(query);
-    (_findTarget ?? _controller).runJavaScript('''
-      (function() {
-        // If query changed, rebuild highlights
-        if (window._findQuery !== $jsStr) {
-          // Clear old highlights
-          document.querySelectorAll('mark._fh').forEach(function(m) {
-            var p = m.parentNode;
-            p.replaceChild(document.createTextNode(m.textContent), m);
-            p.normalize();
-          });
-          window._findQuery = $jsStr;
-          window._findIdx = -1;
-          window._findMarks = [];
-          // Walk text nodes and wrap matches
-          var query = $jsStr.toLowerCase();
-          var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-          var node, matches = [];
-          while (node = walker.nextNode()) {
-            var text = node.textContent.toLowerCase();
-            var idx = 0;
-            while ((idx = text.indexOf(query, idx)) !== -1) {
-              matches.push({node: node, start: idx, length: query.length});
-              idx += query.length;
-            }
-          }
-          // Apply marks in reverse so offsets stay valid
-          for (var i = matches.length - 1; i >= 0; i--) {
-            var m = matches[i];
-            var range = document.createRange();
-            range.setStart(m.node, m.start);
-            range.setEnd(m.node, m.start + m.length);
-            var mark = document.createElement('mark');
-            mark.className = '_fh';
-            mark.style.cssText = 'background:#ffeb3b;padding:0;margin:0;';
-            range.surroundContents(mark);
-          }
-          window._findMarks = Array.from(document.querySelectorAll('mark._fh'));
-        }
-        if (window._findMarks.length === 0) return;
-        // Navigate
-        var dir = ${forward ? '1' : '-1'};
-        window._findIdx = (window._findIdx + dir + window._findMarks.length) % window._findMarks.length;
-        // Reset all to yellow, highlight current in orange
-        window._findMarks.forEach(function(m) { m.style.background = '#ffeb3b'; });
-        var cur = window._findMarks[window._findIdx];
-        cur.style.background = '#ff9800';
-        cur.scrollIntoView({block: 'center', behavior: 'smooth'});
-      })();
-    ''');
+    final target = _findTarget ?? _controller;
+    try {
+      final raw = await target.runJavaScriptReturningResult(
+        pageFindJavaScript(query, forward: forward, navigate: navigate),
+      ).timeout(const Duration(seconds: 3));
+      // A slow reply cannot overwrite a newer query or another dialog.
+      if (!mounted || _findOverlay == null ||
+          !identical(_findTarget, target) || generation != _findSearchGeneration) return;
+      _findMatchState.value = parseFindMatchState(raw);
+    } catch (error) {
+      if (mounted && _findOverlay != null &&
+          identical(_findTarget, target) && generation == _findSearchGeneration) {
+        _findMatchState.value = FindMatchState.empty;
+        debugPrint('Find in page failed: $error');
+      }
+    }
   }
 
   void _clearFindHighlights() {
-    (_findTarget ?? _controller).runJavaScript('''
-      (function() {
-        document.querySelectorAll('mark._fh').forEach(function(m) {
-          var p = m.parentNode;
-          p.replaceChild(document.createTextNode(m.textContent), m);
-          p.normalize();
-        });
-        window._findQuery = '';
-        window._findIdx = -1;
-        window._findMarks = [];
-      })();
-    ''');
+    _findSearchDebounce?.cancel();
+    ++_findSearchGeneration;
+    _findMatchState.value = FindMatchState.empty;
+    final target = _findTarget ?? _controller;
+    target.runJavaScript(kClearFindJavaScript).catchError((Object _) {});
   }
 
   Future<void> _injectSpaHook() {
