@@ -668,7 +668,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     WakelockPlus.enable();
     onMacWindowExitedFullscreen(
       () => _setMacPageFullscreen(false),
-      onFindShortcut: () => _showFindFor(_visiblePageForFind()),
+      onFindShortcut: () {
+        if (_isControllerReady) _showFindFor(_visiblePageForFind());
+      },
     );
     HardwareKeyboard.instance.addHandler(_onFindPageKey);
     HardwareKeyboard.instance.addHandler(_onMacFullscreenEscape);
@@ -1375,7 +1377,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   bool _onFindPageKey(KeyEvent event) {
-    if (!(Platform.isMacOS || Platform.isWindows || Platform.isLinux) ||
+    if (!_isControllerReady ||
+        !(Platform.isMacOS || Platform.isWindows || Platform.isLinux) ||
         event is! KeyDownEvent) return false;
     if (event.logicalKey == LogicalKeyboardKey.escape && _findOverlay != null) {
       _closeFindBar();
