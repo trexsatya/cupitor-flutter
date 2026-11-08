@@ -333,6 +333,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   OverlayEntry? _findOverlay;
   WebViewController? _findTarget;
   final FocusNode _findFocusNode = FocusNode();
+  bool _embeddedFindDispatchPending = false;
   final ValueNotifier<FindMatchState> _findMatchState =
       ValueNotifier<FindMatchState>(FindMatchState.empty);
   Timer? _findSearchDebounce;
@@ -676,9 +677,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     onMacWindowExitedFullscreen(
       () => _setMacPageFullscreen(false),
       onFindShortcut: () {
-        if (_isControllerReady && _hasVisibleWebViewForFind()) {
-          _showFindFor(_visiblePageForFind());
-        }
+        unawaited(_dispatchFindToVisiblePage());
       },
     );
     HardwareKeyboard.instance.addHandler(_onFindPageKey);
@@ -853,7 +852,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           if (_autoHideAppBar && !_showAppBar) _showAppBarWithTimer();
         })
         ..addJavaScriptChannel('FindInPageShortcut', onMessageReceived: (_) {
-          if (identical(c, _controller)) _showFindFor(c);
+          if (identical(c, _controller)) unawaited(_dispatchFindToController(c));
         })
         // Page-side fallback for app-bar gestures. On macOS the WKWebView is
         // a native NSView that swallows pointer events before Flutter's
@@ -1430,8 +1429,44 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       shiftPressed: keyboard.isShiftPressed,
     )) return false;
     if (!_hasVisibleWebViewForFind()) return false;
-    _showFindFor(_visiblePageForFind());
+    unawaited(_dispatchFindToVisiblePage());
     return true;
+  }
+
+  /// One keyboard shortcut, one Find interface: the Cupitor webapp owns
+  /// its own Find bar while ordinary websites keep the native Flutter bar.
+  /// This resolves macOS WKWebView's window-level Cmd+F interception without
+  /// leaving two search bars on screen. The webapp's on-page Find button
+  /// remains usable by touch on Android with no native app dependency.
+  Future<void> _dispatchFindToVisiblePage() async {
+    if (!_isControllerReady || !_hasVisibleWebViewForFind()) return;
+    await _dispatchFindToController(_visiblePageForFind());
+  }
+
+  Future<void> _dispatchFindToController(WebViewController target) async {
+    if (!mounted || _embeddedFindDispatchPending) return;
+    _embeddedFindDispatchPending = true;
+    try {
+      bool handled = false;
+      try {
+        final result = await target.runJavaScriptReturningResult(
+          kEmbeddedCupitorFindProbeJs,
+        ).timeout(const Duration(milliseconds: 700));
+        handled = embeddedPageHandledFind(result);
+      } catch (_) {
+        // Third-party pages and old Cupitor deployments are not expected
+        // to expose the embedded Find API. Use the native bar as before.
+      }
+      if (!mounted || !_isControllerReady || !_hasVisibleWebViewForFind() ||
+          !identical(_visiblePageForFind(), target)) return;
+      if (handled) {
+        if (_findOverlay != null) _closeFindBar();
+      } else {
+        _showFindFor(target);
+      }
+    } finally {
+      _embeddedFindDispatchPending = false;
+    }
   }
 
   void _injectFindShortcut(WebViewController controller) {
@@ -5384,7 +5419,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       ..addJavaScriptChannel('WiktCollect', onMessageReceived: (msg) => _handleWiktCollectMessage(msg.message))
       ..addJavaScriptChannel('FindInPageShortcut', onMessageReceived: (_) {
         if (identical(_dialog2Controllers[dialogIdForBridge], dialog2Controller)) {
-          _showFindFor(dialog2Controller);
+          unawaited(_dispatchFindToController(dialog2Controller));
         }
       })
       ..addJavaScriptChannel('LinkLongPress', onMessageReceived: (msg) => _handleLinkLongPress(msg.message))
@@ -8859,7 +8894,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // Protocol: docs/speech-bridge-spec.md.
         ..addJavaScriptChannel('SpeechBridge', onMessageReceived: _handleSpeechBridge)
         ..addJavaScriptChannel('FindInPageShortcut', onMessageReceived: (_) {
-          if (_dialog1Visible && identical(ctrl, dialogController)) _showFindFor(ctrl);
+          if (_dialog1Visible && identical(ctrl, dialogController)) {
+            unawaited(_dispatchFindToController(ctrl));
+          }
         })
         ..addJavaScriptChannel('DialogChromeActivity', onMessageReceived: (_) {
           if (mounted && identical(ctrl, dialogController)) _dialog1ChromeActivity.value++;
@@ -11936,7 +11973,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           tooltip: _findOverlay != null ? 'Close find' : 'Find in page (Cmd/Ctrl+F)',
           onPressed: () {
             if (_findOverlay != null) _closeFindBar();
-            else _showFindFor(_visiblePageForFind());
+            else unawaited(_dispatchFindToVisiblePage());
           },
         ),
         GestureDetector(
