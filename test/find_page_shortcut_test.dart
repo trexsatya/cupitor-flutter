@@ -1,3 +1,4 @@
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:cupitor/find_page_shortcut.dart';
@@ -68,6 +69,42 @@ void main() {
     expect(pageFindJavaScript('foo', forward: false),
       contains('var forward = false;'));
     expect(kClearFindJavaScript, contains("window._findQuery = '';"));
+  });
+
+  testWidgets('Enter and Shift+Enter keep the Find text field focused', (tester) async {
+    final focusNode = FocusNode();
+    final directions = <int>[];
+    focusNode.onKeyEvent = (node, event) {
+      if (event is! KeyDownEvent) return KeyEventResult.ignored;
+      final direction = findEnterDirection(
+        event.logicalKey,
+        shiftPressed: HardwareKeyboard.instance.isShiftPressed,
+      );
+      if (direction == 0) return KeyEventResult.ignored;
+      directions.add(direction);
+      return KeyEventResult.handled;
+    };
+    addTearDown(focusNode.dispose);
+    await tester.pumpWidget(MaterialApp(home: Scaffold(
+      body: TextField(
+        focusNode: focusNode,
+        onEditingComplete: () {},
+        onSubmitted: (_) {},
+        textInputAction: TextInputAction.search,
+      ),
+    )));
+    focusNode.requestFocus();
+    await tester.pump();
+    expect(focusNode.hasFocus, isTrue);
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+    expect(focusNode.hasFocus, isTrue);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.pump();
+    expect(directions, <int>[1, -1]);
+    expect(focusNode.hasFocus, isTrue);
   });
 
   test('web view fallback detects both platform modifiers', () {
