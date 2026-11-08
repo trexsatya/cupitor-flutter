@@ -37,6 +37,22 @@ const String kDesktopFindShortcutJs = r'''
 ''';
 
 
+/// The Cupitor webapp owns Find on its own language page. When present,
+/// the desktop shell must open that bar instead of making a second one.
+/// Probe only the focused WebView; ordinary sites fall back to native Find.
+const String kEmbeddedCupitorFindProbeJs = r'''
+(function() {
+  var bar = document.getElementById('cupPageFindBar');
+  var api = bar && bar.__cupPageFind;
+  if (!api || typeof api.open !== 'function') return 'not-handled';
+  api.open();
+  return 'cupitor-web-find-opened';
+})()
+''';
+
+bool embeddedPageHandledFind(Object? result) =>
+    result?.toString().contains('cupitor-web-find-opened') ?? false;
+
 /// Enter / Shift+Enter navigate without submitting or closing the field.
 int findEnterDirection(LogicalKeyboardKey key, {bool shiftPressed = false}) {
   if (key != LogicalKeyboardKey.enter && key != LogicalKeyboardKey.numpadEnter) {
