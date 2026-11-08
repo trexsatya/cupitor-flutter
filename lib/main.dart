@@ -1407,10 +1407,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         _closeFindBar();
         return true;
       }
-      if (_findFocusNode.hasFocus &&
-          (event.logicalKey == LogicalKeyboardKey.enter ||
-           event.logicalKey == LogicalKeyboardKey.numpadEnter)) {
-        _findInPage(_findController.text, forward: !keyboard.isShiftPressed);
+      final enterDirection = _findFocusNode.hasFocus
+          ? findEnterDirection(event.logicalKey,
+              shiftPressed: keyboard.isShiftPressed)
+          : 0;
+      if (enterDirection != 0) {
+        _findInPage(_findController.text, forward: enterDirection > 0);
         return true;
       }
       final direction = findNavigationDirection(
@@ -1890,12 +1892,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _closeFindBar();
       return KeyEventResult.handled;
     }
-    if (event.logicalKey == LogicalKeyboardKey.enter ||
-        event.logicalKey == LogicalKeyboardKey.numpadEnter) {
-      _findInPage(
-        _findController.text,
-        forward: !HardwareKeyboard.instance.isShiftPressed,
-      );
+    final enterDirection = findEnterDirection(event.logicalKey,
+        shiftPressed: HardwareKeyboard.instance.isShiftPressed);
+    if (enterDirection != 0) {
+      _findInPage(_findController.text, forward: enterDirection > 0);
       // Prevent TextField's default submit action from surrendering focus.
       return KeyEventResult.handled;
     }
