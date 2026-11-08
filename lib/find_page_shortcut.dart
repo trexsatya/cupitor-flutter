@@ -143,12 +143,14 @@ String pageFindJavaScript(String query, {bool navigate = true, bool forward = tr
     var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     var textNode, matches = [];
     while ((textNode = walker.nextNode())) {
+      var haystack = (textNode.textContent || '').toLowerCase();
+      // Most text nodes are not matches. Avoid layout/style reads for them.
+      if (haystack.indexOf(lower) === -1) continue;
       var parent = textNode.parentElement;
       if (!parent || !parent.isConnected ||
           parent.closest('script,style,noscript,textarea,select,option,mark._fh,[contenteditable="true"],[hidden],[aria-hidden="true"]')) continue;
       var style = getComputedStyle(parent);
       if (style.display === 'none' || style.visibility === 'hidden' || !parent.getClientRects().length) continue;
-      var haystack = (textNode.textContent || '').toLowerCase();
       var offset = 0, at;
       while ((at = haystack.indexOf(lower, offset)) !== -1) {
         matches.push({node: textNode, start: at, length: query.length});
