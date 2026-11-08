@@ -37,6 +37,14 @@ const String kDesktopFindShortcutJs = r'''
 ''';
 
 
+/// Enter / Shift+Enter navigate without submitting or closing the field.
+int findEnterDirection(LogicalKeyboardKey key, {bool shiftPressed = false}) {
+  if (key != LogicalKeyboardKey.enter && key != LogicalKeyboardKey.numpadEnter) {
+    return 0;
+  }
+  return shiftPressed ? -1 : 1;
+}
+
 /// Browser-standard next/previous shortcuts.
 int findNavigationDirection({
   required LogicalKeyboardKey key,
