@@ -459,6 +459,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   FlutterTts? _dialog1Tts;
   final List<Map<String, dynamic>> _dialog1TtsQueue = [];
   int? _dialog1TtsActiveJsId;
+  // A single native TTS engine serves both the dictionary dialog and the
+  // language webapp. Completion callbacks must go back to their source page.
+  WebViewController? _dialog1TtsActiveController;
   bool _dialog1TtsBusy = false;
   static const _adBlockChannel = MethodChannel('cupitor/adblock');
   // Headset / Bluetooth media-key bridge. Native (MediaSessionCompat) sends
@@ -854,6 +857,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('FindInPageShortcut', onMessageReceived: (_) {
           if (identical(c, _controller)) unawaited(_dispatchFindToController(c));
         })
+        // Android WebView does not implement speechSynthesis. The existing
+        // native FlutterTts bridge also serves the main Cupitor language page.
+        ..addJavaScriptChannel('TtsBridge',
+            onMessageReceived: (msg) => _handleTtsBridge(msg, controller: c))
         // Page-side fallback for app-bar gestures. On macOS the WKWebView is
         // a native NSView that swallows pointer events before Flutter's
         // Listener can see them, so the Flutter-level double-tap / long-press
@@ -1016,6 +1023,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             },
             onPageFinished: (url) {
               _injectFindShortcut(c);
+              final pageUri = Uri.tryParse(url);
+              if (pageUri != null &&
+                  (pageUri.host == 'trexsatya.github.io' ||
+                   pageUri.host == 'localhost' || pageUri.host == '127.0.0.1') &&
+                  pageUri.path.endsWith('/language.html')) {
+                // Install on the same WebView which owns Player and Practice.
+                // Other websites keep their own native speech APIs untouched.
+                c.runJavaScript(_ttsPolyfillJs);
+              }
               if (identical(c, _controller)) _pageLoading.finished();
               if (_isShowingOurHtml) {
                 _injectJs(); // only need word-click JS on our own text page
@@ -8885,7 +8901,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(_userAgent)
         ..addJavaScriptChannel('GitHubProxy', onMessageReceived: _handleGitHubProxyRequest)
-        ..addJavaScriptChannel('TtsBridge', onMessageReceived: _handleTtsBridge)
+        ..addJavaScriptChannel('TtsBridge',
+            onMessageReceived: (msg) => _handleTtsBridge(msg, controller: ctrl))
         ..addJavaScriptChannel('MediaState', onMessageReceived: _handleMediaStateBridge)
         ..addJavaScriptChannel('AudioBridge', onMessageReceived: _handleAudioBridge)
         // Dictation for the manual-card editor's Source/Target fields. The
@@ -11299,7 +11316,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       tts.setStartHandler(() {
         final id = _dialog1TtsActiveJsId;
         if (id != null) {
-          dialogController?.runJavaScript('window.__cupitorTtsStart && window.__cupitorTtsStart($id);');
+          (_dialog1TtsActiveController ?? dialogController)?.runJavaScript(
+              'window.__cupitorTtsStart && window.__cupitorTtsStart($id);');
         }
       });
       tts.setCompletionHandler(() {
@@ -11317,14 +11335,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   void _ttsFinishCurrent({String? error}) {
     final id = _dialog1TtsActiveJsId;
+    final controller = _dialog1TtsActiveController ?? dialogController;
     _dialog1TtsActiveJsId = null;
+    _dialog1TtsActiveController = null;
     _dialog1TtsBusy = false;
     if (id != null) {
       if (error == null) {
-        dialogController?.runJavaScript('window.__cupitorTtsEnd && window.__cupitorTtsEnd($id);');
+        controller?.runJavaScript('window.__cupitorTtsEnd && window.__cupitorTtsEnd($id);');
       } else {
         final esc = jsonEncode(error);
-        dialogController?.runJavaScript('window.__cupitorTtsError && window.__cupitorTtsError($id, $esc);');
+        controller?.runJavaScript('window.__cupitorTtsError && window.__cupitorTtsError($id, $esc);');
       }
     }
     _ttsPumpQueue();
@@ -11336,6 +11356,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final next = _dialog1TtsQueue.removeAt(0);
     _dialog1TtsBusy = true;
     _dialog1TtsActiveJsId = next['id'] as int;
+    _dialog1TtsActiveController = next['_controller'] as WebViewController?;
     final tts = _dialog1Tts;
     if (tts == null) { _ttsFinishCurrent(error: 'tts-unavailable'); return; }
     try {
@@ -11359,7 +11380,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
   }
 
-  void _handleTtsBridge(JavaScriptMessage msg) {
+  void _handleTtsBridge(JavaScriptMessage msg, {WebViewController? controller}) {
     Map<String, dynamic> req;
     try { req = jsonDecode(msg.message) as Map<String, dynamic>; }
     catch (_) { return; }
@@ -11368,6 +11389,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _ensureDialog1Tts();
     switch (type) {
       case 'speak':
+        req['_controller'] = controller ?? dialogController;
         _dialog1TtsQueue.add(req);
         _ttsPumpQueue();
         break;
