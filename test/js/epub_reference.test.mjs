@@ -20,6 +20,11 @@ let scrolled = false;
 context.document.getElementById = id => id === 'rätt' ? {scrollIntoView() {scrolled = true;}} : null;
 context.document.getElementsByName = () => [];
 vm.runInContext(scrollCode, context);
-context.window.__cupEpubScrollToReference('r%C3%A4tt');
-assert.equal(scrolled, true, 'encoded reference ids resolve to DOM anchors');
+context.window.__cupEpubScrollToReference('rätt');
+assert.equal(scrolled, true, 'decoded reference ids resolve to DOM anchors');
 console.log('EPUB internal reference interception and anchor scrolling passed');
+
+scrolled = false;
+context.document.getElementById = id => id === 'literal%41' ? {scrollIntoView() {scrolled = true;}} : null;
+context.window.__cupEpubScrollToReference('literal%41');
+assert.equal(scrolled, true, 'literal percent ids must not be decoded a second time');

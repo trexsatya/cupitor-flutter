@@ -20,12 +20,20 @@ EpubReference? resolveEpubReference(
   if (readerUrl) {
     var path = link.path.replaceFirst(RegExp(r'^/chapter/\d+/'), '');
     path = path.replaceFirst(RegExp(r'^/'), '');
-    relative = Uri(path: path, fragment: link.fragment);
+    relative = Uri.parse('$path${link.hasFragment ? '#${link.fragment}' : ''}');
   }
   final target = base.resolveUri(relative);
   final path = Uri.decodeComponent(target.path);
   final index = chapterHrefs.indexWhere((chapter) =>
       Uri.decodeComponent(Uri.parse('https://epub.invalid/').resolve(chapter).path) == path);
   if (index < 0) return null;
-  return EpubReference(index, target.fragment);
+  // Uri.fragment retains percent escapes. Decode once here, before passing
+  // the id to JavaScript; decoding again would corrupt literal percent ids.
+  String fragment;
+  try {
+    fragment = Uri.decodeComponent(target.fragment);
+  } on FormatException {
+    fragment = target.fragment;
+  }
+  return EpubReference(index, fragment);
 }

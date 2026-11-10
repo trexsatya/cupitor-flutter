@@ -14,6 +14,8 @@ void main() {
     expect(resolve('chapter-07.xhtml#ref-note-8')!.chapterIndex, 1);
     expect(resolve('../notes.xhtml#note-8')!.chapterIndex, 2);
     expect(resolve('#r%C3%A4tt')!.fragment, 'rätt');
+    expect(resolve('#literal%2541')!.fragment, 'literal%41');
+    expect(resolve('cupitor-epub://chapter/chapter-07.xhtml#r%C3%A4tt')!.fragment, 'rätt');
     expect(resolve('cupitor-epub://chapter/chapter-07.xhtml#ref-note-8')!.chapterIndex, 1);
   });
   test('external and missing resources are not chapter links', () {

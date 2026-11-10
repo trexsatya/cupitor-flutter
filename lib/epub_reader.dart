@@ -3938,9 +3938,7 @@ $chapterHtml
   window.__cupEpubScrollToReference = function(fragment) {
     programmaticScrollUntil = Date.now() + 1500;
     if (!fragment) { window.scrollTo(0, 0); return; }
-    var id = fragment;
-    try { id = decodeURIComponent(fragment); } catch (_) {}
-    var target = document.getElementById(id) || document.getElementsByName(id)[0];
+    var target = document.getElementById(fragment) || document.getElementsByName(fragment)[0];
     if (target) target.scrollIntoView({ block: 'start', inline: 'start' });
   };
   window.__cupEpubRestoreScroll = function(pct) {
