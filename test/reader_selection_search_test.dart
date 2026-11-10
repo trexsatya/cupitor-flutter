@@ -8,6 +8,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 // ignore: depend_on_referenced_packages
 import 'package:webview_flutter_platform_interface/webview_flutter_platform_interface.dart';
 
+class _NavigationDelegate extends PlatformNavigationDelegate {
+  _NavigationDelegate(super.params) : super.implementation();
+
+  @override
+  Future<void> setOnNavigationRequest(NavigationRequestCallback callback) async {}
+}
+
 class _Controller extends PlatformWebViewController {
   _Controller(super.params) : super.implementation();
   final channels = <String, JavaScriptChannelParams>{};
@@ -17,6 +24,9 @@ class _Controller extends PlatformWebViewController {
   Future<void> setBackgroundColor(Color color) async {}
   @override
   Future<void> setJavaScriptMode(JavaScriptMode javaScriptMode) async {}
+  @override
+  Future<void> setPlatformNavigationDelegate(PlatformNavigationDelegate handler) async {}
+
   @override
   Future<void> addJavaScriptChannel(JavaScriptChannelParams params) async {
     channels[params.name] = params;
@@ -47,6 +57,10 @@ class _WebView extends PlatformWebViewWidget {
 
 class _Platform extends WebViewPlatform {
   late _Controller controller;
+  @override
+  PlatformNavigationDelegate createPlatformNavigationDelegate(
+    PlatformNavigationDelegateCreationParams params,
+  ) => _NavigationDelegate(params);
   @override
   PlatformWebViewController createPlatformWebViewController(
     PlatformWebViewControllerCreationParams params,

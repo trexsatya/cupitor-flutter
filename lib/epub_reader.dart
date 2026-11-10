@@ -50,6 +50,7 @@ import 'text_transform.dart';
 import 'mac_webview.dart';
 import 'page_cursor.dart';
 import 'reader_selection_menu.dart';
+import 'epub_reference.dart';
 
 // WebKit on macOS does not register cupitor-epub:// as a loadable URL
 // scheme. HTML is injected locally, with images and fonts already inlined;
@@ -1016,6 +1017,8 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
   bool _tagShowMaskImages = false;
   Completer<ExtendResult>? _pendingTagExtend;
 
+  String? _pendingReferenceFragment;
+
   EpubBook get book => widget.book;
 
   @override
@@ -1079,6 +1082,14 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     final ctrl = WebViewController()
       ..configureForMac()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(NavigationDelegate(onNavigationRequest: (request) {
+        final uri = Uri.tryParse(request.url);
+        if (uri?.scheme == 'cupitor-epub' || uri?.host == 'reader.cupitor.invalid') {
+          _openReference(request.url);
+          return NavigationDecision.prevent;
+        }
+        return NavigationDecision.navigate;
+      }))
       ..addJavaScriptChannel('CupEpub', onMessageReceived: _onJsMessage)
       // Sentence-tagging bridges — same protocol as the main WebView so
       // the Dart-side capture sheet and DB layer can be shared.
@@ -1307,6 +1318,11 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
             _controller?.runJavaScript('window.__cupEpubSetPaginated && window.__cupEpubSetPaginated(true);');
           }
           _installTagHelpersAndRehydrate();
+          final fragment = _pendingReferenceFragment;
+          if (fragment != null) {
+            _pendingReferenceFragment = null;
+            _scrollToReference(fragment);
+          }
           // Apply the one-shot deep-link highlight (from global search's
           // "open hit" flow) right after the chapter is settled. Cleared
           // immediately so navigating away and back doesn't re-scroll.
@@ -1327,6 +1343,8 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
           if (id.isNotEmpty) _showHighlightActions(id);
           break;
         case 'anchor':
+          final href = env['href'];
+          if (href is String) _openReference(href);
           break;
       }
     } catch (_) {}
@@ -3596,6 +3614,26 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     try { await _tts?.setSpeechRate(_state.ttsRate); } catch (_) {}
   }
 
+  Future<void> _openReference(String href) async {
+    final reference = resolveEpubReference(href,
+        currentHref: book.chapters[_state.chapterIdx].href,
+        chapterHrefs: book.chapters.map((chapter) => chapter.href).toList());
+    if (reference == null) return;
+    _pauseTts();
+    if (reference.chapterIndex == _state.chapterIdx) {
+      await _scrollToReference(reference.fragment);
+    } else {
+      _pendingReferenceFragment = reference.fragment;
+      _state.scrollPct = 0;
+      await _loadChapter(reference.chapterIndex);
+    }
+  }
+
+  Future<void> _scrollToReference(String fragment) async {
+    await _controller?.runJavaScript(
+      'window.__cupEpubScrollToReference && window.__cupEpubScrollToReference(${jsonEncode(fragment)});');
+  }
+
   // ─── Navigation ────────────────────────────────────────────────────────
 
   void _goNext() {
@@ -3897,6 +3935,12 @@ $chapterHtml
   window.addEventListener('keydown', _clearProgrammaticGate, { passive: true });
 
   // ── Restore scroll on chapter load ──
+  window.__cupEpubScrollToReference = function(fragment) {
+    programmaticScrollUntil = Date.now() + 1500;
+    if (!fragment) { window.scrollTo(0, 0); return; }
+    var target = document.getElementById(fragment) || document.getElementsByName(fragment)[0];
+    if (target) target.scrollIntoView({ block: 'start', inline: 'start' });
+  };
   window.__cupEpubRestoreScroll = function(pct) {
     var h = document.documentElement.scrollHeight - window.innerHeight;
     if (h > 0) window.scrollTo(0, Math.max(0, Math.floor(h * pct)));
@@ -4133,7 +4177,16 @@ $chapterHtml
     var anchor = tgt && tgt.closest && tgt.closest('a');
     if (anchor) {
       var href = anchor.getAttribute('href') || '';
-      if (href.length > 0) { vlog('[epub] lookup early-exit: anchor href=' + href.slice(0, 60)); return; }
+      if (href.length > 0) {
+        // Injected chapters cannot navigate their archive URLs in WebView.
+        // Let the host load the chapter, then scroll to its reference id.
+        if (!/^[a-z][a-z0-9+.-]*:/i.test(href) || /^cupitor-epub:/i.test(href) ||
+            href.indexOf('https://reader.cupitor.invalid/') === 0) {
+          ev.preventDefault();
+          post({ type: 'anchor', href: href });
+        }
+        return;
+      }
     }
     // Ignore if the user selected text — that goes through the selection
     // hook instead.
