@@ -42,6 +42,7 @@ void main() {
     onHighlight: () => calls.add('highlight'),
     onNote: () => calls.add('note'),
     onCopy: () => calls.add('copy'),
+    onReadFromHere: () => calls.add('read'),
   );
 
   Future<void> pump(
@@ -106,11 +107,25 @@ void main() {
     'Translate and all reader actions dispatch the correct callbacks',
     (tester) async {
       await pump(tester);
-      for (final label in ['Lookup', 'Translate', 'Highlight', 'Note', 'Copy']) {
+      for (final label in [
+        'Lookup',
+        'Translate',
+        'Highlight',
+        'Note',
+        'Copy',
+        'Read from here',
+      ]) {
         await tester.tap(find.text(label));
         await tester.pump();
       }
-      expect(calls, ['lookup', 'translate', 'highlight', 'note', 'copy']);
+      expect(calls, [
+        'lookup',
+        'translate',
+        'highlight',
+        'note',
+        'copy',
+        'read',
+      ]);
       await tester.tapAt(const Offset(5, 190));
       expect(calls.last, 'dismiss');
     },

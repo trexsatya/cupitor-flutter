@@ -15,6 +15,7 @@ class ReaderSelectionMenu extends StatelessWidget {
     required this.onHighlight,
     required this.onNote,
     required this.onCopy,
+    this.onReadFromHere,
   });
 
   final Offset anchor;
@@ -26,6 +27,7 @@ class ReaderSelectionMenu extends StatelessWidget {
   final VoidCallback onHighlight;
   final VoidCallback onNote;
   final VoidCallback onCopy;
+  final VoidCallback? onReadFromHere;
 
   @override
   Widget build(BuildContext context) => Stack(
@@ -53,6 +55,12 @@ class ReaderSelectionMenu extends StatelessWidget {
                 _button(Icons.brush, 'Highlight', onHighlight),
                 _button(Icons.sticky_note_2_outlined, 'Note', onNote),
                 _button(Icons.copy, 'Copy', onCopy),
+                if (onReadFromHere case final readFromHere?)
+                  _button(
+                    Icons.play_circle_outline,
+                    'Read from here',
+                    readFromHere,
+                  ),
               ],
             ),
           ),
@@ -79,7 +87,8 @@ class ReaderSelectionMenu extends StatelessWidget {
                 const SizedBox(height: 2),
                 Text(
                   label,
-                  maxLines: 1,
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(color: foreground, fontSize: 11),
                 ),
