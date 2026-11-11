@@ -378,6 +378,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // MainActivity exposes no way to ask. Mirror its state here so a dictation
   // request can refuse rather than silently record nothing.
   bool _nativeRecordingActive = false;
+  bool _nativeRecordingIsSpeakOver = false;
   final NativeRecordingStart _nativeRecordingStart = NativeRecordingStart();
   bool get _recordingHasMic => _nativeRecordingActive || _nativeRecordingStart.isPending;
   // A long-press capture was cut short by the app being backgrounded; show
@@ -630,6 +631,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.hidden && _nativeRecordingIsSpeakOver) {
+      _stopNativeRecordingIfAny();
+    }
     if (state == AppLifecycleState.resumed) {
       WakelockPlus.enable();
       if (_pendingVoiceResumeDialog) {
@@ -9201,10 +9205,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // pending promise. Drop it and its 🎤 button pulses forever and blocks
       // the other one. 'cancelled' is silent on that side.
       _sttCancelForMicHandoff();
-      // Deliberately NOT clearing _nativeRecordingActive here. The page
-      // outlives this handler (it also runs on minimize) and still owns its
-      // recording; clearing the flag without stopping the recorder would let
-      // the next dictation talk to a mic that is already taken.
+      if (_nativeRecordingIsSpeakOver) _stopNativeRecordingIfAny();
       // Notify the page running inside dialog1 that the dialog just
       // closed — useful for the language page to pause TTS, stop a
       // running clip, or persist state before the user comes back.
@@ -10204,6 +10205,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   void _stopNativeRecordingIfAny() {
     _nativeRecordingStart.cancel();
     _nativeRecordingActive = false;
+    _nativeRecordingIsSpeakOver = false;
     _permsChannel.invokeMethod<void>('cancelNativeRecording').catchError((_) {});
   }
 
@@ -10469,6 +10471,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         if (id.isEmpty) { _audioReply('recordStart', rid, null, 'bad-id'); return; }
         final token = _nativeRecordingStart.begin(recording: _nativeRecordingActive);
         if (token == null) { _audioReply('recordStart', rid, null, 'mic-busy'); return; }
+        _nativeRecordingIsSpeakOver = req['speakOver'] == true;
         bool cancelled() {
           if (_nativeRecordingStart.isCurrent(token)) return false;
           _audioReply('recordStart', rid, null, 'cancelled');
@@ -10498,11 +10501,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         } on PlatformException catch (e) {
           if (!cancelled()) _audioReply('recordStart', rid, null, '${e.code}: ${e.message ?? ''}');
         } finally {
+          if (_nativeRecordingStart.isCurrent(token) && !_nativeRecordingActive) {
+            _nativeRecordingIsSpeakOver = false;
+          }
           _nativeRecordingStart.complete(token);
         }
       } else if (op == 'recordStop') {
         _nativeRecordingStart.cancel();
         _nativeRecordingActive = false;
+        _nativeRecordingIsSpeakOver = false;
         try {
           final path = await _permsChannel.invokeMethod<String>('stopNativeRecording');
           if (path == null) {
@@ -10516,6 +10523,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       } else if (op == 'recordCancel') {
         _nativeRecordingStart.cancel();
         _nativeRecordingActive = false;
+        _nativeRecordingIsSpeakOver = false;
         try {
           await _permsChannel.invokeMethod<void>('cancelNativeRecording');
           _audioReply('recordCancel', rid, 'ok', null);
