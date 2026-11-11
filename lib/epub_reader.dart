@@ -51,6 +51,7 @@ import 'mac_webview.dart';
 import 'page_cursor.dart';
 import 'reader_selection_menu.dart';
 import 'epub_reference.dart';
+import 'epub_speech.dart';
 
 // WebKit on macOS does not register cupitor-epub:// as a loadable URL
 // scheme. HTML is injected locally, with images and fonts already inlined;
@@ -216,6 +217,9 @@ class EpubReadingState {
     this.lineHeight = 1.6,
     this.paginated = false,
     this.ttsRate = 0.5,
+    this.ttsReplacements = epubDefaultTtsReplacements,
+    this.ttsNewlinePauseMs = epubDefaultTtsNewlinePauseMs,
+    this.ttsParagraphPauseMs = epubDefaultTtsParagraphPauseMs,
     this.highlights = const <EpubHighlight>[],
   });
 
@@ -228,6 +232,9 @@ class EpubReadingState {
   double lineHeight;           // 1.2..2.2
   bool paginated;              // false = scroll, true = column pagination
   double ttsRate;              // 0.2..1.0 — flutter_tts speech rate
+  String ttsReplacements;
+  int ttsNewlinePauseMs;
+  int ttsParagraphPauseMs;
   List<EpubHighlight> highlights;
 
   Map<String, dynamic> toJson() => {
@@ -240,6 +247,9 @@ class EpubReadingState {
         'lineHeight': lineHeight,
         'paginated': paginated,
         'ttsRate': ttsRate,
+        'ttsReplacements': ttsReplacements,
+        'ttsNewlinePauseMs': ttsNewlinePauseMs,
+        'ttsParagraphPauseMs': ttsParagraphPauseMs,
         'highlights': highlights.map((h) => h.toJson()).toList(),
       };
 
@@ -254,6 +264,11 @@ class EpubReadingState {
         lineHeight: (j['lineHeight'] as num?)?.toDouble() ?? 1.6,
         paginated: j['paginated'] as bool? ?? false,
         ttsRate: (j['ttsRate'] as num?)?.toDouble() ?? 0.5,
+        ttsReplacements: j['ttsReplacements'] as String? ?? epubDefaultTtsReplacements,
+        ttsNewlinePauseMs: ((j['ttsNewlinePauseMs'] as num?)?.toInt() ?? epubDefaultTtsNewlinePauseMs)
+            .clamp(0, epubMaxTtsPauseMs),
+        ttsParagraphPauseMs: ((j['ttsParagraphPauseMs'] as num?)?.toInt() ?? epubDefaultTtsParagraphPauseMs)
+            .clamp(0, epubMaxTtsPauseMs),
         highlights: ((j['highlights'] as List?) ?? const [])
             .whereType<Map>()
             .map((m) => EpubHighlight.fromJson(m.cast<String, dynamic>()))
@@ -977,15 +992,12 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
   List<_BookSearchHit> _bookSearchHits = const [];
 
   // ─── Text-to-speech ─────────────────────────────────────────────────
-  // We use a dedicated FlutterTts instance for the reader. Sentences are
-  // wrapped in <span data-sent="N"> by JS at chapter render — we then
-  // (a) ask JS for the text of sentence N, (b) speak it, (c) on
-  // completion advance N by 1 and repeat, (d) at end-of-chapter, flip
-  // to the next chapter and continue if `_ttsActive` is still true.
   FlutterTts? _tts;
-  bool _ttsActive = false;
-  int _ttsIdx = 0;
-  int _ttsCount = 0;
+  _EpubSpeechRun? _ttsRun;
+  EpubSpeechPosition? _ttsPosition;
+  Future<void>? _ttsStopping;
+  Completer<void>? _chapterReady;
+  int _chapterLoadId = 0;
 
   // ─── Selection menu / highlights ────────────────────────────────────
   // Anchor for the floating selection menu — set by the JS selection
@@ -1169,44 +1181,51 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
 
   // ─── Chapter loading ───────────────────────────────────────────────────
 
-  Future<void> _loadChapter(int idx, {bool restoreScroll = false}) async {
-    if (idx < 0 || idx >= book.chapters.length) return;
-    final ch = book.chapters[idx];
-    final html = _wrapChapter(ch);
+  Future<bool> _loadChapter(
+    int idx, {
+    bool restoreScroll = false,
+    bool preserveTtsPosition = false,
+  }) async {
+    if (idx < 0 || idx >= book.chapters.length) return false;
+    if (!preserveTtsPosition) _stopTts();
+    final loadId = ++_chapterLoadId;
+    _chapterReady = Completer<void>();
+    final html = _wrapChapter(book.chapters[idx], loadId);
     _state.chapterIdx = idx;
+    if (mounted) setState(() {});
     try {
       await _controller?.loadHtmlString(html, baseUrl: epubChapterBaseUrl(idx))
           .timeout(const Duration(seconds: 20));
     } catch (error, stack) {
       JsLogSink.add('error', 'EPUB chapter ${idx + 1} failed to load: $error\n$stack');
-      if (mounted) setState(() => _readerLoadError =
-          'Could not display chapter ${idx + 1}: $error');
-      return;
+      if (mounted && loadId == _chapterLoadId) {
+        setState(() => _readerLoadError = 'Could not display chapter ${idx + 1}: $error');
+      }
+      return false;
     }
-    if (_readerLoadError != null && mounted) {
-      setState(() => _readerLoadError = null);
-    }
+    if (!mounted || loadId != _chapterLoadId) return false;
+    if (_readerLoadError != null) setState(() => _readerLoadError = null);
     // Wait for the page to lay out, then scroll to remembered position.
     if (restoreScroll && _state.scrollPct > 0) {
       Future<void>.delayed(const Duration(milliseconds: 350), () async {
+        if (!mounted || loadId != _chapterLoadId) return;
         await _controller?.runJavaScript(
           'window.__cupEpubRestoreScroll && window.__cupEpubRestoreScroll(${_state.scrollPct});',
         );
       });
     }
     _scheduleSave();
-    if (mounted) setState(() {});
+    return true;
   }
 
   // Restart chapter rendering when theme/font/etc changed. Restores the
   // current scroll position instead of dropping to the top.
   Future<void> _rerenderForSettings() async {
-    final ch = book.chapters[_state.chapterIdx];
-    final html = _wrapChapter(ch);
-    // Capture current scroll first so we can restore it after reload.
+    final loadId = _chapterLoadId;
     try {
       final js = 'JSON.stringify({h: document.documentElement.scrollHeight, y: window.scrollY})';
       final v = await _controller?.runJavaScriptReturningResult(js);
+      if (!mounted || loadId != _chapterLoadId) return;
       if (v is String) {
         final m = jsonDecode(v) as Map<String, dynamic>;
         final h = (m['h'] as num).toDouble();
@@ -1214,12 +1233,12 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
         if (h > 0) _state.scrollPct = (y / h).clamp(0.0, 1.0);
       }
     } catch (_) {}
-    await _controller?.loadHtmlString(html, baseUrl: epubChapterBaseUrl(_state.chapterIdx));
-    Future<void>.delayed(const Duration(milliseconds: 250), () async {
-      await _controller?.runJavaScript(
-        'window.__cupEpubRestoreScroll && window.__cupEpubRestoreScroll(${_state.scrollPct});',
-      );
-    });
+    if (!mounted || loadId != _chapterLoadId) return;
+    await _loadChapter(
+      _state.chapterIdx,
+      restoreScroll: true,
+      preserveTtsPosition: _ttsPosition != null,
+    );
   }
 
   // ─── Reading-state persistence ─────────────────────────────────────────
@@ -1312,7 +1331,12 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
           if (mounted) setState(() => _findCount = (env['count'] as num?)?.toInt() ?? 0);
           break;
         case 'chapterReady':
-          _ttsCount = (env['sentenceCount'] as num?)?.toInt() ?? 0;
+          if (!mounted || env['loadId'] != _chapterLoadId) break;
+          final ready = _chapterReady;
+          if (ready != null && !ready.isCompleted) {
+            ready.complete();
+            setState(() {});
+          }
           _applySavedHighlightsForCurrentChapter();
           if (_state.paginated) {
             _controller?.runJavaScript('window.__cupEpubSetPaginated && window.__cupEpubSetPaginated(true);');
@@ -1740,42 +1764,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
       return hex.substring(0, 8);
     } catch (e) { return ''; }
   }
-  // Does this element start on a new line when rendered? The layout engine
-  // is asked first: a hidden footnote <aside> or an inline-styled heading
-  // breaks nothing, while a <span> styled display:block — one per verse
-  // line in many EPUBs — breaks the line just like a paragraph. Floats and
-  // absolutely positioned boxes (drop caps, page-number markers) report
-  // display:block too but sit inside the line, so they are excluded. Table
-  // cells share a line with their neighbours. The tag list is only for
-  // when the engine gives no answer.
-  var OWN_LINE_DISPLAY = /^(block|flex|grid|list-item|table|table-row|table-caption|table-row-group|table-header-group|table-footer-group|flow-root)\$/;
-  var OWN_LINE_TAGS = /^(BR|HR|P|DIV|LI|UL|OL|DL|DD|DT|BLOCKQUOTE|SECTION|ARTICLE|ASIDE|HEADER|FOOTER|NAV|MAIN|FIGURE|FIGCAPTION|TABLE|TR|H[1-6]|PRE)\$/;
-  function startsOwnLine(el) {
-    var tag = el.tagName || '';
-    var cs = null;
-    try { cs = window.getComputedStyle(el); } catch (e) { cs = null; }
-    var display = cs ? (cs.display || '') : '';
-    if (!display) return OWN_LINE_TAGS.test(tag);
-    if (display === 'none') return false;
-    if (tag === 'BR') return true;
-    var fl = cs.cssFloat || cs['float'] || 'none';
-    if (fl !== 'none') return false;
-    if (cs.position === 'absolute' || cs.position === 'fixed') return false;
-    if (!OWN_LINE_DISPLAY.test(display)) return false;
-    // A flex or grid container blockifies its children whatever they are,
-    // so the child's own display says nothing about lines here — a row of
-    // flex items shares one. The container has the answer.
-    var parent = el.parentNode;
-    var ps = null;
-    if (parent && parent.nodeType === 1) {
-      try { ps = window.getComputedStyle(parent); } catch (e) { ps = null; }
-    }
-    var pd = ps ? (ps.display || '') : '';
-    if (pd === 'flex' || pd === 'inline-flex') {
-      return /^column/.test(ps.flexDirection || '');
-    }
-    return true;
-  }
+  var startsOwnLine = window.__cupEpubStartsOwnLine;
   // The nearest ancestor that starts its own line — the line this span is
   // printed on — or null when that is the body itself.
   function ownLineAncestor(el) {
@@ -3534,84 +3523,143 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
 
   // ─── TTS ───────────────────────────────────────────────────────────────
 
-  Future<void> _initTts() async {
-    if (_tts != null) return;
-    final t = FlutterTts();
+  Future<void> _startTts({bool fromSelection = false}) async {
+    final controller = _controller;
+    if (controller == null || _chapterReady?.isCompleted != true) return;
+    if (fromSelection) _stopTts();
+    if (_ttsRun != null) return;
+    final position = _ttsPosition ??= EpubSpeechPosition();
+    final run = _EpubSpeechRun();
+    setState(() => _ttsRun = run);
     try {
-      await t.awaitSpeakCompletion(true);
-    } catch (_) {}
-    try { await t.setSpeechRate(_state.ttsRate); } catch (_) {}
-    try { await t.setVolume(1.0); } catch (_) {}
-    try { await t.setPitch(1.0); } catch (_) {}
-    _tts = t;
-  }
-
-  Future<void> _startTts() async {
-    await _initTts();
-    if (_ttsCount == 0) return;
-    _ttsActive = true;
-    _ttsIdx = 0;
-    if (mounted) setState(() {});
-    await _speakNext();
-  }
-
-  Future<void> _speakNext() async {
-    if (!_ttsActive) return;
-    if (_ttsIdx >= _ttsCount) {
-      // End-of-chapter → advance and continue if there are more chapters.
-      if (_state.chapterIdx < book.chapters.length - 1) {
-        await _loadChapter(_state.chapterIdx + 1);
-        // chapterReady arrives async; wait a tick and resume.
-        Future<void>.delayed(const Duration(milliseconds: 350), () {
-          if (!_ttsActive) return;
-          _ttsIdx = 0;
-          _speakNext();
-        });
-      } else {
-        _ttsActive = false;
-        if (mounted) setState(() {});
+      if (fromSelection) {
+        position.lines = _readTtsLines(controller, fromSelection: true);
+        await position.lines;
       }
-      return;
+      await _ttsStopping;
+      if (_ttsRun != run) return;
+      final tts = _tts ??= FlutterTts();
+      await tts.awaitSpeakCompletion(true);
+      if (_ttsRun != run) return;
+      await tts.setVolume(1.0);
+      if (_ttsRun != run) return;
+      await tts.setPitch(1.0);
+      double? appliedRate;
+      while (_ttsRun == run) {
+        final lines = await (position.lines ??= _readTtsLines(controller));
+        while (_ttsRun == run && position.nextLine < lines.length) {
+          final line = lines[position.nextLine];
+          final rules = parseEpubTtsReplacements(_state.ttsReplacements);
+          final text = applyEpubTtsReplacements(line['text'] as String, rules);
+          if (text.isNotEmpty) {
+            final ready = _chapterReady!;
+            if (!ready.isCompleted) {
+              await run.waitFor(ready.future.timeout(const Duration(seconds: 20)));
+              if (_ttsRun != run) return;
+            }
+            await controller.runJavaScript(
+              'window.__cupEpubSpeakHighlight(${line['start']}, ${line['end']});',
+            );
+            if (_ttsRun != run) return;
+            final rate = _state.ttsRate.clamp(0.2, 1.0);
+            if (rate != appliedRate) {
+              await tts.setSpeechRate(rate);
+              appliedRate = rate;
+            }
+            var offset = position.resumeOffset(text);
+            for (final utterance in epubTtsUtterances(text.substring(offset))) {
+              if (_ttsRun != run) return;
+              final start = text.indexOf(utterance, offset);
+              tts.setProgressHandler((spoken, wordStart, _, _) {
+                if (_ttsRun == run && spoken == utterance &&
+                    wordStart >= 0 && wordStart < utterance.length) {
+                  position.speechOffset = start + wordStart;
+                }
+              });
+              final result = await run.waitFor(tts.speak(utterance));
+              if (_ttsRun != run) return;
+              tts.progressHandler = null;
+              if (result == 0) throw StateError('The speech engine rejected the text.');
+              offset = position.speechOffset = start + utterance.length;
+            }
+          }
+          position.advanceLine();
+          final pauseMs = switch (line['breakAfter']) {
+            'paragraph' => _state.ttsParagraphPauseMs,
+            'newline' => _state.ttsNewlinePauseMs,
+            _ => 0,
+          };
+          if (pauseMs > 0) await _waitBetweenSpeechLines(run, pauseMs);
+        }
+        if (_ttsRun != run || _state.chapterIdx + 1 >= book.chapters.length) return;
+        position.advanceChapter();
+        final loaded = await _loadChapter(
+          _state.chapterIdx + 1,
+          preserveTtsPosition: true,
+        );
+        if (!loaded || _ttsRun != run) return;
+        await run.waitFor(_chapterReady!.future.timeout(const Duration(seconds: 20)));
+      }
+    } catch (error, stack) {
+      if (_ttsRun != run) return;
+      JsLogSink.add('error', 'EPUB read-aloud failed: $error\n$stack');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Read-aloud could not continue.')),
+        );
+      }
+    } finally {
+      if (_ttsRun == run) _stopTts();
     }
-    final escaped = _ttsIdx.toString();
-    await _controller?.runJavaScript('window.__cupEpubSpeakHighlight && window.__cupEpubSpeakHighlight($escaped);');
-    final raw = await _controller?.runJavaScriptReturningResult(
-      'window.__cupEpubSentenceText && window.__cupEpubSentenceText($escaped)',
+  }
+
+  Future<List<Map<String, dynamic>>> _readTtsLines(
+    WebViewController controller, {
+    bool fromSelection = false,
+  }) async {
+    final loadId = _chapterLoadId;
+    final raw = await controller.runJavaScriptReturningResult(
+      'window.__cupEpubSpeechLines($fromSelection)',
     );
-    String text;
-    if (raw is String) {
-      // Android wraps the result in JSON quotes; iOS often doesn't.
-      text = raw.startsWith('"') && raw.endsWith('"')
-          ? jsonDecode(raw) as String
-          : raw;
-    } else {
-      text = raw?.toString() ?? '';
+    // WebView implementations return either JSON or its quoted representation.
+    var decoded = jsonDecode(raw as String);
+    if (decoded is String) decoded = jsonDecode(decoded);
+    if (fromSelection && mounted && loadId == _chapterLoadId) {
+      _clearSelection();
+      _revealChromeAndScheduleHide();
     }
-    final clean = text.trim();
-    if (clean.isEmpty) {
-      _ttsIdx++;
-      _speakNext();
-      return;
+    if (decoded is! List || (fromSelection && decoded.isEmpty)) {
+      throw StateError('There is no readable text at the selected position.');
     }
-    try {
-      await _tts!.speak(clean);
-    } catch (_) {}
-    if (!_ttsActive) return;
-    _ttsIdx++;
-    _speakNext();
+    return decoded.cast<Map<String, dynamic>>();
   }
 
-  void _pauseTts() {
-    _ttsActive = false;
-    _tts?.stop();
-    _controller?.runJavaScript('window.__cupEpubSpeakHighlight && window.__cupEpubSpeakHighlight(-1);');
-    if (mounted) setState(() {});
+  Future<void> _waitBetweenSpeechLines(_EpubSpeechRun run, int pauseMs) async {
+    final elapsed = Completer<void>();
+    final timer = Timer(Duration(milliseconds: pauseMs), elapsed.complete);
+    await run.waitFor(elapsed.future);
+    timer.cancel();
   }
 
-  Future<void> _setTtsRate(double r) async {
-    _state.ttsRate = r.clamp(0.2, 1.0);
-    _scheduleSave();
-    try { await _tts?.setSpeechRate(_state.ttsRate); } catch (_) {}
+  void _stopTts({bool keepPosition = false, bool disposing = false}) {
+    final hadPosition = _ttsPosition != null;
+    if (!keepPosition) _ttsPosition = null;
+    final run = _ttsRun;
+    _ttsRun = null;
+    if (run != null) {
+      run.cancel();
+      _tts?.progressHandler = null;
+      _ttsStopping = _stopNativeSpeech();
+      if (!disposing) {
+        _controller?.runJavaScript('window.__cupEpubSpeakHighlight?.(-1, -1);')
+            .catchError((Object _) {});
+      }
+    }
+    if (!disposing && mounted && (run != null || hadPosition)) setState(() {});
+  }
+
+  Future<void> _stopNativeSpeech() async {
+    try { await _tts?.stop(); } catch (_) {}
   }
 
   Future<void> _openReference(String href) async {
@@ -3619,7 +3667,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
         currentHref: book.chapters[_state.chapterIdx].href,
         chapterHrefs: book.chapters.map((chapter) => chapter.href).toList());
     if (reference == null) return;
-    _pauseTts();
+    _stopTts();
     if (reference.chapterIndex == _state.chapterIdx) {
       await _scrollToReference(reference.fragment);
     } else {
@@ -3740,7 +3788,7 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
 
   // ─── HTML/CSS wrapper for each chapter ─────────────────────────────────
 
-  String _wrapChapter(EpubChapter ch) {
+  String _wrapChapter(EpubChapter ch, int loadId) {
     final theme = _themeColors(_state.theme);
     final bookCss = book.cssText
         // EPUB CSS often hard-codes `body { margin: ... }` that fights our
@@ -4287,6 +4335,7 @@ $chapterHtml
         lastSel = '';
         return;
       }
+      if (sel.rangeCount) window.__cupEpubSpeechSelection = sel.getRangeAt(0).cloneRange();
       if (t === lastSel) return;
       lastSel = t;
       // Compute prefix/suffix from the chapter's plain text so highlight
@@ -4367,19 +4416,63 @@ $chapterHtml
   }
   wrapSentences();
 
-  window.__cupEpubSentenceCount = function() { return sentenceCount; };
-  window.__cupEpubSentenceText = function(i) {
-    var el = document.querySelector('.cup-sent[data-sent="' + i + '"]');
-    return el ? (el.textContent || '') : '';
+  // Does this element start on a new line when rendered? The layout engine
+  // is asked first: a hidden footnote <aside> or an inline-styled heading
+  // breaks nothing, while a <span> styled display:block — one per verse
+  // line in many EPUBs — breaks the line just like a paragraph. Floats and
+  // absolutely positioned boxes (drop caps, page-number markers) report
+  // display:block too but sit inside the line, so they are excluded. Table
+  // cells share a line with their neighbours. The tag list is only for
+  // when the engine gives no answer.
+  var OWN_LINE_DISPLAY = /^(block|flex|grid|list-item|table|table-row|table-caption|table-row-group|table-header-group|table-footer-group|flow-root)\$/;
+  var OWN_LINE_TAGS = /^(BR|HR|P|DIV|LI|UL|OL|DL|DD|DT|BLOCKQUOTE|SECTION|ARTICLE|ASIDE|HEADER|FOOTER|NAV|MAIN|FIGURE|FIGCAPTION|TABLE|TR|H[1-6]|PRE)\$/;
+  window.__cupEpubStartsOwnLine = function(el, cs) {
+    var tag = el.tagName || '';
+    if (!cs) {
+      try { cs = window.getComputedStyle(el); } catch (e) { cs = null; }
+    }
+    var display = cs ? (cs.display || '') : '';
+    if (!display) return OWN_LINE_TAGS.test(tag);
+    if (display === 'none') return false;
+    if (tag === 'BR') return true;
+    var fl = cs.cssFloat || cs['float'] || 'none';
+    if (fl !== 'none') return false;
+    if (cs.position === 'absolute' || cs.position === 'fixed') return false;
+    if (!OWN_LINE_DISPLAY.test(display)) return false;
+    // A flex or grid container blockifies its children whatever they are,
+    // so the child's own display says nothing about lines here — a row of
+    // flex items shares one. The container has the answer.
+    var parent = el.parentNode;
+    var ps = null;
+    if (parent && parent.nodeType === 1) {
+      try { ps = window.getComputedStyle(parent); } catch (e) { ps = null; }
+    }
+    var pd = ps ? (ps.display || '') : '';
+    if (pd === 'flex' || pd === 'inline-flex') {
+      return /^column/.test(ps.flexDirection || '');
+    }
+    return true;
   };
-  window.__cupEpubSpeakHighlight = function(i) {
-    var prev = document.querySelector('.cup-sent.cup-sent-current');
-    if (prev) prev.classList.remove('cup-sent-current');
-    if (i < 0) return;
-    var el = document.querySelector('.cup-sent[data-sent="' + i + '"]');
-    if (el) {
-      el.classList.add('cup-sent-current');
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+  $epubSpeechLinesJs
+
+  var speechSpans = document.querySelectorAll('.cup-sent[data-sent]');
+  var speakingSpans = [];
+  window.__cupEpubSpeakHighlight = function(start, end) {
+    speakingSpans.forEach(function(span) { span.classList.remove('cup-sent-current'); });
+    speakingSpans = [];
+    if (start < 0) return;
+    for (var i = start; i <= end; i++) {
+      var span = speechSpans[i];
+      if (span && span.getClientRects().length) {
+        span.classList.add('cup-sent-current');
+        speakingSpans.push(span);
+      }
+    }
+    var first = speakingSpans[0];
+    if (first) {
+      programmaticScrollUntil = Date.now() + 1500;
+      first.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   };
 
@@ -4484,7 +4577,7 @@ $chapterHtml
 
   // Signal to host that the chapter is ready (sentences wrapped, all
   // CSS applied, layout settled).
-  post({ type: 'chapterReady', sentenceCount: sentenceCount });
+  post({ type: 'chapterReady', loadId: $loadId });
 
   // ── Find in chapter ──
   // Walks the DOM, wraps each match in <span class="cup-find-hit"> and
@@ -4838,18 +4931,21 @@ $chapterHtml
                   onPressed: _state.chapterIdx > 0 ? _goPrev : null,
                   tooltip: 'Previous chapter',
                 ),
-                // Read-aloud toggle. Spinning icon while active.
                 IconButton(
-                  icon: Icon(_ttsActive ? Icons.stop_circle_outlined : Icons.play_circle_outline),
-                  color: _ttsActive ? theme.accent : theme.chromeFg,
-                  tooltip: _ttsActive ? 'Stop read-aloud' : 'Read aloud',
-                  onPressed: () {
-                    if (_ttsActive) {
-                      _pauseTts();
-                    } else {
-                      _startTts();
-                    }
-                  },
+                  icon: Icon(_ttsRun != null ? Icons.pause_circle_outline : Icons.play_circle_outline),
+                  color: _ttsRun != null ? theme.accent : theme.chromeFg,
+                  tooltip: _ttsRun != null
+                      ? 'Pause read-aloud'
+                      : _ttsPosition != null ? 'Resume read-aloud' : 'Read aloud',
+                  onPressed: _ttsRun != null
+                      ? () => _stopTts(keepPosition: true)
+                      : _chapterReady?.isCompleted == true ? _startTts : null,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.record_voice_over_outlined),
+                  color: theme.chromeFg,
+                  tooltip: 'Read-aloud settings',
+                  onPressed: _showReadAloudSettings,
                 ),
                 Expanded(
                   child: Slider(
@@ -4862,6 +4958,7 @@ $chapterHtml
                     divisions: book.chapters.length > 1 ? book.chapters.length - 1 : null,
                     label: 'Ch ${_state.chapterIdx + 1}',
                     onChanged: (v) {
+                      _stopTts();
                       setState(() => _state.chapterIdx = v.round());
                     },
                     onChangeEnd: (v) => _jumpTo(v.round()),
@@ -4985,6 +5082,112 @@ $chapterHtml
       }
     }
     return out;
+  }
+
+  Future<void> _showReadAloudSettings() async {
+    final form = GlobalKey<FormState>();
+    var rate = _state.ttsRate.clamp(0.2, 1.0);
+    var replacements = _state.ttsReplacements;
+    var newlinePauseMs = _state.ttsNewlinePauseMs;
+    var paragraphPauseMs = _state.ttsParagraphPauseMs;
+
+    Widget pauseField(String label, int initialValue, ValueChanged<int> onSave) {
+      return TextFormField(
+        initialValue: initialValue.toString(),
+        keyboardType: TextInputType.number,
+        decoration: InputDecoration(labelText: label),
+        validator: (value) {
+          final ms = int.tryParse(value?.trim() ?? '');
+          return ms == null || ms < 0 || ms > epubMaxTtsPauseMs
+              ? 'Enter a whole number from 0 to $epubMaxTtsPauseMs.'
+              : null;
+        },
+        onSaved: (value) => onSave(int.parse(value!.trim())),
+      );
+    }
+
+    final save = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialog) => AlertDialog(
+          title: const Text('Read-aloud settings'),
+          scrollable: true,
+          content: SizedBox(
+            width: 360,
+            child: Form(
+              key: form,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Speech speed  ${(rate * 100).round()}%'),
+                  Slider(
+                    min: 0.2,
+                    max: 1.0,
+                    divisions: 8,
+                    value: rate,
+                    label: '${(rate * 100).round()}%',
+                    onChanged: (value) => setDialog(() => rate = value),
+                  ),
+                  pauseField(
+                    'Newline pause (ms)',
+                    newlinePauseMs,
+                    (ms) => newlinePauseMs = ms,
+                  ),
+                  const SizedBox(height: 12),
+                  pauseField(
+                    'Paragraph pause (ms)',
+                    paragraphPauseMs,
+                    (ms) => paragraphPauseMs = ms,
+                  ),
+                  const SizedBox(height: 16),
+                  TextFormField(
+                    initialValue: replacements,
+                    keyboardType: TextInputType.multiline,
+                    minLines: 2,
+                    maxLines: 5,
+                    decoration: const InputDecoration(
+                      labelText: 'Spoken replacements',
+                      hintText: '->=could be',
+                      helperText: 'One rule per line, in the form original=spoken text.',
+                      helperMaxLines: 2,
+                      errorMaxLines: 2,
+                      alignLabelWithHint: true,
+                    ),
+                    validator: (value) {
+                      try {
+                        parseEpubTtsReplacements(value ?? '');
+                        return null;
+                      } on FormatException catch (error) {
+                        return error.message;
+                      }
+                    },
+                    onSaved: (value) => replacements = value ?? '',
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () {
+                if (!form.currentState!.validate()) return;
+                form.currentState!.save();
+                Navigator.of(ctx).pop(true);
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (save != true || !mounted) return;
+    _state.ttsRate = rate;
+    _state.ttsReplacements = replacements;
+    _state.ttsNewlinePauseMs = newlinePauseMs;
+    _state.ttsParagraphPauseMs = paragraphPauseMs;
+    await _state.save(book.key);
   }
 
   void _showSettingsSheet() {
@@ -5117,18 +5320,12 @@ $chapterHtml
                   },
                 ),
                 ListTile(
-                  leading: const Icon(Icons.speed),
-                  title: const Text('Read-aloud speed'),
-                  subtitle: Slider(
-                    min: 0.2, max: 1.0, divisions: 8,
-                    value: _state.ttsRate.clamp(0.2, 1.0),
-                    label: '${(_state.ttsRate * 100).round()}%',
-                    onChanged: (v) {
-                      _state.ttsRate = v;
-                      setSheet(() {});
-                    },
-                    onChangeEnd: (v) => _setTtsRate(v),
-                  ),
+                  leading: const Icon(Icons.record_voice_over_outlined),
+                  title: const Text('Read-aloud settings'),
+                  onTap: () {
+                    Navigator.of(ctx).pop();
+                    _showReadAloudSettings();
+                  },
                 ),
                 ListTile(
                   leading: const Icon(Icons.bookmarks),
@@ -5248,6 +5445,7 @@ $chapterHtml
     background: theme.chromeBg,
     foreground: theme.chromeFg,
     onDismiss: _clearSelection,
+    onReadFromHere: () => _startTts(fromSelection: true),
     onLookup: () {
       final text = _selectionText;
       _clearSelection();
@@ -5400,12 +5598,27 @@ $chapterHtml
     _saveDebounce?.cancel();
     _state.save(book.key);
     _findController.dispose();
-    // Stop the TTS pipeline cleanly — otherwise speech can continue
-    // playing after the user has navigated away from the reader.
-    _ttsActive = false;
-    try { _tts?.stop(); } catch (_) {}
+    _stopTts(disposing: true);
     super.dispose();
   }
+}
+
+// Some native engines leave a cancelled speak() future unresolved. Keep
+// at most one interruptible wait so Stop also releases the Dart loop.
+class _EpubSpeechRun {
+  VoidCallback? _cancelWait;
+
+  Future<T?> waitFor<T>(Future<T> work) async {
+    final cancelled = Completer<T?>();
+    _cancelWait = () => cancelled.complete();
+    try {
+      return await Future.any<T?>([work, cancelled.future]);
+    } finally {
+      _cancelWait = null;
+    }
+  }
+
+  void cancel() => _cancelWait?.call();
 }
 
 class _BookSearchHit {
