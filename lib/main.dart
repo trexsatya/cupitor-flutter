@@ -10970,6 +10970,24 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       await ProfileService.setActive(target.profileId);
     }
     if (!mounted) return;
+    final practice = RegExp(r'^practice-log:([a-z][a-z-]{0,39}):([a-f0-9-]{36})?$')
+        .firstMatch(target.id);
+    if (practice != null) {
+      if (ProfileService.currentId != target.profileId) return;
+      final language = practice.group(1)!;
+      _pendingStudyCallHistory = {'language': language, 'goal': practice.group(2)};
+      final url = Uri.parse(_dialogUrl).replace(queryParameters: {'lang': language});
+      final current = Uri.tryParse(await dialogController?.currentUrl() ?? '');
+      if (!mounted) return;
+      if (!_dialog1Loaded || current?.path != url.path ||
+          (current?.queryParameters['lang'] ?? 'swedish') != language) {
+        _openDialogAtUrl(url.toString());
+      } else {
+        _showDialog1();
+        await _deliverStudyCallHistory();
+      }
+      return;
+    }
     _pendingStudyCallHistory = {'id': target.id, 'open_id': target.openId};
     if (dialogController == null) {
       _openDialogWithWebview('');
@@ -10988,7 +11006,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     await _studyCallBridge.handle('{"op":"getCalls"}');
     if (!mounted || !_dialog1Loaded || !identical(pending, _pendingStudyCallHistory)) return;
     _pendingStudyCallHistory = null;
-    _emitNotifEvent('cupitorStudyCallOpened', pending);
+    _emitNotifEvent(pending.containsKey('language')
+        ? 'cupitorPracticeReminderOpened' : 'cupitorStudyCallOpened', pending);
   }
 
   /// Foreground action button → grade via the shared service path, then

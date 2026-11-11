@@ -56,12 +56,14 @@ object StudyCalls {
     fun install(activity: Activity, messenger: BinaryMessenger) {
         cancelObsoletePlaylistCalls(activity)
         rearmBestEffort(activity)
+        PracticeReminders.rearm(activity)
         MethodChannel(messenger, "cupitor/study_calls").setMethodCallHandler { call, reply ->
             try {
                 val args = call.arguments as? Map<*, *> ?: emptyMap<Any, Any>()
                 val profile = (args["profile_id"] as? Number)?.toInt() ?: 1
                 when (call.method) {
                     "getCapabilities" -> reply.success(mapOf(
+                        "practice_reminders" to true,
                         "supported" to true, "permission" to permission(activity),
                         "full_screen" to fullScreenAllowed(activity),
                         "exact_alarms" to exactAllowed(activity),
@@ -76,6 +78,10 @@ object StudyCalls {
                         "max_pending_limit" to MAX_PENDING_LIMIT, "armed_limit" to MAX_ARMED,
                         "pending_count" to read(activity).count { it.optString("status") !in terminal },
                     ) + StudyCallSpeech.defaults(activity) + StudyCallControls.defaults(activity))
+                    "setPracticeReminders" -> {
+                        PracticeReminders.save(activity, profile, args)
+                        reply.success(true)
+                    }
                     "setSettings" -> {
                         setSettings(activity, args)
                         reply.success(mapOf("pending_limit" to pendingLimit(activity)) + StudyCallSpeech.defaults(activity) + StudyCallControls.defaults(activity))
@@ -638,6 +644,15 @@ class StudyCallReceiver : BroadcastReceiver() {
             if (intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) {
                 StudyCalls.cancelObsoletePlaylistCalls(context)
                 StudyCalls.rearmBestEffort(context)
+                PracticeReminders.rearm(context)
+                return
+            }
+            if (intent.action == Intent.ACTION_TIME_CHANGED || intent.action == Intent.ACTION_TIMEZONE_CHANGED) {
+                PracticeReminders.rearm(context)
+                return
+            }
+            if (intent.action == PracticeReminders.FIRE) {
+                PracticeReminders.deliver(context, intent)
                 return
             }
             val id = intent.getStringExtra("id") ?: return

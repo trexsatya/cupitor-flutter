@@ -25,6 +25,7 @@ class StudyCallBridge {
   static const _ops = {
     'getCapabilities',
     'setSettings',
+    'setPracticeReminders',
     'getVoices',
     'previewVoice',
     'stopVoicePreview',
