@@ -3,6 +3,60 @@ const epubDefaultTtsNewlinePauseMs = 700;
 const epubDefaultTtsParagraphPauseMs = 1200;
 const epubMaxTtsPauseMs = 10000;
 
+final _languageTag = RegExp(
+  r'^[a-z]{2,8}(?:-[a-z0-9]{1,8})*$',
+  caseSensitive: false,
+);
+final _chapterLanguageElement = RegExp(
+  r'<(html|body)(?=\s|>)[^>]*>',
+  caseSensitive: false,
+);
+final _chapterLanguageAttribute = RegExp(
+  r'''\s(xml:lang|lang)\s*=\s*(["'])([^"']*)\2''',
+  caseSensitive: false,
+);
+
+String? epubLanguageTag(String? value) {
+  final tag = value?.trim().replaceAll('_', '-');
+  if (tag == null || !_languageTag.hasMatch(tag)) return null;
+  final primary = tag.split('-').first.toLowerCase();
+  return const {'und', 'mul', 'zxx'}.contains(primary) ? null : tag;
+}
+
+// The chapter wrapper discards the original html/body elements.
+String? epubChapterLanguage(String html) {
+  String? language;
+  for (final element in _chapterLanguageElement.allMatches(html)) {
+    String? htmlLang;
+    String? xmlLang;
+    for (final attribute in _chapterLanguageAttribute.allMatches(element[0]!)) {
+      final tag = epubLanguageTag(attribute[3]);
+      if (attribute[1]!.toLowerCase() == 'xml:lang') {
+        xmlLang = tag;
+      } else {
+        htmlLang = tag;
+      }
+    }
+    language = xmlLang ?? htmlLang ?? language;
+    if (element[1]!.toLowerCase() == 'body') break;
+  }
+  return language;
+}
+
+// Some engines need a full locale even when the EPUB declares a bare
+// language. Prefer an exact installed locale, then a voice in that language.
+String epubSpeechEngineLocale(String requested, Iterable<String> available) {
+  final tag = requested.toLowerCase();
+  final primary = tag.split('-').first;
+  String? sameLanguage;
+  for (final locale in available) {
+    final candidate = epubLanguageTag(locale)?.toLowerCase();
+    if (candidate == tag) return locale;
+    if (candidate?.split('-').first == primary) sameLanguage ??= locale;
+  }
+  return sameLanguage ?? requested;
+}
+
 List<(String, String)> parseEpubTtsReplacements(String input) {
   final rules = <(String, String)>[];
   for (final line in input.split('\n')) {

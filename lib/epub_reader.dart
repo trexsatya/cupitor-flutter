@@ -315,12 +315,14 @@ class EpubChapter {
     required this.href,
     required this.title,
     required this.html,
+    this.language,
   });
 
   final String id;
   final String href;     // path inside the zip (POSIX-style)
   final String title;    // from TOC; falls back to "Chapter N"
   final String html;     // raw XHTML body content
+  final String? language;
 }
 
 class EpubTocEntry {
@@ -342,12 +344,14 @@ class EpubBook {
     required this.basePathInZip,
     required this.key,
     required this.filePath,
+    this.language,
     this.coverBytes,
     this.coverMime,
   });
 
   final String title;
   final String? author;
+  final String? language;
   final List<EpubChapter> chapters;
   final List<EpubTocEntry> toc;
   /// Resource path (inside zip) → data: URL we inline into chapter HTML.
@@ -364,6 +368,9 @@ class EpubBook {
   /// Raw bytes of the cover image (JPEG/PNG/SVG) if the book had one.
   final Uint8List? coverBytes;
   final String? coverMime;
+
+  String speechLanguageForChapter(int index, String fallback) =>
+      chapters[index].language ?? language ?? fallback;
 
   static Future<EpubBook> openFile(File file) async {
     final bytes = await file.readAsBytes();
@@ -430,9 +437,10 @@ class EpubBook {
     final opfDoc = xml.XmlDocument.parse(utf8.decode(opfFile.content as List<int>));
     final basePath = opfPath.contains('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
 
-    // 2) Metadata: title, author.
+    // 2) Metadata: title, author, language.
     String title = 'Untitled';
     String? author;
+    String? language;
     final metaEls = opfDoc.findAllElements('metadata').firstOrNull;
     if (metaEls != null) {
       // dc:title can appear multiple times; pick the first non-empty.
@@ -455,6 +463,11 @@ class EpubBook {
           final a = el.innerText.trim();
           if (a.isNotEmpty) { author = a; break; }
         }
+      }
+      for (final el in metaEls.childElements) {
+        if (el.name.local != 'language') continue;
+        language = epubLanguageTag(el.innerText);
+        if (language != null) break;
       }
     }
 
@@ -532,6 +545,7 @@ class EpubBook {
         href: m.href,
         title: 'Chapter ${i + 1}',
         html: rewritten,
+        language: epubChapterLanguage(rawHtml),
       ));
       // Used by TOC resolution: an href like "ch3.xhtml#sec2" maps to the
       // chapter whose href starts with "ch3.xhtml".
@@ -591,7 +605,12 @@ class EpubBook {
         if (e.chapterIdx >= 0 && e.chapterIdx < chapters.length) {
           final c = chapters[e.chapterIdx];
           chapters[e.chapterIdx] = EpubChapter(
-            id: c.id, href: c.href, title: e.title.isNotEmpty ? e.title : c.title, html: c.html);
+            id: c.id,
+            href: c.href,
+            title: e.title.isNotEmpty ? e.title : c.title,
+            html: c.html,
+            language: c.language,
+          );
         }
         applyTocTitles(e.children);
       }
@@ -601,6 +620,7 @@ class EpubBook {
     return EpubBook(
       title: title,
       author: author,
+      language: language,
       chapters: chapters,
       toc: toc,
       resources: resources,
@@ -895,6 +915,7 @@ Future<void> openEpubReader(
   required EpubLibrary library,
   required void Function(String word, String context) onLookup,
   Future<String> Function(String text)? onTranslate,
+  String? speechFallbackLocale,
   String? initialHighlight,
   Future<String?> Function({
     required String text,
@@ -926,6 +947,7 @@ Future<void> openEpubReader(
       book: book,
       onLookup: onLookup,
       onTranslate: onTranslate,
+      speechFallbackLocale: speechFallbackLocale,
       initialHighlight: initialHighlight,
       onSendToPlaylist: onSendToPlaylist,
     ),
@@ -941,6 +963,7 @@ class EpubReaderScreen extends StatefulWidget {
     required this.book,
     required this.onLookup,
     this.onTranslate,
+    this.speechFallbackLocale,
     this.initialHighlight,
     this.onSendToPlaylist,
   });
@@ -948,6 +971,7 @@ class EpubReaderScreen extends StatefulWidget {
   final EpubBook book;
   final void Function(String word, String context) onLookup;
   final Future<String> Function(String text)? onTranslate;
+  final String? speechFallbackLocale;
 
   /// Sends one sentence to the language webapp to be filed in a playlist.
   /// Lives in the host because only it holds the webapp's WebView. Null
@@ -3530,6 +3554,8 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
     if (_ttsRun != null) return;
     final position = _ttsPosition ??= EpubSpeechPosition();
     final run = _EpubSpeechRun();
+    final fallbackLocale = widget.speechFallbackLocale ??
+        Localizations.localeOf(context).toLanguageTag();
     setState(() => _ttsRun = run);
     try {
       if (fromSelection) {
@@ -3544,8 +3570,19 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
       await tts.setVolume(1.0);
       if (_ttsRun != run) return;
       await tts.setPitch(1.0);
+      if (_ttsRun != run) return;
+      final languages = await tts.getLanguages;
+      final available = languages is Iterable
+          ? languages.whereType<String>()
+          : const <String>[];
       double? appliedRate;
+      String? appliedLocale;
       while (_ttsRun == run) {
+        final requested = book.speechLanguageForChapter(
+          _state.chapterIdx,
+          fallbackLocale,
+        );
+        final locale = epubSpeechEngineLocale(requested, available);
         final lines = await (position.lines ??= _readTtsLines(controller));
         while (_ttsRun == run && position.nextLine < lines.length) {
           final line = lines[position.nextLine];
@@ -3556,6 +3593,19 @@ class _EpubReaderScreenState extends State<EpubReaderScreen> {
             if (!ready.isCompleted) {
               await run.waitFor(ready.future.timeout(const Duration(seconds: 20)));
               if (_ttsRun != run) return;
+            }
+            if (appliedLocale != locale) {
+              final result = await tts.setLanguage(locale);
+              if (_ttsRun != run) return;
+              if (result == 0 || result == false) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('No text-to-speech voice for $locale is available.'),
+                  ),
+                );
+                return;
+              }
+              appliedLocale = locale;
             }
             await controller.runJavaScript(
               'window.__cupEpubSpeakHighlight(${line['start']}, ${line['end']});',

@@ -4845,6 +4845,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       file: file,
       library: lib,
       initialHighlight: initialHighlight,
+      speechFallbackLocale: _speechLocale(),
       onLookup: (word, _) {
         // Send the looked-up word into the existing lookup flow. The
         // surrounding context is discarded for now — dialog1 only takes
