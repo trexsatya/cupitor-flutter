@@ -1,8 +1,63 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:archive/archive.dart';
 import 'package:cupitor/epub_reader.dart';
 import 'package:cupitor/epub_speech.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'docx_fixtures.dart' show zipFixture;
+
 void main() {
+  test('reads EPUB language metadata and chapter overrides', () async {
+    final folder = await Directory.systemTemp.createTemp(
+      'cupitor_epub_speech_',
+    );
+    addTearDown(() => folder.delete(recursive: true));
+    final archive = Archive();
+    const files = {
+      'META-INF/container.xml':
+          '<container><rootfiles>'
+          '<rootfile full-path="book.opf"/></rootfiles></container>',
+      'book.opf': '''
+<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <metadata><dc:language>und</dc:language><dc:language>sv</dc:language></metadata>
+  <manifest>
+    <item id="a" href="a.xhtml" media-type="application/xhtml+xml"/>
+    <item id="b" href="b.xhtml" media-type="application/xhtml+xml"/>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+  </manifest>
+  <spine><itemref idref="a"/><itemref idref="b"/></spine>
+</package>
+''',
+      'a.xhtml': '<html><body><p>Hej.</p></body></html>',
+      'b.xhtml':
+          '<html lang="en"><body xml:lang="es-MX"><p>Hola.</p></body></html>',
+      'nav.xhtml':
+          '<html><body><nav type="toc"><ol><li>'
+          '<a href="b.xhtml">Spanish chapter</a></li></ol></nav></body></html>',
+    };
+    for (final entry in files.entries) {
+      final bytes = utf8.encode(entry.value);
+      archive.addFile(ArchiveFile(entry.key, bytes.length, bytes));
+    }
+    final file = await File.fromUri(
+      folder.uri.resolve('book.epub'),
+    ).writeAsBytes(zipFixture(archive));
+    final book = await EpubBook.openFile(file);
+    expect(book.chapters[1].title, 'Spanish chapter');
+    expect(book.speechLanguageForChapter(0, 'en-US'), 'sv');
+    expect(book.speechLanguageForChapter(1, 'en-US'), 'es-MX');
+  });
+
+  test('speech engine locale prefers exact and same-language voices', () {
+    const available = ['en-US', 'es-ES', 'es-MX', 'sv-SE'];
+    expect(epubSpeechEngineLocale('es-mx', available), 'es-MX');
+    expect(epubSpeechEngineLocale('sv', available), 'sv-SE');
+    expect(epubSpeechEngineLocale('es-AR', available), 'es-ES');
+    expect(epubSpeechEngineLocale('fr', available), 'fr');
+  });
+
   test('existing books retain speed and get read-aloud defaults', () {
     final state = EpubReadingState.fromJson({'ttsRate': 0.8});
     expect(state.ttsRate, 0.8);
