@@ -17,6 +17,7 @@ import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -78,6 +79,7 @@ import 'playlist_service.dart';
 import 'profile_service.dart';
 import 'tag_browser.dart';
 import 'capture_meta.dart';
+import 'filmot_urls.dart';
 import 'media_store.dart';
 import 'tag_capture.dart';
 import 'tag_filter.dart';
@@ -5446,8 +5448,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       ..addJavaScriptChannel('SnippetLogChannel',
           onMessageReceived: _onSnippetLogMessage)
       ..setNavigationDelegate(NavigationDelegate(
-        onNavigationRequest: (request) {
+        onNavigationRequest: (request) async {
           if (!request.isMainFrame) return NavigationDecision.navigate;
+          final signIn = filmotBrowserSignInUrl(url, request.url);
+          if (signIn != null) {
+            await _openFilmotInBrowser(dialogId, signIn);
+            return NavigationDecision.prevent;
+          }
           final rewritten = _rewriteYouTubeUrl(request.url);
           if (rewritten != null) {
             dialog2Controller.loadRequest(Uri.parse(rewritten));
@@ -5472,7 +5479,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           // Auto-unmute any YouTube/HTML5 media that autoplayed muted.
           dialog2Controller.runJavaScript(_autoUnmuteYouTubeJs);
           _injectScrollDiag(dialog2Controller, 'dialog2:$dialogIdForBridge');
-          if (_isFilmotUrl(finishedUrl)) {
+          if (isFilmotUrl(finishedUrl)) {
             _injectFilmotHelper(dialog2Controller);
           }
           if (_isWiktionaryUrl(finishedUrl)) {
@@ -5703,7 +5710,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     ),
                   ),
                 ],
-                if (_isFilmotUrl(url)) ...[
+                if (isFilmotUrl(url)) ...[
+                  IconButton(
+                    tooltip: 'Open Filmot in browser',
+                    icon: const Icon(Icons.open_in_browser, size: 20),
+                    onPressed: () async {
+                      final current = await controller.currentUrl();
+                      final target = isFilmotUrl(current) ? current! : url;
+                      await _openFilmotInBrowser(dialogId, Uri.parse(target));
+                    },
+                  ),
                   IconButton(
                     tooltip: 'Capture subtitle (with context, translate, send to lookup)',
                     icon: Icon(Icons.subtitles, size: 20),
@@ -5907,9 +5923,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   // ---------- Filmot helpers ----------
 
-  bool _isFilmotUrl(String? url) {
-    final host = Uri.tryParse(url ?? '')?.host ?? '';
-    return host.endsWith('filmot.com');
+  Future<void> _openFilmotInBrowser(String dialogId, Uri url) async {
+    try {
+      if (await launchUrl(url, mode: LaunchMode.externalApplication)) return;
+    } catch (_) {
+      // Keep the Filmot results visible when the browser cannot open.
+    }
+    _showDialog2SnackBar(dialogId, 'Could not open Filmot in your browser.');
   }
 
   bool _isWiktionaryUrl(String? url) {
@@ -6252,7 +6272,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // Push partial results so the UI updates progressively.
       if (anyResolved) {
         for (final entry in _dialog2Controllers.entries) {
-          if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+          if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
         }
       }
     }
@@ -6675,7 +6695,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // Push updated config back to every active filmot dialog so all open
       // dialogs immediately hide rows from this channel.
       for (final entry in _dialog2Controllers.entries) {
-        if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+        if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
       }
       _showDialog2SnackBar(dialogId, 'Blacklisted: $channel');
     } else if (action == 'saveVideo') {
@@ -6726,7 +6746,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                           setState(() => _filmotBlacklistDisabled = v);
                           setStateDialog(() {});
                           for (final entry in _dialog2Controllers.entries) {
-                            if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                            if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
                           }
                         },
                       ),
@@ -6760,7 +6780,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                             _saveFilmotBlacklist();
                             setStateDialog(() {});
                             for (final entry in _dialog2Controllers.entries) {
-                              if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                              if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
                             }
                           },
                         );
@@ -6774,7 +6794,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   _saveFilmotBlacklist();
                   setStateDialog(() {});
                   for (final entry in _dialog2Controllers.entries) {
-                    if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                    if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
                   }
                 },
                 child: Text('Clear all'),
