@@ -40,4 +40,31 @@ void main() {
       isNull,
     );
   });
+
+  test('identifies the video for a Filmot SRT import', () {
+    const id = 'NxAaT1Yj9OE';
+    for (final link in [
+      'https://filmot.com/video/$id/Example',
+      'https://beta.filmot.com/sidebyside/$id/auto.sv/sv/Swedish/Swedish',
+      'https://filmot.com/search/%22%C3%A5tg%C3%A5ng%22/$id/1?lang=sv',
+      'https://youtu.be/$id?t=9',
+      'https://www.youtube.com/watch?v=$id',
+      id,
+    ]) {
+      expect(filmotSubtitleVideoId(' $link '), id, reason: link);
+    }
+  });
+
+  test('an SRT cannot be assigned to a Filmot search without a video', () {
+    for (final link in [
+      'https://filmot.com/search/NxAaT1Yj9OE/1?lang=sv',
+      'https://filmot.com/search/sondera/1?lang=sv',
+      'https://filmot.com/video/short',
+      'https://filmot.com/auth/login',
+      'https://filmot.com.example.com/video/NxAaT1Yj9OE',
+      'https://filmot.com@example.com/video/NxAaT1Yj9OE',
+    ]) {
+      expect(filmotSubtitleVideoId(link), isNull, reason: link);
+    }
+  });
 }
