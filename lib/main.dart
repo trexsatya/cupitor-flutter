@@ -5447,12 +5447,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           onMessageReceived: _onSnippetLogMessage)
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (request) async {
-          if (!request.isMainFrame) return NavigationDecision.navigate;
+          // WebKit reports new-window requests without a main-frame target.
           final signIn = filmotBrowserSignInUrl(url, request.url);
           if (signIn != null) {
             await _openFilmotInBrowser(dialogId, signIn);
             return NavigationDecision.prevent;
           }
+          if (!request.isMainFrame) return NavigationDecision.navigate;
           final rewritten = _rewriteYouTubeUrl(request.url);
           if (rewritten != null) {
             dialog2Controller.loadRequest(Uri.parse(rewritten));

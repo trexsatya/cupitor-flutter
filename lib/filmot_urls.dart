@@ -27,16 +27,34 @@ String? filmotSubtitleVideoId(String input) {
 
 /// Start Filmot's OAuth flow in the browser that will receive its callback.
 Uri? filmotBrowserSignInUrl(String initialUrl, String requestedUrl) {
-  if (!isFilmotUrl(initialUrl) || !isFilmotUrl(requestedUrl)) return null;
-  final request = Uri.parse(requestedUrl);
-  if (request.scheme != 'https' || request.userInfo.isNotEmpty) return null;
+  if (!isFilmotUrl(initialUrl)) return null;
+  final request = Uri.tryParse(requestedUrl);
+  if (request == null ||
+      request.scheme != 'https' ||
+      request.userInfo.isNotEmpty) {
+    return null;
+  }
   final path = request.path.replaceFirst(RegExp(r'/$'), '');
-  if (path == '/auth/login') return request;
-  if (path == '/auth/patreon/redirect') {
+  final filmotRequest = isFilmotUrl(requestedUrl);
+  if (filmotRequest && path == '/auth/login') return request;
+
+  // If Patreon has already opened Google's account picker inside the WebView,
+  // restart with Filmot. The picker URL belongs to the embedded popup session.
+  final patreonGooglePopup =
+      request.host == 'accounts.google.com' &&
+      path == '/gsi/select' &&
+      request.queryParameters['ux_mode'] == 'popup' &&
+      const {
+        'https://www.patreon.com',
+        'https://patreon.com',
+      }.contains(request.queryParameters['origin']);
+  if (patreonGooglePopup ||
+      (filmotRequest && path == '/auth/patreon/redirect')) {
+    final filmot = filmotRequest ? request : Uri.parse(initialUrl);
     return Uri(
       scheme: 'https',
-      host: request.host,
-      port: request.hasPort ? request.port : null,
+      host: filmot.host,
+      port: filmot.hasPort ? filmot.port : null,
       path: '/auth/login',
     );
   }

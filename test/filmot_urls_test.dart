@@ -19,6 +19,32 @@ void main() {
     );
   });
 
+  test('Patreon Google popup restarts at Filmot without forwarding state', () {
+    const popup =
+        'https://accounts.google.com/gsi/select?ux_mode=popup'
+        '&origin=https%3A%2F%2Fwww.patreon.com&as=example';
+    expect(
+      filmotBrowserSignInUrl(results, popup),
+      Uri.parse('https://filmot.com/auth/login'),
+    );
+    expect(
+      filmotBrowserSignInUrl('https://beta.filmot.com/search/test/1', popup),
+      Uri.parse('https://beta.filmot.com/auth/login'),
+    );
+    expect(filmotBrowserSignInUrl('https://www.patreon.com', popup), isNull);
+    for (final unrelated in [
+      popup.replaceFirst('www.patreon.com', 'www.patreon.com.example.org'),
+      popup.replaceFirst('ux_mode=popup', 'ux_mode=redirect'),
+      popup.replaceFirst(
+        'accounts.google.com',
+        'accounts.google.com.example.org',
+      ),
+      popup.replaceFirst('/gsi/select', '/gsi/client'),
+    ]) {
+      expect(filmotBrowserSignInUrl(results, unrelated), isNull);
+    }
+  });
+
   test('search, settings, callbacks, and unrelated sites stay in Cupitor', () {
     for (final url in [
       results,
