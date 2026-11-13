@@ -17,7 +17,6 @@ import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
-import 'package:url_launcher/url_launcher.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -79,7 +78,6 @@ import 'playlist_service.dart';
 import 'profile_service.dart';
 import 'tag_browser.dart';
 import 'capture_meta.dart';
-import 'filmot_urls.dart';
 import 'media_store.dart';
 import 'tag_capture.dart';
 import 'tag_filter.dart';
@@ -527,8 +525,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   final Map<String, Offset> _chipPositions = {};
   final ValueNotifier<int> _minimizedVersion = ValueNotifier(0);
 
-  // Request the mobile Chrome layout in the reader and secondary WebViews.
-  // Filmot's Google sign-in uses the external browser.
+  // Pretend to be Chrome — the default Android WebView UA contains "; wv)",
+  // which Google explicitly checks for and uses to refuse OAuth flows
+  // ("disallowed_useragent"). Without this, Sign-in-with-Google on sites like
+  // filmot.com fails. Applied to every WebViewController we create.
   static const String _userAgent =
       'Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36';
@@ -536,7 +536,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // The main browser on macOS identifies as desktop Safari instead: the
   // Android UA above gets sites' touch-first mobile layouts, and YouTube's
   // mobile player treats every mouse click as play/pause, with no theater
-  // mode.
+  // mode. Safari's UA carries no WebView marker, so Google sign-in still works.
   static const String _macUserAgent =
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 '
       '(KHTML, like Gecko) Version/18.0 Safari/605.1.15';
@@ -5446,13 +5446,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       ..addJavaScriptChannel('SnippetLogChannel',
           onMessageReceived: _onSnippetLogMessage)
       ..setNavigationDelegate(NavigationDelegate(
-        onNavigationRequest: (request) async {
-          // WebKit reports new-window requests without a main-frame target.
-          final signIn = filmotBrowserSignInUrl(url, request.url);
-          if (signIn != null) {
-            await _openFilmotInBrowser(dialogId, signIn);
-            return NavigationDecision.prevent;
-          }
+        onNavigationRequest: (request) {
           if (!request.isMainFrame) return NavigationDecision.navigate;
           final rewritten = _rewriteYouTubeUrl(request.url);
           if (rewritten != null) {
@@ -5478,7 +5472,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           // Auto-unmute any YouTube/HTML5 media that autoplayed muted.
           dialog2Controller.runJavaScript(_autoUnmuteYouTubeJs);
           _injectScrollDiag(dialog2Controller, 'dialog2:$dialogIdForBridge');
-          if (isFilmotUrl(finishedUrl)) {
+          if (_isFilmotUrl(finishedUrl)) {
             _injectFilmotHelper(dialog2Controller);
           }
           if (_isWiktionaryUrl(finishedUrl)) {
@@ -5709,30 +5703,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     ),
                   ),
                 ],
-                if (isFilmotUrl(url)) ...[
-                  PopupMenuButton<bool>(
-                    tooltip: 'Filmot browser and SRT import',
-                    icon: const Icon(Icons.open_in_browser, size: 20),
-                    itemBuilder: (_) => const [
-                      PopupMenuItem<bool>(
-                        value: false,
-                        child: Text('Open Filmot in browser'),
-                      ),
-                      PopupMenuItem<bool>(
-                        value: true,
-                        child: Text('Import Filmot SRT…'),
-                      ),
-                    ],
-                    onSelected: (importSrt) async {
-                      if (importSrt) {
-                        await _importFilmotSrt(ctx, dialogId);
-                        return;
-                      }
-                      final current = await controller.currentUrl();
-                      final target = isFilmotUrl(current) ? current! : url;
-                      await _openFilmotInBrowser(dialogId, Uri.parse(target));
-                    },
-                  ),
+                if (_isFilmotUrl(url)) ...[
                   IconButton(
                     tooltip: 'Capture subtitle (with context, translate, send to lookup)',
                     icon: Icon(Icons.subtitles, size: 20),
@@ -5771,7 +5742,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 IconButton(
                   tooltip: 'Minimize',
                   icon: const Icon(Icons.minimize, size: 20),
-                  onPressed: () => _minimizeDialog2(ctx, dialogId),
+                  onPressed: () {
+                    _minimizedDialog2s.add(dialogId);
+                    _everMinimizedDialog2s.add(dialogId); // Mark as ever minimized
+                    Navigator.of(ctx).pop();
+                    _bumpMinimizedVersion();
+                  },
                 ),
                 IconButton(
                   tooltip: 'Close',
@@ -5931,118 +5907,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   // ---------- Filmot helpers ----------
 
-  Future<void> _openFilmotInBrowser(String dialogId, Uri url) async {
-    try {
-      if (await launchUrl(url, mode: LaunchMode.externalApplication)) return;
-    } catch (_) {
-      // Keep the Filmot results visible when the browser cannot open.
-    }
-    _showDialog2SnackBar(dialogId, 'Could not open Filmot in your browser.');
-  }
-
-  void _minimizeDialog2(BuildContext ctx, String dialogId) {
-    if (!ctx.mounted || ModalRoute.of(ctx)?.isCurrent != true) return;
-    _minimizedDialog2s.add(dialogId);
-    _everMinimizedDialog2s.add(dialogId);
-    Navigator.of(ctx).pop();
-    _bumpMinimizedVersion();
-  }
-
-  Future<void> _importFilmotSrt(BuildContext ctx, String dialogId) async {
-    var link = '';
-    try {
-      final copied = (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? '';
-      if (filmotSubtitleVideoId(copied) != null) link = copied.trim();
-    } catch (_) {
-      // Pasting the link manually also works when clipboard access is denied.
-    }
-    if (!ctx.mounted) return;
-
-    final form = GlobalKey<FormState>();
-    var language = _selectedLanguage;
-    final source = await showDialog<({String videoId, String language})>(
-      context: ctx,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Import Filmot SRT'),
-        content: SizedBox(
-          width: 440,
-          child: SingleChildScrollView(
-            child: Form(
-              key: form,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Choose Download SRT on the Filmot subtitles page in your browser. '
-                    'Copy that page’s link or the YouTube video link.',
-                  ),
-                  const SizedBox(height: 12),
-                  TextFormField(
-                    initialValue: link,
-                    decoration: const InputDecoration(labelText: 'Video link'),
-                    keyboardType: TextInputType.url,
-                    onChanged: (value) => link = value,
-                    validator: (value) =>
-                        filmotSubtitleVideoId(value ?? '') == null
-                            ? 'Enter a Filmot or YouTube video link.'
-                            : null,
-                  ),
-                  const SizedBox(height: 8),
-                  TextFormField(
-                    initialValue: language,
-                    decoration: const InputDecoration(
-                      labelText: 'Subtitle language code',
-                      hintText: 'sv, es, en…',
-                    ),
-                    onChanged: (value) => language = value,
-                    validator: (value) =>
-                        RegExp(r'^[a-zA-Z]{2,3}$').hasMatch((value ?? '').trim())
-                            ? null
-                            : 'Enter a two- or three-letter language code.',
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () {
-              if (form.currentState?.validate() != true) return;
-              Navigator.of(dialogContext).pop((
-                videoId: filmotSubtitleVideoId(link)!,
-                language: baseLanguageCode(language),
-              ));
-            },
-            child: const Text('Choose SRT file'),
-          ),
-        ],
-      ),
-    );
-    if (source == null || !ctx.mounted || _localSubtitleImportBusy) return;
-    _localSubtitleImportBusy = true;
-    try {
-      final picked = await _pickLocalSubtitleFile();
-      if (picked == null || !ctx.mounted) return;
-      _showFullSubtitleDialog(
-        ctx,
-        lines: picked.lines,
-        sourceLang: source.language,
-        videoUrl: 'https://www.youtube.com/watch?v=${source.videoId}',
-        videoId: source.videoId,
-        videoTitle: '',
-        onSendToLookup: () => _minimizeDialog2(ctx, dialogId),
-      );
-    } catch (error) {
-      if (ctx.mounted) _showCaptureError('Could not open SRT file', '$error');
-    } finally {
-      _localSubtitleImportBusy = false;
-    }
+  bool _isFilmotUrl(String? url) {
+    final host = Uri.tryParse(url ?? '')?.host ?? '';
+    return host.endsWith('filmot.com');
   }
 
   bool _isWiktionaryUrl(String? url) {
@@ -6385,7 +6252,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // Push partial results so the UI updates progressively.
       if (anyResolved) {
         for (final entry in _dialog2Controllers.entries) {
-          if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+          if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
         }
       }
     }
@@ -6808,7 +6675,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // Push updated config back to every active filmot dialog so all open
       // dialogs immediately hide rows from this channel.
       for (final entry in _dialog2Controllers.entries) {
-        if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+        if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
       }
       _showDialog2SnackBar(dialogId, 'Blacklisted: $channel');
     } else if (action == 'saveVideo') {
@@ -6859,7 +6726,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                           setState(() => _filmotBlacklistDisabled = v);
                           setStateDialog(() {});
                           for (final entry in _dialog2Controllers.entries) {
-                            if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                            if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
                           }
                         },
                       ),
@@ -6893,7 +6760,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                             _saveFilmotBlacklist();
                             setStateDialog(() {});
                             for (final entry in _dialog2Controllers.entries) {
-                              if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                              if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
                             }
                           },
                         );
@@ -6907,7 +6774,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   _saveFilmotBlacklist();
                   setStateDialog(() {});
                   for (final entry in _dialog2Controllers.entries) {
-                    if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                    if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
                   }
                 },
                 child: Text('Clear all'),
@@ -7201,35 +7068,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   bool _localSubtitleImportBusy = false;
 
-  Future<({String fileName, List<Map<String, dynamic>> lines})?>
-      _pickLocalSubtitleFile() async {
-    final picked = await FilePicker.platform.pickFiles(
-      dialogTitle: 'Open SRT subtitles',
-      type: FileType.custom,
-      allowedExtensions: const ['srt'],
-      allowMultiple: false,
-      withData: true,
-    );
-    if (picked == null || picked.files.isEmpty) return null;
-    final file = picked.files.single;
-    if (file.size > maxLocalSubtitleBytes) {
-      throw const FormatException('The SRT file is larger than 10 MB.');
-    }
-    final bytes = file.bytes ??
-        (file.path != null ? await File(file.path!).readAsBytes() : null);
-    if (bytes == null) throw const FormatException('The file could not be read.');
-    final lines = await compute(
-      (data) => parseLocalSrt(decodeLocalSubtitles(data)),
-      bytes,
-    );
-    if (lines.isEmpty) {
-      throw const FormatException(
-        'No valid subtitle cues were found in this SRT file.',
-      );
-    }
-    return (fileName: file.name, lines: lines);
-  }
-
   Future<void> _openLocalSubtitlesForPage(
       WebViewController page, JavaScriptMessage message) async {
     if (!mounted || !identical(page, _controller)) return;
@@ -7251,16 +7089,33 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (_localSubtitleImportBusy) { await cancel(); return; }
     _localSubtitleImportBusy = true;
     try {
-      final picked = await _pickLocalSubtitleFile();
-      if (picked == null) { await cancel(); return; }
+      final picked = await FilePicker.platform.pickFiles(
+        dialogTitle: 'Open SRT subtitles',
+        type: FileType.custom,
+        allowedExtensions: const ['srt'],
+        allowMultiple: false,
+        withData: true,
+      );
+      if (picked == null || picked.files.isEmpty) { await cancel(); return; }
+      final file = picked.files.single;
+      if (file.size > maxLocalSubtitleBytes) {
+        throw const FormatException('The SRT file is larger than 10 MB.');
+      }
+      final bytes = file.bytes ??
+          (file.path != null ? await File(file.path!).readAsBytes() : null);
+      if (bytes == null) throw const FormatException('The file could not be read.');
+      final lines = await compute(parseLocalSrt, decodeLocalSubtitles(bytes));
+      if (lines.isEmpty) {
+        throw const FormatException('No valid subtitle cues were found in this SRT file.');
+      }
       if (!mounted || !identical(page, _controller)) return;
       final language = request['lang'] is String
           ? request['lang'] as String : _selectedLanguage;
       final accepted = await page.runJavaScriptReturningResult(localSubtitleResultJs({
         'requestId': requestId,
-        'fileName': picked.fileName,
+        'fileName': file.name,
         'lang': language,
-        'lines': picked.lines,
+        'lines': lines,
       }));
       if (accepted.toString() != 'true') {
         _showCaptureError('Could not attach subtitles',
@@ -7590,7 +7445,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     required String videoUrl,
     required String videoId,
     required String videoTitle,
-    VoidCallback? onSendToLookup,
   }) {
     final originals = lines.map((l) => (l['text'] as String)).toList();
     List<String> translation = List<String>.filled(lines.length, '');
@@ -7785,7 +7639,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     });
                   }
                   Navigator.of(dctx).pop();
-                  onSendToLookup?.call();
                   _sendCapturedSubtitleToDialog1(<String, dynamic>{
                     'query': '',
                     'sourceLang': sourceLang,
