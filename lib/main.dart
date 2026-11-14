@@ -42,6 +42,7 @@ import 'stable_dialog_chrome.dart';
 import 'dialog_app_lifecycle.dart';
 import 'mac_webview.dart';
 import 'find_page_shortcut.dart';
+import 'desktop_browser_shortcut.dart';
 import 'tts_bridge_scope.dart';
 import 'history_store.dart';
 import 'history_screen.dart';
@@ -325,9 +326,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   bool _showAppBar = true;
   // Drives the toolbar's spinner while the main page loads.
   final PageLoading _pageLoading = PageLoading();
-  // Platforms whose top app bar auto-hides on a timer and toggles via
-  // double-tap / long-press. Mac mirrors Android so both feel identical.
-  bool get _autoHideAppBar => Platform.isAndroid || Platform.isMacOS;
+  bool get _desktop => Platform.isMacOS || Platform.isWindows || Platform.isLinux;
+  bool _showWideBrowserTools = false;
+  // Compact windows use the same auto-hiding toolbar as Android.
+  bool get _autoHideAppBar =>
+      Platform.isAndroid || (Platform.isMacOS && !_showWideBrowserTools);
+
+  bool _hasWideBrowserToolbar(double width) =>
+      _desktop && width >= desktopToolbarMinWidth;
   String? _githubToken;
   int _pdfTextFontSize = 15;
   // Root overlay stays above dialog routes and native WebView platform views.
@@ -403,7 +409,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // route — which lives outside the outer State's setState scope — rebuilds.
   final ValueNotifier<bool> _dialog1FullscreenNotifier = ValueNotifier(false);
   final ValueNotifier<int> _dialog1ChromeActivity = ValueNotifier(0);
-  final ValueNotifier<bool> _studyToolsOpen = ValueNotifier(false);
   // Language-app ↔ Cupitor bridge for the notification feature (spec:
   // docs/superpowers/specs/2026-07-27-notifications-design.md §Bridge).
   // Permission/exact-alarm/action capabilities are backed by the real
@@ -563,6 +568,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     SpeechHub.release(_speechHubListener);
     _videoNotePoller.dispose();
     HardwareKeyboard.instance.removeHandler(_onFindPageKey);
+    HardwareKeyboard.instance.removeHandler(_onDesktopBrowserKey);
     HardwareKeyboard.instance.removeHandler(_onMacFullscreenEscape);
     _findOverlay?.remove();
     _findOverlay?.dispose();
@@ -621,7 +627,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _isListeningNotifier.dispose();
     _dialog1FullscreenNotifier.dispose();
     _dialog1ChromeActivity.dispose();
-    _studyToolsOpen.dispose();
     _dialog1Tts?.stop();
     _dialog1Tts = null;
     // Close any open ML Kit translators in the snippet-bridge pool.
@@ -690,6 +695,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       onFindShortcut: () {
         unawaited(_dispatchFindToVisiblePage());
       },
+      onBrowserShortcut: (name) {
+        for (final action in DesktopBrowserShortcut.values) {
+          if (action.name == name) {
+            _runDesktopBrowserShortcut(action);
+            break;
+          }
+        }
+      },
       onFilmotCapture: _receiveBrowserFilmotCapture,
     );
     if (Platform.isAndroid) {
@@ -701,6 +714,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       });
     }
     HardwareKeyboard.instance.addHandler(_onFindPageKey);
+    HardwareKeyboard.instance.addHandler(_onDesktopBrowserKey);
     HardwareKeyboard.instance.addHandler(_onMacFullscreenEscape);
     // Record why we died last time — a system kill leaves no crash report at
     // all, so this log is the only evidence such a death ever happened. Runs
@@ -847,7 +861,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // instance. Same shape as dialog2Controller.
       late final WebViewController c;
       c = WebViewController()
-        ..configureForMac()
+        ..configureForMac(browserShortcuts: true)
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(Platform.isMacOS ? _macUserAgent : _userAgent)
         ..addJavaScriptChannel('CaptionHandler', onMessageReceived: (msg) {
@@ -1427,7 +1441,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   bool _onFindPageKey(KeyEvent event) {
     if (!_isControllerReady ||
-        !(Platform.isMacOS || Platform.isWindows || Platform.isLinux) ||
+        !_desktop ||
         event is! KeyDownEvent) return false;
     final keyboard = HardwareKeyboard.instance;
     if (_findOverlay != null) {
@@ -1460,6 +1474,61 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (!_hasVisibleWebViewForFind()) return false;
     unawaited(_dispatchFindToVisiblePage());
     return true;
+  }
+
+  bool _onDesktopBrowserKey(KeyEvent event) {
+    if (!_desktop || event is! KeyDownEvent) return false;
+    final keyboard = HardwareKeyboard.instance;
+    final action = desktopBrowserShortcutForKey(
+      event.logicalKey,
+      macOS: Platform.isMacOS,
+      metaPressed: keyboard.isMetaPressed,
+      controlPressed: keyboard.isControlPressed,
+      altPressed: keyboard.isAltPressed,
+      shiftPressed: keyboard.isShiftPressed,
+    );
+    return action != null && _runDesktopBrowserShortcut(action);
+  }
+
+  bool _runDesktopBrowserShortcut(DesktopBrowserShortcut action) {
+    if (!mounted || !_isControllerReady || _webFullscreen ||
+        ModalRoute.of(context)?.isCurrent != true) return false;
+    switch (action) {
+      case DesktopBrowserShortcut.address:
+        _showAppBarWithTimer();
+        _urlFocusNode.requestFocus();
+        _urlController.selection = TextSelection(
+          baseOffset: 0,
+          extentOffset: _urlController.text.length,
+        );
+      case DesktopBrowserShortcut.reload:
+        final pdfUrl = _currentPdfUrl;
+        if (pdfUrl != null) {
+          if (_isExtractingPdf) return false;
+          setState(() {
+            _isTextView = false;
+            _isShowingOurHtml = false;
+          });
+          unawaited(_controller.loadRequest(Uri.parse(pdfUrl)));
+        } else {
+          unawaited(_controller.reload());
+        }
+      case DesktopBrowserShortcut.addBookmark:
+        unawaited(_addBookmark());
+      case DesktopBrowserShortcut.bookmarks:
+        _showBookmarks();
+      case DesktopBrowserShortcut.tools:
+        _showToolsDrawer();
+    }
+    return true;
+  }
+
+  void _toggleMainPageFind() {
+    if (_findOverlay != null) {
+      _closeFindBar();
+    } else {
+      unawaited(_dispatchFindToVisiblePage());
+    }
   }
 
   /// One keyboard shortcut, one Find interface: the Cupitor webapp owns
@@ -1992,8 +2061,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (_findOverlay == null) {
       _findOverlay = OverlayEntry(builder: (overlayContext) {
         final media = MediaQuery.of(overlayContext);
+        final belowToolbar = identical(_findTarget, _controller) &&
+            _hasWideBrowserToolbar(media.size.width) &&
+            !_webFullscreen;
         return Positioned(
-          top: media.padding.top + 8,
+          top: media.padding.top + (belowToolbar ? kToolbarHeight : 0) + 8,
           right: 10,
           child: Material(
             elevation: 8,
@@ -4240,12 +4312,18 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return 'https://www.google.com/search?q=${Uri.encodeComponent(trimmed)}';
   }
 
-  Future<void> _addBookmark() async {
-    final url = _urlController.text.trim();
-    if (url.isEmpty || _bookmarks.contains(url)) return;
+  Future<void> _addBookmark({VoidCallback? refreshList}) async {
+    final controller = _controller;
+    final url = _currentPdfUrl ?? await controller.currentUrl();
+    final uri = Uri.tryParse(url ?? '');
+    if (!mounted || !identical(_controller, controller) || url == null ||
+        uri == null || !{'http', 'https'}.contains(uri.scheme) ||
+        uri.host.isEmpty || _bookmarks.contains(url)) return;
     setState(() => _bookmarks.insert(0, url));
+    refreshList?.call();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList('bookmarks', _bookmarks);
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('Bookmarked'), duration: Duration(seconds: 1)),
     );
@@ -4442,6 +4520,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   children: [
                     Text('Tools', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                     Spacer(),
+                    if (_desktop)
+                      IconButton(
+                        icon: const Icon(Icons.keyboard_outlined),
+                        tooltip: 'Keyboard shortcuts',
+                        onPressed: _showDesktopKeyboardShortcuts,
+                      ),
                     IconButton(
                       icon: Icon(Icons.close),
                       onPressed: () => Navigator.of(ctx).pop(),
@@ -5276,14 +5360,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     IconButton(
                       icon: Icon(Icons.bookmark_add_outlined),
                       tooltip: 'Add current page',
-                      onPressed: () async {
-                        final url = _urlController.text.trim();
-                        if (url.isEmpty || _bookmarks.contains(url)) return;
-                        setState(() => _bookmarks.insert(0, url));
-                        setModalState(() {});
-                        final prefs = await SharedPreferences.getInstance();
-                        await prefs.setStringList('bookmarks', _bookmarks);
-                      },
+                      onPressed: () => _addBookmark(refreshList: () {
+                        if (ctx.mounted) setModalState(() {});
+                      }),
                     ),
                     if (_bookmarks.isNotEmpty)
                       TextButton(
@@ -9131,7 +9210,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       child: StableDialogChrome(
           enabled: !fullscreen,
           holdVisible: _isListeningNotifier,
-          menuOpen: _studyToolsOpen,
           activity: _dialog1ChromeActivity,
           toolbar: Container(
             padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -9153,46 +9231,25 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 mainAxisAlignment: MainAxisAlignment.start,
                 children: [
                 IconButton(
-                  tooltip: 'Close',
-                  icon: const Icon(Icons.close, size: 20),
-                  onPressed: () {
-                    setState(() => _dialog1Minimized = false);
-                    Navigator.of(ctx).pop();
-                    _bumpMinimizedVersion();
-                  },
+                  tooltip: 'Download YouTube subtitles',
+                  icon: const Icon(Icons.closed_caption_outlined, size: 20),
+                  onPressed: () => _startYouTubeSubtitleDownload(ctx),
                 ),
-                MenuAnchor(
-                  onOpen: () => _studyToolsOpen.value = true,
-                  onClose: () {
-                    if (mounted) _studyToolsOpen.value = false;
+                IconButton(
+                  tooltip: 'Ask AI about this word',
+                  icon: const Icon(Icons.auto_awesome, size: 20),
+                  onPressed: _shareSearchTextToAi,
+                ),
+                IconButton(
+                  tooltip: 'Reload page (bypass cache)',
+                  icon: const Icon(Icons.refresh, size: 20),
+                  onPressed: () async {
+                    final ctrl = dialogController;
+                    if (ctrl == null) return;
+                    try { await ctrl.clearCache(); } catch (_) {}
+                    if (!ctx.mounted || !identical(dialogController, ctrl)) return;
+                    await _loadDialog1Page(Uri.parse(getUrlForLanguage(_selectedLanguage)));
                   },
-                  builder: (_, menu, __) => IconButton(
-                    tooltip: 'Study tools',
-                    icon: const Icon(Icons.more_vert, size: 20),
-                    onPressed: () => menu.isOpen ? menu.close() : menu.open(),
-                  ),
-                  menuChildren: [
-                    MenuItemButton(
-                      leadingIcon: const Icon(Icons.closed_caption_outlined),
-                      onPressed: () => _startYouTubeSubtitleDownload(ctx),
-                      child: const Text('Download YouTube subtitles'),
-                    ),
-                    MenuItemButton(
-                      leadingIcon: const Icon(Icons.auto_awesome),
-                      onPressed: _shareSearchTextToAi,
-                      child: const Text('Ask AI about this word'),
-                    ),
-                    MenuItemButton(
-                      leadingIcon: const Icon(Icons.refresh),
-                      onPressed: () async {
-                        final ctrl = dialogController;
-                        if (ctrl == null) return;
-                        try { await ctrl.clearCache(); } catch (_) {}
-                        await _loadDialog1Page(Uri.parse(getUrlForLanguage(_selectedLanguage)));
-                      },
-                      child: const Text('Reload page (bypass cache)'),
-                    ),
-                  ],
                 ),
                 const Spacer(),
                 GestureDetector(
@@ -11788,8 +11845,52 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
   }
 
+  String _desktopShortcutLabel(String key) =>
+      Platform.isMacOS ? '⌘$key' : 'Ctrl+$key';
+
+  void _showDesktopKeyboardShortcuts() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Keyboard shortcuts'),
+        content: SizedBox(
+          width: 360,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ListTile(
+                  title: const Text('Find in page'),
+                  trailing: Text(_desktopShortcutLabel('F')),
+                ),
+                for (final shortcut in DesktopBrowserShortcut.values)
+                  ListTile(
+                    title: Text(shortcut.description),
+                    trailing: Text(_desktopShortcutLabel(shortcut.label)),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Done'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final showWideBrowserTools =
+        _hasWideBrowserToolbar(MediaQuery.sizeOf(context).width);
+    if (_showWideBrowserTools != showWideBrowserTools) {
+      _showWideBrowserTools = showWideBrowserTools;
+      _showAppBar = true;
+      _scheduleAppBarHide();
+    }
     if (!_isControllerReady) {
       return Scaffold(body: Center(child: CircularProgressIndicator()));
     }
@@ -11797,8 +11898,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final appBar = AppBar(
       title: Focus(
         onFocusChange: (focused) {
-          if (_autoHideAppBar) setState(() => _urlBarFocused = focused);
-          if (focused) { _appBarTimer?.cancel(); }
+          if (_urlBarFocused != focused) {
+            setState(() => _urlBarFocused = focused);
+          }
+          if (focused) {
+            _appBarTimer?.cancel();
+          } else {
+            _scheduleAppBarHide();
+          }
         },
         child: RawAutocomplete<HistoryEntry>(
           textEditingController: _urlController,
@@ -11893,7 +12000,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           },
         ),
       ),
-      actions: _urlBarFocused ? null : [
+      actions: _urlBarFocused && !_showWideBrowserTools ? null : [
         ValueListenableBuilder<bool>(
           valueListenable: _pageLoading,
           builder: (context, loading, __) => loading
@@ -11917,7 +12024,29 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               child: CircularProgressIndicator(strokeWidth: 2),
             ),
           ),
-        MenuAnchor(
+        if (_showWideBrowserTools) ...[
+          IconButton(
+            icon: Icon(_findOverlay != null ? Icons.search_off : Icons.search),
+            tooltip: _findOverlay != null ? 'Close find' : 'Find in page (${_desktopShortcutLabel('F')})',
+            onPressed: _hasVisibleWebViewForFind() ? _toggleMainPageFind : null,
+          ),
+          if (_currentPdfUrl != null)
+            IconButton(
+              icon: Icon(_isTextView ? Icons.picture_as_pdf : Icons.text_snippet_outlined),
+              tooltip: _isTextView ? 'Switch to PDF view' : 'Switch to text view',
+              onPressed: _isExtractingPdf ? null : _togglePdfTextView,
+            ),
+          IconButton(
+            icon: const Icon(Icons.bookmarks_outlined),
+            tooltip: 'Bookmarks (${_desktopShortcutLabel('B')})',
+            onPressed: _showBookmarks,
+          ),
+          IconButton(
+            icon: const Icon(Icons.tune_outlined),
+            tooltip: 'Tools (${_desktopShortcutLabel(',')})',
+            onPressed: _showToolsDrawer,
+          ),
+        ] else MenuAnchor(
           onOpen: () {
             _pageToolsOpen = true;
             _appBarTimer?.cancel();
@@ -11937,13 +12066,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               menuChildren: [
                 MenuItemButton(
                   leadingIcon: Icon(_findOverlay != null ? Icons.search_off : Icons.search),
-                  onPressed: () {
-                    if (_findOverlay != null) {
-                      _closeFindBar();
-                    } else {
-                      unawaited(_dispatchFindToVisiblePage());
-                    }
-                  },
+                  onPressed: _toggleMainPageFind,
                   child: Text(_findOverlay != null ? 'Close find' : 'Find in page'),
                 ),
                 if (_currentPdfUrl != null)
@@ -11954,6 +12077,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   ),
               ],
               child: const Text('Page'),
+            ),
+            MenuItemButton(
+              leadingIcon: const Icon(Icons.bookmarks_outlined),
+              onPressed: _showBookmarks,
+              child: const Text('Bookmarks'),
             ),
             MenuItemButton(
               leadingIcon: const Icon(Icons.tune_outlined),
@@ -12083,6 +12211,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         }
       },
       child: Scaffold(
+        appBar: _showWideBrowserTools && !_webFullscreen ? appBar : null,
         body: Stack(
           children: [
             // Main content — fills entire screen
@@ -12133,10 +12262,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 ],
               ),
             ),
-            // Double-tap + long-press detector for the auto-hiding app bar
-            // (Android + macOS — desktop runs through PointerEvent the same
-            // way, so the same gestures toggle the bar with a mouse). The
-            // Listener doesn't consume events, so the WebView still gets the
+            // Double-tap + long-press detector for the auto-hiding app bar.
+            // The listener doesn't consume events, so the WebView still gets the
             // input for native text selection.
             if (_autoHideAppBar)
               Positioned.fill(
@@ -12148,8 +12275,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   onPointerCancel: (_) { _longPressTimer?.cancel(); _longPressTimer = null; _pointerDownPos = null; },
                 ),
               ),
-            // Transparent overlay to unfocus URL bar when tapping the page
-            if (_urlBarFocused)
+            // Keep compact address editing above the webview until dismissed.
+            if (_urlBarFocused && !_showWideBrowserTools)
               Positioned.fill(
                 child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
@@ -12164,8 +12291,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   child: _androidFullscreenView,
                 ),
               ),
-            // App bar overlay — auto-hides on Android + macOS, always visible elsewhere
-            if ((_showAppBar || !_autoHideAppBar) && !_webFullscreen)
+            // Compact toolbar floats above the page so it can auto-hide.
+            if (!_showWideBrowserTools && (_showAppBar || !_autoHideAppBar) && !_webFullscreen)
               Positioned(
                 top: 0, left: 0, right: 0,
                 child: SafeArea(

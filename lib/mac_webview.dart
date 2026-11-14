@@ -20,12 +20,15 @@ Future<void> installMacFrameScript(String script) async {
 /// right after creating it (`WebViewController()..configureForMac()`); a no-op
 /// on other platforms.
 extension MacWebView on WebViewController {
-  void configureForMac() {
+  void configureForMac({bool browserShortcuts = false}) {
     if (!Platform.isMacOS) return;
     final platform = this.platform;
     if (platform is! WebKitWebViewController) return;
     _macConfiguration[this] = _channel
-        .invokeMethod<bool>('configureWebView', platform.webViewIdentifier)
+        .invokeMethod<bool>('configureWebView', {
+          'id': platform.webViewIdentifier,
+          'browserShortcuts': browserShortcuts,
+        })
         .then((ok) {
           if (ok != true) debugPrint('configureMacWebView: WebView not found');
         })
@@ -59,6 +62,7 @@ Future<bool> openMacBrowser(String url) async {
 void onMacWindowExitedFullscreen(
   VoidCallback onExit, {
   VoidCallback? onFindShortcut,
+  ValueChanged<String>? onBrowserShortcut,
   ValueChanged<String>? onFilmotCapture,
 }) {
   if (!Platform.isMacOS) return;
@@ -66,6 +70,9 @@ void onMacWindowExitedFullscreen(
     if (call.method == 'windowExitedFullscreen') onExit();
     if (call.method == 'findShortcut') onFindShortcut?.call();
     final capture = call.arguments;
+    if (call.method == 'browserShortcut' && capture is String) {
+      onBrowserShortcut?.call(capture);
+    }
     if (call.method == 'filmotCapture' && capture is String) {
       onFilmotCapture?.call(capture);
     }
