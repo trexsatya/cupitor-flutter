@@ -1,6 +1,25 @@
 import 'dart:convert';
 
+import 'package:file_picker/file_picker.dart';
+
 const maxLocalSubtitleBytes = 10 * 1024 * 1024;
+
+Future<PlatformFile?> pickLocalSubtitleFile({required bool isAndroid}) async {
+  // Android filters by MIME type, and Drive can label .srt as generic binary.
+  final picked = await FilePicker.platform.pickFiles(
+    dialogTitle: 'Open SRT subtitles',
+    type: isAndroid ? FileType.any : FileType.custom,
+    allowedExtensions: isAndroid ? null : const ['srt'],
+    // On Android the picker caches the document. Check its size before reading.
+    withData: !isAndroid,
+  );
+  if (picked == null || picked.files.isEmpty) return null;
+  final file = picked.files.single;
+  if (isAndroid && !file.name.toLowerCase().endsWith('.srt')) {
+    throw const FormatException('Choose a subtitle file ending in .srt.');
+  }
+  return file;
+}
 
 /// SRT files commonly come from Windows editors as UTF-16 or Latin-1.
 String decodeLocalSubtitles(List<int> bytes) {

@@ -1,12 +1,84 @@
 import 'dart:convert';
 
 import 'package:cupitor/local_subtitles.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+class _SubtitlePicker extends FilePicker {
+  _SubtitlePicker(this.file);
+
+  final PlatformFile? file;
+  late FileType requestedType;
+  List<String>? requestedExtensions;
+  late bool requestedData;
+
+  @override
+  Future<FilePickerResult?> pickFiles({
+    String? dialogTitle,
+    String? initialDirectory,
+    FileType type = FileType.any,
+    List<String>? allowedExtensions,
+    Function(FilePickerStatus)? onFileLoading,
+    bool allowCompression = true,
+    int compressionQuality = 30,
+    bool allowMultiple = false,
+    bool withData = false,
+    bool withReadStream = false,
+    bool lockParentWindow = false,
+    bool readSequential = false,
+  }) async {
+    requestedType = type;
+    requestedExtensions = allowedExtensions;
+    requestedData = withData;
+    final selected = file;
+    return selected == null ? null : FilePickerResult([selected]);
+  }
+}
 
 void main() {
   const srt =
       '1\r\n00:00:10,250 --> 00:00:12,500\r\nFörsta raden\r\nAndra raden\r\n\r\n'
       '2\r\n00:00:02,000 --> 00:00:04,000\r\n<i>Hej!</i>\r\n';
+
+  test('Android picks Drive SRTs without a MIME filter', () async {
+    final file = PlatformFile(
+      name: 'episode.SRT',
+      size: 78,
+      path: '/cache/file_picker/episode.SRT',
+      identifier: 'content://drive/document/123',
+    );
+    final picker = _SubtitlePicker(file);
+    FilePicker.platform = picker;
+
+    expect(await pickLocalSubtitleFile(isAndroid: true), same(file));
+    expect(picker.requestedType, FileType.any);
+    expect(picker.requestedExtensions, isNull);
+    expect(picker.requestedData, isFalse);
+  });
+
+  test('Android rejects non-SRT files selected in the picker', () async {
+    FilePicker.platform = _SubtitlePicker(
+      PlatformFile(name: 'episode.mp3', size: 78),
+    );
+
+    await expectLater(
+      pickLocalSubtitleFile(isAndroid: true),
+      throwsFormatException,
+    );
+  });
+
+  test(
+    'other platforms retain the SRT filter and handle cancellation',
+    () async {
+      final picker = _SubtitlePicker(null);
+      FilePicker.platform = picker;
+
+      expect(await pickLocalSubtitleFile(isAndroid: false), isNull);
+      expect(picker.requestedType, FileType.custom);
+      expect(picker.requestedExtensions, ['srt']);
+      expect(picker.requestedData, isTrue);
+    },
+  );
 
   test('reads and sorts multiline SRT files with Windows line endings', () {
     expect(parseLocalSrt(srt), [
