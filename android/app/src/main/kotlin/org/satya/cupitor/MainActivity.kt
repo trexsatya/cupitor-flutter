@@ -33,6 +33,7 @@ import java.io.RandomAccessFile
 import java.io.File
 
 class MainActivity : FlutterActivity() {
+    private var cupitorBrowser: CupitorBrowser? = null
 
     companion object {
         private const val CHANNEL = "cupitor/adblock"
@@ -190,6 +191,23 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        val browserChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cupitor/browser")
+        browserChannel.setMethodCallHandler { call, result ->
+            if (call.method != "openBrowser") {
+                result.notImplemented()
+            } else {
+                val browser = cupitorBrowser ?: CupitorBrowser(
+                    this,
+                    captureScript = {
+                        val key = io.flutter.FlutterInjector.instance().flutterLoader()
+                            .getLookupKeyForAsset("assets/js/filmot_capture.js")
+                        assets.open(key).bufferedReader().use { it.readText() }
+                    },
+                    onCapture = { browserChannel.invokeMethod("filmotCapture", it) },
+                ).also { cupitorBrowser = it }
+                result.success(browser.open(call.arguments as? String))
+            }
+        }
         StudyCalls.install(this, flutterEngine.dartExecutor.binaryMessenger)
         StudyCallHistory.install(this, flutterEngine.dartExecutor.binaryMessenger)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cupitor/youtube_controls")
@@ -1172,12 +1190,24 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        cupitorBrowser?.resume()
+    }
+
+    override fun onPause() {
+        cupitorBrowser?.pause()
+        super.onPause()
+    }
+
     override fun onStop() {
         StudyCallSpeech.stopPreview()
         super.onStop()
     }
 
     override fun onDestroy() {
+        cupitorBrowser?.destroy()
+        cupitorBrowser = null
         try {
             mediaSession?.isActive = false
             mediaSession?.release()

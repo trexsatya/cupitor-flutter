@@ -552,6 +552,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   @override
   void dispose() {
+    if (Platform.isAndroid) _androidBrowserChannel.setMethodCallHandler(null);
     _appBarTimer?.cancel();
     _studyCallHistoryBridge.dispose();
     if (!_profileInitComplete.isCompleted) _profileInitComplete.complete();
@@ -687,8 +688,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       onFindShortcut: () {
         unawaited(_dispatchFindToVisiblePage());
       },
-      onFilmotCapture: _receiveMacFilmotCapture,
+      onFilmotCapture: _receiveBrowserFilmotCapture,
     );
+    if (Platform.isAndroid) {
+      _androidBrowserChannel.setMethodCallHandler((call) async {
+        final payload = call.arguments;
+        if (call.method == 'filmotCapture' && payload is String) {
+          _receiveBrowserFilmotCapture(payload);
+        }
+      });
+    }
     HardwareKeyboard.instance.addHandler(_onFindPageKey);
     HardwareKeyboard.instance.addHandler(_onMacFullscreenEscape);
     // Record why we died last time — a system kill leaves no crash report at
@@ -4575,13 +4584,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     // ── Web behavior ───────────────────────────────────
                     _toolsSectionDivider(),
                     _toolsSectionHeader('Web behavior'),
-                    if (Platform.isMacOS)
+                    if (Platform.isMacOS || Platform.isAndroid)
                       ListTile(
                         leading: const Icon(Icons.open_in_browser),
-                        title: const Text('New browser window'),
+                        title: Text(Platform.isAndroid ? 'Cupitor Browser' : 'New browser window'),
                         onTap: () {
                           Navigator.of(ctx).pop();
-                          unawaited(_openInMacBrowser('https://www.google.com/'));
+                          unawaited(_openCupitorBrowser());
                         },
                       ),
                     ListTile(
@@ -5714,43 +5723,56 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   ),
                 ],
                 if (_isFilmotUrl(url)) ...[
-                  if (Platform.isMacOS)
-                    IconButton(
-                      tooltip: 'Open in Cupitor Browser',
-                      icon: const Icon(Icons.open_in_browser, size: 20),
-                      onPressed: () async {
-                        final current = await controller.currentUrl();
-                        if (!ctx.mounted) return;
-                        final opened = await _openInMacBrowser(
-                          _isFilmotUrl(current) ? current! : url,
-                        );
-                        if (opened && ctx.mounted && ModalRoute.of(ctx)?.isCurrent == true) {
-                          _minimizedDialog2s.add(dialogId);
-                          _everMinimizedDialog2s.add(dialogId);
-                          Navigator.of(ctx).pop();
-                          _bumpMinimizedVersion();
-                        }
-                      },
-                    ),
                   IconButton(
                     tooltip: 'Capture subtitle (with context, translate, send to lookup)',
                     icon: Icon(Icons.subtitles, size: 20),
                     onPressed: () => _captureFilmotSubtitle(ctx, controller),
                   ),
-                  IconButton(
-                    tooltip: 'Channel blacklist (tap to edit / temporarily disable)',
-                    icon: Icon(Icons.block, size: 20),
-                    onPressed: () => _showFilmotChannelsDialog(ctx, dialogId, controller),
-                  ),
-                  IconButton(
-                    tooltip: 'Saved videos',
-                    icon: Icon(Icons.bookmark_outline, size: 20),
-                    onPressed: () => _showSavedVideosDialog(ctx),
-                  ),
-                  IconButton(
-                    tooltip: 'Save current video URL',
-                    icon: Icon(Icons.save_alt, size: 20),
-                    onPressed: () => _saveCurrentFilmotVideo(dialogId, controller),
+                  MenuAnchor(
+                    builder: (_, menu, __) => IconButton(
+                      tooltip: 'Filmot tools',
+                      icon: const Icon(Icons.more_vert, size: 20),
+                      onPressed: () => menu.isOpen ? menu.close() : menu.open(),
+                    ),
+                    menuChildren: [
+                      if (Platform.isMacOS || Platform.isAndroid)
+                        MenuItemButton(
+                          leadingIcon: const Icon(Icons.open_in_browser),
+                          onPressed: () async {
+                            final current = await controller.currentUrl();
+                            if (!ctx.mounted) return;
+                            final opened = await _openCupitorBrowser(
+                              _isFilmotUrl(current) ? current! : url,
+                            );
+                            if (opened && ctx.mounted && ModalRoute.of(ctx)?.isCurrent == true) {
+                              _minimizedDialog2s.add(dialogId);
+                              _everMinimizedDialog2s.add(dialogId);
+                              Navigator.of(ctx).pop();
+                              _bumpMinimizedVersion();
+                            }
+                          },
+                          child: const Text('Open in Cupitor Browser'),
+                        ),
+                      SubmenuButton(
+                        leadingIcon: const Icon(Icons.bookmark_outline),
+                        menuChildren: [
+                          MenuItemButton(
+                            onPressed: () => _showSavedVideosDialog(ctx),
+                            child: const Text('View saved videos'),
+                          ),
+                          MenuItemButton(
+                            onPressed: () => _saveCurrentFilmotVideo(dialogId, controller),
+                            child: const Text('Save current video'),
+                          ),
+                        ],
+                        child: const Text('Saved videos'),
+                      ),
+                      MenuItemButton(
+                        leadingIcon: const Icon(Icons.block),
+                        onPressed: () => _showFilmotChannelsDialog(ctx, dialogId, controller),
+                        child: const Text('Channel blacklist'),
+                      ),
+                    ],
                   ),
                 ],
                 // `url` is the address this dialog was OPENED with and is never
@@ -5941,17 +5963,22 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         (uri.host == 'filmot.com' || uri.host.endsWith('.filmot.com'));
   }
 
-  Future<bool> _openInMacBrowser(String url) async {
+  static const _androidBrowserChannel = MethodChannel('cupitor/browser');
+
+  Future<bool> _openCupitorBrowser([String? url]) async {
     try {
-      if (await openMacBrowser(url)) return true;
+      final opened = Platform.isAndroid
+          ? await _androidBrowserChannel.invokeMethod<bool>('openBrowser', url)
+          : await openMacBrowser(url ?? 'https://www.google.com/');
+      if (opened == true) return true;
     } catch (_) {
       // Surface native window creation failures in the app.
     }
-    if (mounted) _showCaptureError('Could not open browser window', url);
+    if (mounted) _showCaptureError('Could not open Cupitor Browser', url ?? 'Try again from Tools.');
     return false;
   }
 
-  void _receiveMacFilmotCapture(String json) {
+  void _receiveBrowserFilmotCapture(String json) {
     if (!mounted) return;
     try {
       final capture = jsonDecode(json);
