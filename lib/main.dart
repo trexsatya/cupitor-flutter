@@ -403,6 +403,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // route — which lives outside the outer State's setState scope — rebuilds.
   final ValueNotifier<bool> _dialog1FullscreenNotifier = ValueNotifier(false);
   final ValueNotifier<int> _dialog1ChromeActivity = ValueNotifier(0);
+  final ValueNotifier<bool> _studyToolsOpen = ValueNotifier(false);
   // Language-app ↔ Cupitor bridge for the notification feature (spec:
   // docs/superpowers/specs/2026-07-27-notifications-design.md §Bridge).
   // Permission/exact-alarm/action capabilities are backed by the real
@@ -620,6 +621,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _isListeningNotifier.dispose();
     _dialog1FullscreenNotifier.dispose();
     _dialog1ChromeActivity.dispose();
+    _studyToolsOpen.dispose();
     _dialog1Tts?.stop();
     _dialog1Tts = null;
     // Close any open ML Kit translators in the snippet-bridge pool.
@@ -4298,28 +4300,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (result != null) await _renameBookmark(url, result);
   }
 
-  // Section header + spacer helpers for the Tools drawer. Keeping them
-  // separate methods so the ListView body stays readable — each group
-  // is one visual chunk with a labelled top row.
-  Widget _toolsSectionHeader(String label) {
-    final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
-      child: Text(
-        label.toUpperCase(),
-        style: theme.textTheme.labelSmall?.copyWith(
-          fontWeight: FontWeight.w700,
-          letterSpacing: 0.9,
-          color: theme.colorScheme.primary,
-        ),
-      ),
+  Widget _toolsSubmenu(String label, IconData icon, List<Widget> children) {
+    return ExpansionTile(
+      key: PageStorageKey(label),
+      leading: Icon(icon),
+      title: Text(label),
+      childrenPadding: const EdgeInsets.only(left: 12, bottom: 8),
+      children: children,
     );
   }
-
-  Widget _toolsSectionDivider() => const Padding(
-        padding: EdgeInsets.only(top: 8),
-        child: Divider(height: 1),
-      );
 
   /// Asks how the page should be saved, then saves it.
   ///
@@ -4465,372 +4454,351 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 child: ListView(
                   controller: scrollController,
                   children: [
-                    // ── Reading & content ──────────────────────────────
-                    // First, because it is what the app is for. Everything
-                    // below it adjusts how reading works rather than doing it.
-                    _toolsSectionHeader('Reading & content'),
-                    ListTile(
-                      leading: const Icon(Icons.bookmarks_outlined),
-                      title: const Text('Bookmarks'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showBookmarks();
-                      },
-                    ),
-                    if (_tagDbReady)
+                    _toolsSubmenu('Reading & content', Icons.bookmarks_outlined, [
                       ListTile(
-                        leading: const Icon(Icons.label_outline),
-                        title: const Text('Tag sentences…'),
+                        leading: const Icon(Icons.bookmarks_outlined),
+                        title: const Text('Bookmarks'),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _showBookmarks();
+                        },
+                      ),
+                      if (_tagDbReady)
+                        ListTile(
+                          leading: const Icon(Icons.label_outline),
+                          title: const Text('Tag sentences…'),
+                          subtitle: const Text(
+                            'Capture chip, masks, filter, segmentation scope, '
+                            'and the global browser — all in one place.',
+                          ),
+                          trailing: const Icon(Icons.chevron_right),
+                          onTap: () {
+                            Navigator.of(ctx).pop();
+                            _openTagSettingsSheet();
+                          },
+                        ),
+                    ]),
+                    _toolsSubmenu('Books', Icons.menu_book_outlined, [
+                      ListTile(
+                        leading: const Icon(Icons.menu_book_outlined),
+                        title: const Text('Open EPUB / DOCX'),
+                        subtitle: const Text('From device storage or a URL'),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _showEpubSourcePicker();
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.history_edu_outlined),
+                        title: const Text('Book library'),
+                        subtitle: const Text('Resume a recent book'),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _showEpubLibrary();
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.search),
+                        title: const Text('Global search…'),
                         subtitle: const Text(
-                          'Capture chip, masks, filter, segmentation scope, '
-                          'and the global browser — all in one place.',
+                          'Across every EPUB and DOCX · use `|` for OR (e.g. cat|dog)',
                         ),
                         trailing: const Icon(Icons.chevron_right),
                         onTap: () {
                           Navigator.of(ctx).pop();
-                          _openTagSettingsSheet();
+                          _openGlobalSearch();
                         },
                       ),
-
-                    // ── Books ──────────────────────────────────────────
-                    // Opening a book, returning to one, and searching across
-                    // all of them are the same errand at different stages.
-                    _toolsSectionDivider(),
-                    _toolsSectionHeader('Books'),
-                    ListTile(
-                      leading: const Icon(Icons.menu_book_outlined),
-                      title: const Text('Open EPUB / DOCX'),
-                      subtitle: const Text('From device storage or a URL'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showEpubSourcePicker();
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.history_edu_outlined),
-                      title: const Text('Book library'),
-                      subtitle: const Text('Resume a recent book'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showEpubLibrary();
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.search),
-                      title: const Text('Global search…'),
-                      subtitle: const Text(
-                        'Across every EPUB and DOCX · use `|` for OR (e.g. cat|dog)',
-                      ),
-                      trailing: const Icon(Icons.chevron_right),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _openGlobalSearch();
-                      },
-                    ),
-
-                    // ── Appearance ─────────────────────────────────────
-                    _toolsSectionDivider(),
-                    _toolsSectionHeader('Appearance'),
-                    SwitchListTile(
-                      secondary: Icon(_isEinkMode ? Icons.invert_colors_off : Icons.invert_colors),
-                      title: const Text('E-ink mode'),
-                      subtitle: const Text('High-contrast reading'),
-                      value: _isEinkMode,
-                      onChanged: (val) {
-                        setState(() => _isEinkMode = val);
-                        einkMode.value = val;
-                        setModalState(() {});
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.format_size),
-                      title: const Text('Page font size'),
-                      subtitle: Text('${(100 * (1.0 + _pageZoomLevel * 0.15)).round()}%'),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            icon: const Icon(Icons.text_decrease),
-                            tooltip: 'Decrease',
-                            onPressed: () async {
-                              await _changePageZoom(-1);
-                              setModalState(() {});
-                            },
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.text_increase),
-                            tooltip: 'Increase',
-                            onPressed: () async {
-                              await _changePageZoom(1);
-                              setModalState(() {});
-                            },
-                          ),
-                        ],
-                      ),
-                    ),
-                    if (_currentPdfUrl != null) ...[
-                      ListTile(
-                        leading: const Icon(Icons.zoom_out),
-                        title: const Text('PDF zoom out'),
-                        onTap: () => _changePdfZoom(-1),
-                      ),
-                      ListTile(
-                        leading: const Icon(Icons.zoom_in),
-                        title: const Text('PDF zoom in'),
-                        onTap: () => _changePdfZoom(1),
-                      ),
-                    ],
-
-                    // ── Web behavior ───────────────────────────────────
-                    _toolsSectionDivider(),
-                    _toolsSectionHeader('Web behavior'),
-                    if (Platform.isMacOS || Platform.isAndroid)
-                      ListTile(
-                        leading: const Icon(Icons.open_in_browser),
-                        title: Text(Platform.isAndroid ? 'Cupitor Browser' : 'New browser window'),
-                        onTap: () {
-                          Navigator.of(ctx).pop();
-                          unawaited(_openCupitorBrowser());
-                        },
-                      ),
-                    ListTile(
-                      leading: const Icon(Icons.history),
-                      title: const Text('History'),
-                      subtitle: const Text(
-                        'Pages you have visited. Search, remove, or clear.',
-                      ),
-                      trailing: const Icon(Icons.chevron_right),
-                      onTap: () async {
-                        Navigator.of(ctx).pop();
-                        final picked = await Navigator.of(context)
-                            .push<String>(MaterialPageRoute<String>(
-                          builder: (_) => const HistoryScreen(),
-                        ));
-                        if (picked == null || !mounted) return;
-                        _urlController.text = picked;
-                        _loadUrl();
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.language),
-                      title: const Text('Language'),
-                      trailing: DropdownButton<String>(
-                        value: _selectedLanguage,
-                        items: _languages
-                            .map((l) => DropdownMenuItem(value: l, child: Text(l)))
-                            .toList(),
+                    ]),
+                    _toolsSubmenu('Appearance', Icons.format_paint_outlined, [
+                      SwitchListTile(
+                        secondary: Icon(_isEinkMode ? Icons.invert_colors_off : Icons.invert_colors),
+                        title: const Text('E-ink mode'),
+                        subtitle: const Text('High-contrast reading'),
+                        value: _isEinkMode,
                         onChanged: (val) {
-                          setState(() {
-                            _selectedLanguage = val!;
-                            if (dialogController != null) {
-                              _loadDialog1Page(
-                                  Uri.parse(getUrlForLanguage(_selectedLanguage)));
-                            }
-                          });
+                          setState(() => _isEinkMode = val);
+                          einkMode.value = val;
                           setModalState(() {});
                         },
-                        underline: const SizedBox(),
                       ),
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.smart_display_outlined),
-                      title: const Text('YouTube playback'),
-                      subtitle: Text(_youtubeFrontend == null
-                          ? 'Native YouTube (with ad blocker)'
-                          : 'Via ${_youtubeFrontend!}'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showYoutubeFrontendPicker();
-                      },
-                    ),
-                    // The one choice that changes what lands in the file is
-                    // asked on the way out, where it is being made — not kept
-                    // as a separate switch to find and set beforehand.
-                    ListTile(
-                      leading: const Icon(Icons.save_alt_outlined),
-                      title: const Text('Save page HTML…'),
-                      subtitle: Text(_savePageStrip
-                          ? "As the site rendered it, Cupitor's markup stripped"
-                          : "Exactly as it stands, Cupitor's markup included"),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showSavePageHtmlDialog();
-                      },
-                    ),
-
-                    // ── Exclusions & blocking ──────────────────────────
-                    // Both name what Cupitor should leave alone, one for its
-                    // own features and one for the network.
-                    _toolsSectionDivider(),
-                    _toolsSectionHeader('Exclusions & blocking'),
-                    ValueListenableBuilder<List<String>>(
-                      valueListenable: LookupExclusions.patterns,
-                      builder: (_, list, __) => ListTile(
-                        leading: const Icon(Icons.block),
-                        title: const Text('Lookup exclusions…'),
+                      ListTile(
+                        leading: const Icon(Icons.format_size),
+                        title: const Text('Page font size'),
+                        subtitle: Text('${(100 * (1.0 + _pageZoomLevel * 0.15)).round()}%'),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              icon: const Icon(Icons.text_decrease),
+                              tooltip: 'Decrease',
+                              onPressed: () async {
+                                await _changePageZoom(-1);
+                                setModalState(() {});
+                              },
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.text_increase),
+                              tooltip: 'Increase',
+                              onPressed: () async {
+                                await _changePageZoom(1);
+                                setModalState(() {});
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (_currentPdfUrl != null) ...[
+                        ListTile(
+                          leading: const Icon(Icons.zoom_out),
+                          title: const Text('PDF zoom out'),
+                          onTap: () => _changePdfZoom(-1),
+                        ),
+                        ListTile(
+                          leading: const Icon(Icons.zoom_in),
+                          title: const Text('PDF zoom in'),
+                          onTap: () => _changePdfZoom(1),
+                        ),
+                      ],
+                    ]),
+                    _toolsSubmenu('Web behavior', Icons.language, [
+                      if (Platform.isMacOS || Platform.isAndroid)
+                        ListTile(
+                          leading: const Icon(Icons.open_in_browser),
+                          title: Text(Platform.isAndroid ? 'Cupitor Browser' : 'New browser window'),
+                          onTap: () {
+                            Navigator.of(ctx).pop();
+                            unawaited(_openCupitorBrowser());
+                          },
+                        ),
+                      ListTile(
+                        leading: const Icon(Icons.history),
+                        title: const Text('History'),
+                        subtitle: const Text(
+                          'Pages you have visited. Search, remove, or clear.',
+                        ),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () async {
+                          Navigator.of(ctx).pop();
+                          final picked = await Navigator.of(context)
+                              .push<String>(MaterialPageRoute<String>(
+                            builder: (_) => const HistoryScreen(),
+                          ));
+                          if (picked == null || !mounted) return;
+                          _urlController.text = picked;
+                          _loadUrl();
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.language),
+                        title: const Text('Language'),
+                        trailing: DropdownButton<String>(
+                          value: _selectedLanguage,
+                          items: _languages
+                              .map((l) => DropdownMenuItem(value: l, child: Text(l)))
+                              .toList(),
+                          onChanged: (val) {
+                            setState(() {
+                              _selectedLanguage = val!;
+                              if (dialogController != null) {
+                                _loadDialog1Page(
+                                    Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                              }
+                            });
+                            setModalState(() {});
+                          },
+                          underline: const SizedBox(),
+                        ),
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.smart_display_outlined),
+                        title: const Text('YouTube playback'),
+                        subtitle: Text(_youtubeFrontend == null
+                            ? 'Native YouTube (with ad blocker)'
+                            : 'Via ${_youtubeFrontend!}'),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _showYoutubeFrontendPicker();
+                        },
+                      ),
+                      // The one choice that changes what lands in the file is
+                      // asked on the way out, where it is being made — not kept
+                      // as a separate switch to find and set beforehand.
+                      ListTile(
+                        leading: const Icon(Icons.save_alt_outlined),
+                        title: const Text('Save page HTML…'),
+                        subtitle: Text(_savePageStrip
+                            ? "As the site rendered it, Cupitor's markup stripped"
+                            : "Exactly as it stands, Cupitor's markup included"),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _showSavePageHtmlDialog();
+                        },
+                      ),
+                    ]),
+                    _toolsSubmenu('Exclusions & blocking', Icons.security_outlined, [
+                      ValueListenableBuilder<List<String>>(
+                        valueListenable: LookupExclusions.patterns,
+                        builder: (_, list, __) => ListTile(
+                          leading: const Icon(Icons.block),
+                          title: const Text('Lookup exclusions…'),
+                          subtitle: Text(
+                            list.isEmpty
+                                ? 'No sites excluded'
+                                : '${list.length} pattern${list.length == 1 ? '' : 's'} — '
+                                    'word-lookup / tagging skipped',
+                          ),
+                          trailing: const Icon(Icons.chevron_right),
+                          onTap: () {
+                            Navigator.of(ctx).pop();
+                            Navigator.of(context).push(MaterialPageRoute<void>(
+                              builder: (_) => const LookupExclusionsScreen(),
+                            ));
+                          },
+                        ),
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.security_outlined),
+                        title: const Text('Ad hosts'),
+                        subtitle: const Text('Manage blocked ad hosts'),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _showAdHosts();
+                        },
+                      ),
+                    ]),
+                    _toolsSubmenu('Advanced', Icons.settings_outlined, [
+                      ListTile(
+                        leading: const Icon(Icons.login),
+                        title: const Text('Sign in with GitHub'),
+                        subtitle: Text(_githubToken != null ? 'Signed in' : 'Needed to save to your repo'),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _showDeviceSignIn();
+                        },
+                      ),
+                      ListTile(
+                        leading: Icon(_githubToken != null ? Icons.key : Icons.key_off_outlined),
+                        title: const Text('GitHub token'),
+                        subtitle: Text(_githubToken != null ? 'Token set' : 'Not configured'),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _showTokenDialog();
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.auto_awesome),
+                        title: const Text('AI prompt'),
                         subtitle: Text(
-                          list.isEmpty
-                              ? 'No sites excluded'
-                              : '${list.length} pattern${list.length == 1 ? '' : 's'} — '
-                                  'word-lookup / tagging skipped',
+                          _aiPromptTemplate == kDefaultAiPromptTemplate
+                              ? 'Default wording'
+                              : 'Customised',
+                        ),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _showAiPromptDialog();
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.memory),
+                        title: const Text('Memory manager'),
+                        subtitle: const Text(
+                          'Storage overview per book, orphan-file cleanup, and '
+                          '.cupitor.zip import.',
                         ),
                         trailing: const Icon(Icons.chevron_right),
                         onTap: () {
                           Navigator.of(ctx).pop();
                           Navigator.of(context).push(MaterialPageRoute<void>(
-                            builder: (_) => const LookupExclusionsScreen(),
+                            builder: (_) => const MemoryManagerScreen(),
                           ));
                         },
                       ),
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.security_outlined),
-                      title: const Text('Ad hosts'),
-                      subtitle: const Text('Manage blocked ad hosts'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showAdHosts();
-                      },
-                    ),
-
-                    // ── Advanced ───────────────────────────────────────
-                    _toolsSectionDivider(),
-                    _toolsSectionHeader('Advanced'),
-                    ListTile(
-                      leading: const Icon(Icons.login),
-                      title: const Text('Sign in with GitHub'),
-                      subtitle: Text(_githubToken != null ? 'Signed in' : 'Needed to save to your repo'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showDeviceSignIn();
-                      },
-                    ),
-                    ListTile(
-                      leading: Icon(_githubToken != null ? Icons.key : Icons.key_off_outlined),
-                      title: const Text('GitHub token'),
-                      subtitle: Text(_githubToken != null ? 'Token set' : 'Not configured'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showTokenDialog();
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.auto_awesome),
-                      title: const Text('AI prompt'),
-                      subtitle: Text(
-                        _aiPromptTemplate == kDefaultAiPromptTemplate
-                            ? 'Default wording'
-                            : 'Customised',
-                      ),
-                      trailing: const Icon(Icons.chevron_right),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showAiPromptDialog();
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.memory),
-                      title: const Text('Memory manager'),
-                      subtitle: const Text(
-                        'Storage overview per book, orphan-file cleanup, and '
-                        '.cupitor.zip import.',
-                      ),
-                      trailing: const Icon(Icons.chevron_right),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        Navigator.of(context).push(MaterialPageRoute<void>(
-                          builder: (_) => const MemoryManagerScreen(),
-                        ));
-                      },
-                    ),
-                    ListTile(
-                      leading: Icon(_tagCaptureArmed
-                          ? Icons.playlist_add_check
-                          : Icons.playlist_add),
-                      title: const Text('Collect sentences'),
-                      subtitle: const Text(
-                          'Tap sentences on the page, then Send to a playlist'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _armSentenceCollecting();
-                      },
-                    ),
-                    SwitchListTile(
-                      secondary: const Icon(Icons.edit_note),
-                      title: const Text('Video note button'),
-                      subtitle: const Text(
-                          'Floating button on videos: type or dictate a note '
-                          'at the current time, send it to a playlist'),
-                      value: _videoNoteEnabled,
-                      onChanged: (val) async {
-                        await _setVideoNoteEnabled(val);
-                        setModalState(() {});
-                      },
-                    ),
-                    SwitchListTile(
-                      secondary: const Icon(Icons.fullscreen),
-                      title: const Text('Fullscreen study button'),
-                      subtitle: const Text(
-                          'Floating button that opens the study dialog in fullscreen'),
-                      value: _studyFsChipEnabled,
-                      onChanged: (val) async {
-                        await _setStudyFsChipEnabled(val);
-                        setModalState(() {});
-                      },
-                    ),
-
-                    // ── Diagnostics ────────────────────────────────────
-                    // Run something against the page, watch what it does,
-                    // read what it said — in that order, because that is the
-                    // order they are used in.
-                    _toolsSectionDivider(),
-                    _toolsSectionHeader('Diagnostics'),
-                    ListTile(
-                      leading: const Icon(Icons.code),
-                      title: const Text('Inject remote snippet'),
-                      subtitle: const Text('Run remote JavaScript on current page'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _injectRemoteSnippet();
-                      },
-                    ),
-                    // Turn on while a page/modal refuses to scroll, then drag
-                    // on the stuck area and read the snippet logs. Listeners
-                    // are all passive, so arming it can't change behaviour.
-                    SwitchListTile(
-                      secondary: Icon(_scrollDiagEnabled
-                          ? Icons.swipe_vertical
-                          : Icons.swipe_vertical_outlined),
-                      title: const Text('Scroll diagnostics'),
-                      subtitle: Text(_scrollDiagEnabled
-                          ? 'Armed — drag on the stuck area, then view snippet logs'
-                          : 'Log why a page or modal will not scroll'),
-                      value: _scrollDiagEnabled,
-                      onChanged: (val) async {
-                        await _setScrollDiagnostics(val);
-                        setModalState(() {});
-                      },
-                    ),
-                    if (_scrollDiagEnabled)
                       ListTile(
-                        leading: const Icon(Icons.camera_alt_outlined),
-                        title: const Text('Scroll snapshot now'),
+                        leading: Icon(_tagCaptureArmed
+                            ? Icons.playlist_add_check
+                            : Icons.playlist_add),
+                        title: const Text('Collect sentences'),
                         subtitle: const Text(
-                            'Dump overflow / transform / covering elements'),
+                            'Tap sentences on the page, then Send to a playlist'),
                         onTap: () {
                           Navigator.of(ctx).pop();
-                          _snapshotScrollDiag();
+                          _armSentenceCollecting();
                         },
                       ),
-                    ListTile(
-                      leading: const Icon(Icons.terminal),
-                      title: const Text('View snippet logs'),
-                      subtitle: Text('${_snippetLogs.length} entries'),
-                      onTap: () {
-                        Navigator.of(ctx).pop();
-                        _showSnippetLogs();
-                      },
-                    ),
+                      SwitchListTile(
+                        secondary: const Icon(Icons.edit_note),
+                        title: const Text('Video note button'),
+                        subtitle: const Text(
+                            'Floating button on videos: type or dictate a note '
+                            'at the current time, send it to a playlist'),
+                        value: _videoNoteEnabled,
+                        onChanged: (val) async {
+                          await _setVideoNoteEnabled(val);
+                          setModalState(() {});
+                        },
+                      ),
+                      SwitchListTile(
+                        secondary: const Icon(Icons.fullscreen),
+                        title: const Text('Fullscreen study button'),
+                        subtitle: const Text(
+                            'Floating button that opens the study dialog in fullscreen'),
+                        value: _studyFsChipEnabled,
+                        onChanged: (val) async {
+                          await _setStudyFsChipEnabled(val);
+                          setModalState(() {});
+                        },
+                      ),
+                    ]),
+                    _toolsSubmenu('Diagnostics', Icons.terminal, [
+                      ListTile(
+                        leading: const Icon(Icons.code),
+                        title: const Text('Inject remote snippet'),
+                        subtitle: const Text('Run remote JavaScript on current page'),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _injectRemoteSnippet();
+                        },
+                      ),
+                      // Turn on while a page/modal refuses to scroll, then drag
+                      // on the stuck area and read the snippet logs. Listeners
+                      // are all passive, so arming it can't change behaviour.
+                      SwitchListTile(
+                        secondary: Icon(_scrollDiagEnabled
+                            ? Icons.swipe_vertical
+                            : Icons.swipe_vertical_outlined),
+                        title: const Text('Scroll diagnostics'),
+                        subtitle: Text(_scrollDiagEnabled
+                            ? 'Armed — drag on the stuck area, then view snippet logs'
+                            : 'Log why a page or modal will not scroll'),
+                        value: _scrollDiagEnabled,
+                        onChanged: (val) async {
+                          await _setScrollDiagnostics(val);
+                          setModalState(() {});
+                        },
+                      ),
+                      if (_scrollDiagEnabled)
+                        ListTile(
+                          leading: const Icon(Icons.camera_alt_outlined),
+                          title: const Text('Scroll snapshot now'),
+                          subtitle: const Text(
+                              'Dump overflow / transform / covering elements'),
+                          onTap: () {
+                            Navigator.of(ctx).pop();
+                            _snapshotScrollDiag();
+                          },
+                        ),
+                      ListTile(
+                        leading: const Icon(Icons.terminal),
+                        title: const Text('View snippet logs'),
+                        subtitle: Text('${_snippetLogs.length} entries'),
+                        onTap: () {
+                          Navigator.of(ctx).pop();
+                          _showSnippetLogs();
+                        },
+                      ),
+                    ]),
                     const SizedBox(height: 12),
                   ],
                 ),
@@ -9167,6 +9135,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       child: StableDialogChrome(
           enabled: !fullscreen,
           holdVisible: _isListeningNotifier,
+          menuOpen: _studyToolsOpen,
           activity: _dialog1ChromeActivity,
           toolbar: Container(
             padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -9184,10 +9153,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 ),
               ),
               child: Row(
-                // Order: Close, CC, AI on the LEFT — Mic, Fullscreen, Minimize,
-                // Close on the RIGHT — Spacer in the middle. This keeps the
-                // left cluster clear of the Android camera notch on the right
-                // edge while preserving access to the secondary close.
+                // Keep study actions on the left, clear of the camera cutout.
                 mainAxisAlignment: MainAxisAlignment.start,
                 children: [
                 IconButton(
@@ -9199,15 +9165,38 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     _bumpMinimizedVersion();
                   },
                 ),
-                IconButton(
-                  tooltip: 'Download YouTube subtitles (translate, send to lookup)',
-                  icon: const Icon(Icons.closed_caption_outlined, size: 20),
-                  onPressed: () => _startYouTubeSubtitleDownload(ctx),
-                ),
-                IconButton(
-                  tooltip: 'Ask AI about this word (share)',
-                  icon: const Icon(Icons.auto_awesome, size: 20),
-                  onPressed: _shareSearchTextToAi,
+                MenuAnchor(
+                  onOpen: () => _studyToolsOpen.value = true,
+                  onClose: () {
+                    if (mounted) _studyToolsOpen.value = false;
+                  },
+                  builder: (_, menu, __) => IconButton(
+                    tooltip: 'Study tools',
+                    icon: const Icon(Icons.more_vert, size: 20),
+                    onPressed: () => menu.isOpen ? menu.close() : menu.open(),
+                  ),
+                  menuChildren: [
+                    MenuItemButton(
+                      leadingIcon: const Icon(Icons.closed_caption_outlined),
+                      onPressed: () => _startYouTubeSubtitleDownload(ctx),
+                      child: const Text('Download YouTube subtitles'),
+                    ),
+                    MenuItemButton(
+                      leadingIcon: const Icon(Icons.auto_awesome),
+                      onPressed: _shareSearchTextToAi,
+                      child: const Text('Ask AI about this word'),
+                    ),
+                    MenuItemButton(
+                      leadingIcon: const Icon(Icons.refresh),
+                      onPressed: () async {
+                        final ctrl = dialogController;
+                        if (ctrl == null) return;
+                        try { await ctrl.clearCache(); } catch (_) {}
+                        await _loadDialog1Page(Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                      },
+                      child: const Text('Reload page (bypass cache)'),
+                    ),
+                  ],
                 ),
                 const Spacer(),
                 GestureDetector(
@@ -9251,20 +9240,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       },
                     ),
                   ),
-                ),
-                IconButton(
-                  tooltip: 'Reload page (bypass cache)',
-                  icon: const Icon(Icons.refresh, size: 20),
-                  onPressed: () async {
-                    // Clear HTTP cache so we actually pick up server changes —
-                    // bare reload() honours cache headers and was returning
-                    // stale pages. We stay on the same dialog route (no pop)
-                    // and just rerun loadRequest against the current language URL.
-                    final ctrl = dialogController;
-                    if (ctrl == null) return;
-                    try { await ctrl.clearCache(); } catch (_) {}
-                    await _loadDialog1Page(Uri.parse(getUrlForLanguage(_selectedLanguage)));
-                  },
                 ),
                 IconButton(
                   tooltip: 'Minimize',
@@ -11742,6 +11717,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   Timer? _appBarTimer;
+  bool _pageToolsOpen = false;
   DateTime? _lastTapTime;
   // Long-press tracking — fires a top-bar toggle if the pointer stays down
   // for ~500ms without significant movement. We must NOT consume the touch
@@ -11763,6 +11739,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   void _toggleAppBar() {
+    if (_pageToolsOpen) return;
     // Never hide the bar while voice input is active — the user needs to see
     // the live mic state and the Stop control for as long as recording runs.
     if (_isListening) {
@@ -11803,9 +11780,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   void _showAppBarWithTimer() {
     setState(() => _showAppBar = true);
+    _scheduleAppBarHide();
+  }
+
+  void _scheduleAppBarHide() {
     _appBarTimer?.cancel();
-    // Don't auto-hide app bar when voice input is active
-    if (_autoHideAppBar && !_isListening) {
+    if (_autoHideAppBar && !_isListening && !_pageToolsOpen && !_urlBarFocused) {
       _appBarTimer = Timer(const Duration(seconds: 10), () {
         if (mounted) setState(() => _showAppBar = false);
       });
@@ -11932,31 +11912,59 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 )
               : const SizedBox.shrink(),
         ),
-        IconButton(
-          icon: Icon(Icons.tune_outlined),
-          tooltip: 'Tools',
-          onPressed: _showToolsDrawer,
-        ),
-        if (_currentPdfUrl != null) ...([
-          _isExtractingPdf
-            ? Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: SizedBox(width: 20, height: 20,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)),
-              )
-            : IconButton(
-                icon: Icon(_isTextView ? Icons.picture_as_pdf : Icons.text_snippet_outlined),
-                tooltip: _isTextView ? 'Switch to PDF view' : 'Switch to text view',
-                onPressed: _togglePdfTextView,
-              ),
-        ]),
-        IconButton(
-          icon: Icon(_findOverlay != null ? Icons.search_off : Icons.search),
-          tooltip: _findOverlay != null ? 'Close find' : 'Find in page (Cmd/Ctrl+F)',
-          onPressed: () {
-            if (_findOverlay != null) _closeFindBar();
-            else unawaited(_dispatchFindToVisiblePage());
+        if (_currentPdfUrl != null && _isExtractingPdf)
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 12),
+            child: SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          ),
+        MenuAnchor(
+          onOpen: () {
+            _pageToolsOpen = true;
+            _appBarTimer?.cancel();
           },
+          onClose: () {
+            _pageToolsOpen = false;
+            if (mounted) _scheduleAppBarHide();
+          },
+          builder: (_, menu, __) => IconButton(
+            icon: const Icon(Icons.more_vert),
+            tooltip: 'Page and tools menu',
+            onPressed: () => menu.isOpen ? menu.close() : menu.open(),
+          ),
+          menuChildren: [
+            SubmenuButton(
+              leadingIcon: const Icon(Icons.web),
+              menuChildren: [
+                MenuItemButton(
+                  leadingIcon: Icon(_findOverlay != null ? Icons.search_off : Icons.search),
+                  onPressed: () {
+                    if (_findOverlay != null) {
+                      _closeFindBar();
+                    } else {
+                      unawaited(_dispatchFindToVisiblePage());
+                    }
+                  },
+                  child: Text(_findOverlay != null ? 'Close find' : 'Find in page'),
+                ),
+                if (_currentPdfUrl != null)
+                  MenuItemButton(
+                    leadingIcon: Icon(_isTextView ? Icons.picture_as_pdf : Icons.text_snippet_outlined),
+                    onPressed: _isExtractingPdf ? null : _togglePdfTextView,
+                    child: Text(_isTextView ? 'Switch to PDF view' : 'Switch to text view'),
+                  ),
+              ],
+              child: const Text('Page'),
+            ),
+            MenuItemButton(
+              leadingIcon: const Icon(Icons.tune_outlined),
+              onPressed: _showToolsDrawer,
+              child: const Text('Tools'),
+            ),
+          ],
         ),
         GestureDetector(
           // Long-press = enter continuous-listen mode (until next tap to stop).

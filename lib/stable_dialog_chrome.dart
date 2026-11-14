@@ -25,6 +25,7 @@ class StableDialogChrome extends StatefulWidget {
     required this.child,
     this.enabled = true,
     this.holdVisible,
+    this.menuOpen,
     this.activity,
     this.idle = const Duration(seconds: 3),
   });
@@ -33,6 +34,7 @@ class StableDialogChrome extends StatefulWidget {
   final Widget child;
   final bool enabled;
   final ValueListenable<bool>? holdVisible;
+  final ValueListenable<bool>? menuOpen;
   final Listenable? activity;
   final Duration idle;
 
@@ -50,6 +52,7 @@ class _StableDialogChromeState extends State<StableDialogChrome> {
     super.initState();
     widget.activity?.addListener(_reveal);
     widget.holdVisible?.addListener(_reveal);
+    widget.menuOpen?.addListener(_reveal);
     _schedule();
   }
 
@@ -64,6 +67,10 @@ class _StableDialogChromeState extends State<StableDialogChrome> {
       oldWidget.holdVisible?.removeListener(_reveal);
       widget.holdVisible?.addListener(_reveal);
     }
+    if (oldWidget.menuOpen != widget.menuOpen) {
+      oldWidget.menuOpen?.removeListener(_reveal);
+      widget.menuOpen?.addListener(_reveal);
+    }
     if (oldWidget.enabled != widget.enabled) _reveal();
   }
 
@@ -76,6 +83,7 @@ class _StableDialogChromeState extends State<StableDialogChrome> {
     _timer?.cancel();
     if (!widget.enabled ||
         _pointers.isNotEmpty ||
+        widget.menuOpen?.value == true ||
         widget.holdVisible?.value == true)
       return;
     _timer = Timer(widget.idle, () {
@@ -94,6 +102,7 @@ class _StableDialogChromeState extends State<StableDialogChrome> {
     _timer?.cancel();
     widget.activity?.removeListener(_reveal);
     widget.holdVisible?.removeListener(_reveal);
+    widget.menuOpen?.removeListener(_reveal);
     super.dispose();
   }
 
