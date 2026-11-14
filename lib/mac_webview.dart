@@ -49,13 +49,26 @@ Future<void> setMacWindowFullscreen(bool on) async {
   }
 }
 
+Future<bool> openMacBrowser(String url) async {
+  if (!Platform.isMacOS) return false;
+  return await _channel.invokeMethod<bool>('openBrowser', url) ?? false;
+}
+
 /// macOS: [onExit] runs when the window leaves native fullscreen by any route
 /// (green button, Esc, menu), so page fullscreen can follow it out.
-void onMacWindowExitedFullscreen(VoidCallback onExit, {VoidCallback? onFindShortcut}) {
+void onMacWindowExitedFullscreen(
+  VoidCallback onExit, {
+  VoidCallback? onFindShortcut,
+  ValueChanged<String>? onFilmotCapture,
+}) {
   if (!Platform.isMacOS) return;
   _channel.setMethodCallHandler((call) async {
     if (call.method == 'windowExitedFullscreen') onExit();
     if (call.method == 'findShortcut') onFindShortcut?.call();
+    final capture = call.arguments;
+    if (call.method == 'filmotCapture' && capture is String) {
+      onFilmotCapture?.call(capture);
+    }
   });
 }
 

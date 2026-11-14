@@ -21,6 +21,8 @@
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
+		3AA57F310BFA42C28B951001 /* BrowserWindows.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3AA57F310BFA42C28B951002 /* BrowserWindows.swift */; };
+		3AA57F310BFA42C28B951003 /* filmot_capture.js in Resources */ = {isa = PBXBuildFile; fileRef = 3AA57F310BFA42C28B951004 /* filmot_capture.js */; };
 		5E8A437A2FA137C400000001 /* NativeAudioRecording.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E8A437A2FA137C400000002 /* NativeAudioRecording.swift */; };
 		1E99AA01A2994003764A360F /* Pods_RunnerTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 932FB0BA6B2CA3BDE892C565 /* Pods_RunnerTests.framework */; };
 		331C80D8294CF71000263BE5 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 331C80D7294CF71000263BE5 /* RunnerTests.swift */; };
@@ -63,6 +65,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		3AA57F310BFA42C28B951002 /* BrowserWindows.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserWindows.swift; sourceTree = "<group>"; };
+		3AA57F310BFA42C28B951004 /* filmot_capture.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = filmot_capture.js; path = ../assets/js/filmot_capture.js; sourceTree = SOURCE_ROOT; };
 		5E8A437A2FA137C400000002 /* NativeAudioRecording.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeAudioRecording.swift; sourceTree = "<group>"; };
 		1A6C9BCB546E4E09A51A7AB0 /* Pods_Runner.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Runner.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		331C80D5294CF71000263BE5 /* RunnerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RunnerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -179,6 +183,8 @@
 			children = (
 				33CC10F02044A3C60003C045 /* AppDelegate.swift */,
 				33CC11122044BFA00003C045 /* MainFlutterWindow.swift */,
+				3AA57F310BFA42C28B951002 /* BrowserWindows.swift */,
+				3AA57F310BFA42C28B951004 /* filmot_capture.js */,
 				5E8A437A2FA137C400000002 /* NativeAudioRecording.swift */,
 				33E51913231747F40026EE4D /* DebugProfile.entitlements */,
 				33E51914231749380026EE4D /* Release.entitlements */,
@@ -319,6 +325,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				33CC10F32044A3C60003C045 /* Assets.xcassets in Resources */,
+				3AA57F310BFA42C28B951003 /* filmot_capture.js in Resources */,
 				33CC10F62044A3C60003C045 /* MainMenu.xib in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -441,6 +448,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				33CC11132044BFA00003C045 /* MainFlutterWindow.swift in Sources */,
+				3AA57F310BFA42C28B951001 /* BrowserWindows.swift in Sources */,
 				5E8A437A2FA137C400000001 /* NativeAudioRecording.swift in Sources */,
 				33CC10F12044A3C60003C045 /* AppDelegate.swift in Sources */,
 				335BBD1B22A9A15E00E9071D /* GeneratedPluginRegistrant.swift in Sources */,
