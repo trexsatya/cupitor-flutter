@@ -138,6 +138,7 @@ flutter:
     - assets/js/page_export.js
     - assets/js/youtube_controls.js
     - assets/js/frame_boot.js
+    - assets/js/filmot_capture.js
   #   - images/a_dot_ham.jpeg
 
   # An image asset can refer to one or more resolution-specific "variants", see

@@ -75,6 +75,14 @@ class MainFlutterWindow: NSWindow {
         result(nil)
         return
       }
+      if call.method == "openBrowser" {
+        guard let address = call.arguments as? String, let url = URL(string: address) else {
+          result(false)
+          return
+        }
+        result(self?.openBrowser(url) ?? false)
+        return
+      }
       guard call.method == "configureWebView" else {
         result(FlutterMethodNotImplemented)
         return
@@ -146,6 +154,18 @@ class MainFlutterWindow: NSWindow {
   private let adBlocker = MacAdBlocker()
   private let audioRecording = NativeAudioRecording()
   private let frameScripts = FrameScriptInstaller()
+  private lazy var browserWindows: BrowserWindows = {
+    let browser = BrowserWindows()
+    browser.onFilmotCapture = { [weak self] payload in
+      guard let self else { return }
+      self.makeKeyAndOrderFront(nil)
+      self.webviewChannel?.invokeMethod("filmotCapture", arguments: payload)
+    }
+    return browser
+  }()
+
+  @discardableResult
+  func openBrowser(_ url: URL) -> Bool { browserWindows.open(url) }
   /// The window is fullscreen because a page asked, not because the user did.
   private var windowFullscreenIsOurs = false
   private var pageWantsFullscreen = false
@@ -364,9 +384,9 @@ final class JSPanelUIDelegate: NSObject, WKUIDelegate {
     self.inner = inner
   }
 
-  static func install(on webView: WKWebView) {
+  static func install(on webView: WKWebView, forwardingTo delegate: WKUIDelegate? = nil) {
     if webView.uiDelegate is JSPanelUIDelegate { return }
-    let wrapper = JSPanelUIDelegate(inner: webView.uiDelegate)
+    let wrapper = JSPanelUIDelegate(inner: delegate ?? webView.uiDelegate)
     // uiDelegate is weak; the web view keeps the wrapper alive.
     objc_setAssociatedObject(webView, &key, wrapper, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
     webView.uiDelegate = wrapper

@@ -37,6 +37,48 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(content.userScripts.map { $0.source },
       ["window.FlutterChannel = true", "window.newAgent = true"])
   }
+
+  func testBrowserPopupKeepsTheOpenerAndItsDataStore() {
+    let browser = BrowserWindows()
+    let configuration = WKWebViewConfiguration()
+    configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+    configuration.websiteDataStore = .nonPersistent()
+    let opener = browser.openPopup(configuration: configuration)
+    defer { opener.window?.close() }
+    let navigation = AdBlockNavigation()
+    let loaded = expectation(description: "opener loaded")
+    navigation.finished = { loaded.fulfill() }
+    opener.navigationDelegate = navigation
+    opener.loadHTMLString("<title>Opener</title>", baseURL: nil)
+    wait(for: [loaded], timeout: 10)
+
+    let popup = expectation(description: "popup can talk to its opener")
+    opener.evaluateJavaScript("""
+      (() => {
+        window.popup = window.open('about:blank');
+        return window.popup !== null && window.popup.opener === window;
+      })()
+      """) { value, error in
+      XCTAssertNil(error)
+      XCTAssertEqual(value as? Bool, true)
+      popup.fulfill()
+    }
+    wait(for: [popup], timeout: 10)
+    let child = NSApp.windows.compactMap { window in
+      window.contentView?.subviews.compactMap { $0 as? WKWebView }.first
+    }.first { view in view !== opener && view.configuration.websiteDataStore === configuration.websiteDataStore }
+    XCTAssertNotNil(child)
+    defer { child?.window?.close() }
+    XCTAssertEqual(opener.title, "Opener")
+  }
+
+  func testBrowserCaptureIsScopedToFilmot() {
+    XCTAssertTrue(BrowserTab.isFilmot(URL(string: "https://filmot.com/search/word")))
+    XCTAssertTrue(BrowserTab.isFilmot(URL(string: "https://beta.filmot.com/")))
+    XCTAssertFalse(BrowserTab.isFilmot(URL(string: "https://notfilmot.com/")))
+    XCTAssertFalse(BrowserTab.isFilmot(URL(string: "https://filmot.com.example.org/")))
+    XCTAssertFalse(BrowserTab.canOpen(URL(string: "file:///tmp/test.html")!))
+  }
 }
 
 /// A real loopback server lets WKWebView prove that a request was blocked,
