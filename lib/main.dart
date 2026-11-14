@@ -7142,15 +7142,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (_localSubtitleImportBusy) { await cancel(); return; }
     _localSubtitleImportBusy = true;
     try {
-      final picked = await FilePicker.platform.pickFiles(
-        dialogTitle: 'Open SRT subtitles',
-        type: FileType.custom,
-        allowedExtensions: const ['srt'],
-        allowMultiple: false,
-        withData: true,
-      );
-      if (picked == null || picked.files.isEmpty) { await cancel(); return; }
-      final file = picked.files.single;
+      final file = await pickLocalSubtitleFile(isAndroid: Platform.isAndroid);
+      if (file == null) {
+        await cancel();
+        return;
+      }
       if (file.size > maxLocalSubtitleBytes) {
         throw const FormatException('The SRT file is larger than 10 MB.');
       }
