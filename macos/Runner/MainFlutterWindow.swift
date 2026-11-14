@@ -7,27 +7,38 @@ class MainFlutterWindow: NSWindow {
   // An embedded WKContentView may be the first responder rather than its
   // enclosing WKWebView. Walk the view ancestry to find the actual owner.
   // Do not consume Cmd+F from Flutter-only screens such as the EPUB reader.
-  private var webViewHasFocus: Bool {
+  private var focusedWebView: WKWebView? {
     var view = firstResponder as? NSView
     while let current = view {
-      if current is WKWebView { return true }
+      if let webView = current as? WKWebView { return webView }
       view = current.superview
     }
-    return false
+    return nil
   }
 
   // Native WKWebView text input handles key equivalents before Flutter sees
-  // them. Catch Cmd+F only when a page has focus; Flutter handles its own keys.
+  // them. Route find from any embedded page and browser shortcuts from the
+  // main browser. Flutter handles shortcuts when its own widgets have focus.
   override func performKeyEquivalent(with event: NSEvent) -> Bool {
     let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
-    if webViewHasFocus && event.type == .keyDown && !event.isARepeat &&
-        modifiers == .command &&
-        event.charactersIgnoringModifiers?.lowercased() == "f" {
-      webviewChannel?.invokeMethod("findShortcut", arguments: nil)
-      return true
+    if let webView = focusedWebView, event.type == .keyDown, modifiers == .command,
+       let key = event.charactersIgnoringModifiers?.lowercased() {
+      if key == "f" {
+        if !event.isARepeat { webviewChannel?.invokeMethod("findShortcut", arguments: nil) }
+        return true
+      }
+      if browserShortcutViews.contains(webView), let action = Self.browserShortcuts[key] {
+        if !event.isARepeat { webviewChannel?.invokeMethod("browserShortcut", arguments: action) }
+        return true
+      }
     }
     return super.performKeyEquivalent(with: event)
   }
+
+  private let browserShortcutViews = NSHashTable<WKWebView>.weakObjects()
+  private static let browserShortcuts = [
+    "l": "address", "r": "reload", "d": "addBookmark", "b": "bookmarks", ",": "tools",
+  ]
 
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
@@ -88,12 +99,16 @@ class MainFlutterWindow: NSWindow {
         return
       }
       guard let registry = flutterViewController,
-        let id = (call.arguments as? NSNumber)?.int64Value,
+        let arguments = call.arguments as? [String: Any],
+        let id = (arguments["id"] as? NSNumber)?.int64Value,
         let webView = FWFWebViewFlutterWKWebViewExternalAPI.webView(
           forIdentifier: id, withPluginRegistry: registry)
       else {
         result(false)
         return
+      }
+      if arguments["browserShortcuts"] as? Bool == true {
+        self?.browserShortcutViews.add(webView)
       }
       // WKWebView refuses the HTML Fullscreen API unless this is on, so a
       // page's own fullscreen button (YouTube's, for one) does nothing.
