@@ -74,6 +74,54 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
+  testWidgets('an open study menu holds the toolbar past the idle timeout', (
+    tester,
+  ) async {
+    final menuOpen = ValueNotifier(false);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StableDialogChrome(
+            menuOpen: menuOpen,
+            toolbar: MenuAnchor(
+              onOpen: () => menuOpen.value = true,
+              onClose: () => menuOpen.value = false,
+              menuChildren: [
+                MenuItemButton(onPressed: () {}, child: const Text('Reload')),
+              ],
+              builder: (_, controller, _) => TextButton(
+                onPressed: () => controller.open(),
+                child: const Text('Study tools'),
+              ),
+            ),
+            child: const SizedBox.expand(),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Study tools'));
+    await tester.pumpAndSettle();
+    await tester.pump(const Duration(seconds: 5));
+    expect(find.text('Reload'), findsOneWidget);
+    expect(
+      tester
+          .widget<AnimatedOpacity>(find.byType(AnimatedOpacity).first)
+          .opacity,
+      1,
+    );
+    await tester.tap(find.text('Reload'));
+    await tester.pumpAndSettle();
+    await tester.pump(const Duration(seconds: 3));
+    expect(
+      tester
+          .widget<AnimatedOpacity>(find.byType(AnimatedOpacity).first)
+          .opacity,
+      0,
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+    menuOpen.dispose();
+  });
+
   testWidgets(
     'voice capture and held pointers keep controls visible; JS activity reveals them',
     (tester) async {
