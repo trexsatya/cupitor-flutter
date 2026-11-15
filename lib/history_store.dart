@@ -68,6 +68,99 @@ bool isRecordableHistoryUrl(String url) {
   return uri.host.trim().isNotEmpty;
 }
 
+String? _spotifySearchTerm(String url) {
+  if (!url.startsWith('https://open.spotify.com/') &&
+      !url.startsWith('http://open.spotify.com/')) {
+    return null;
+  }
+  final uri = Uri.tryParse(url);
+  if (uri == null) return null;
+  try {
+    final term = switch (uri.pathSegments) {
+      ['search', 'results', final term] => term.trim(),
+      ['search', final term] when term != 'results' => term.trim(),
+      _ => '',
+    };
+    return term.isEmpty ? null : term;
+  } on FormatException {
+    return null;
+  }
+}
+
+/// Holds live Spotify search URLs until typing settles or the user moves on.
+/// Full page loads and ordinary in-page navigations are recorded immediately
+/// by the caller.
+class LiveSearchHistoryRecorder {
+  LiveSearchHistoryRecorder(this._record);
+
+  final Future<void> Function(String url, {String title}) _record;
+  static const _settleDelay = Duration(seconds: 2);
+
+  ({String url, String term})? _pending;
+  Timer? _timer;
+
+  /// Returns true when this recorder handled the in-page navigation.
+  bool onNavigation(String url) {
+    final term = _spotifySearchTerm(url);
+    final previous = _pending;
+    if (term == null) {
+      flush();
+      return false;
+    }
+    if (url == previous?.url) return true;
+    if (previous != null &&
+        !term.startsWith(previous.term) &&
+        !previous.term.startsWith(term)) {
+      flush();
+    }
+    _pending = (url: url, term: term);
+    _timer?.cancel();
+    _timer = Timer(_settleDelay, flush);
+    return true;
+  }
+
+  void flush() {
+    _timer?.cancel();
+    _timer = null;
+    final search = _pending;
+    _pending = null;
+    if (search == null) return;
+    // The WebView may already be on another page when the user leaves search.
+    unawaited(
+      _record(search.url, title: 'Search for ${search.term} | Spotify'),
+    );
+  }
+}
+
+/// Hides old typing bursts in newest-first history. Require at least two
+/// adjacent, single-visit prefixes, so an isolated shorter search stays
+/// visible. The original rows stay on disk.
+List<HistoryEntry> collapseHistorySearchDrafts(List<HistoryEntry> all) {
+  final shown = <HistoryEntry>[];
+  var index = 0;
+  while (index < all.length) {
+    var newer = all[index++];
+    shown.add(newer);
+    final latestTerm = _spotifySearchTerm(newer.url);
+    if (latestTerm == null) continue;
+    var term = latestTerm;
+
+    final firstDraft = index;
+    while (index < all.length) {
+      final older = all[index];
+      final gap = newer.lastVisited - older.lastVisited;
+      if (older.visitCount != 1 || gap < 0 || gap >= 2000) break;
+      final prefix = _spotifySearchTerm(older.url);
+      if (prefix == null || prefix == term || !term.startsWith(prefix)) break;
+      term = prefix;
+      newer = older;
+      index++;
+    }
+    if (index == firstDraft + 1) shown.add(all[firstDraft]);
+  }
+  return shown;
+}
+
 /// How well [entry] answers [query], lower being better, or null for no match.
 ///
 /// The ranks encode what someone typing into a URL bar means. Typing `svt`
@@ -314,7 +407,11 @@ class HistoryStore {
 
   /// Suggestions for what the user has typed so far.
   static List<HistoryEntry> suggest(String query, {int limit = 8}) =>
-      rankHistorySuggestions(entries.value, query, limit: limit);
+      rankHistorySuggestions(
+        collapseHistorySearchDrafts(entries.value),
+        query,
+        limit: limit,
+      );
 
   static Future<void> remove(String url) async {
     final db = _db;

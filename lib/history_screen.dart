@@ -103,7 +103,11 @@ class _HistoryScreenState extends State<HistoryScreen> {
         builder: (context, all, _) {
           // No limit here: this screen is the place you come to when the
           // drop-down's few guesses were not the one you wanted.
-          final shown = rankHistorySuggestions(all, _search.text, limit: all.length);
+          final shown = rankHistorySuggestions(
+            collapseHistorySearchDrafts(all),
+            _search.text,
+            limit: all.length,
+          );
           if (shown.isEmpty) {
             return Center(
               child: Padding(

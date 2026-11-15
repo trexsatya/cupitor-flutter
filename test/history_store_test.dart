@@ -35,6 +35,75 @@ void main() {
     });
   });
 
+  group('Spotify search history', () {
+    const results = 'https://open.spotify.com/search/results/';
+
+    testWidgets('typing a search records only the settled route', (
+      tester,
+    ) async {
+      final visits = <(String, String)>[];
+      final recorder = LiveSearchHistoryRecorder((url, {title = ''}) async {
+        visits.add((url, title));
+      });
+
+      expect(recorder.onNavigation('${results}B'), isTrue);
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(recorder.onNavigation('${results}Befria'), isTrue);
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(recorder.onNavigation('${results}Befria%20oss'), isTrue);
+      await tester.pump(const Duration(milliseconds: 1999));
+      expect(visits, isEmpty);
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(visits, [
+        ('${results}Befria%20oss', 'Search for Befria oss | Spotify'),
+      ]);
+    });
+
+    testWidgets('keeps separate searches and saves the last one on exit', (
+      tester,
+    ) async {
+      final visits = <String>[];
+      final recorder = LiveSearchHistoryRecorder((url, {title = ''}) async {
+        visits.add(url);
+      });
+
+      recorder.onNavigation('${results}Befria');
+      recorder.onNavigation('https://open.spotify.com/search/Jazz');
+      expect(visits, ['${results}Befria']);
+      expect(
+        recorder.onNavigation('https://open.spotify.com/episode/123'),
+        isFalse,
+      );
+      await tester.pump(const Duration(seconds: 2));
+      expect(visits, [
+        '${results}Befria',
+        'https://open.spotify.com/search/Jazz',
+      ]);
+    });
+
+    test('hides old typing bursts while keeping independent visits', () {
+      final all = [
+        e('${results}Befria%20oss', visits: 2, at: 9000),
+        e('${results}Befria', at: 8500),
+        e('${results}Bef', at: 8000),
+        e('${results}Be', visits: 2, at: 7500),
+        e('${results}B', at: 7000),
+        e('${results}Jazz', at: 6000),
+        e('${results}Jaz', at: 2500),
+        e('${results}Ja', at: 2000),
+      ];
+      expect(collapseHistorySearchDrafts(all), [
+        all[0],
+        all[3],
+        all[4],
+        all[5],
+        all[6],
+        all[7],
+      ]);
+      expect(all, hasLength(8));
+    });
+  });
+
   group('matching', () {
     test('a host that starts with the query beats one that contains it', () {
       final starts = e('https://svtplay.se/');

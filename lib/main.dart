@@ -197,6 +197,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// Needed because [_urlController] holds whatever the user may be halfway
   /// through TYPING, and a rebuild has to navigate somewhere loadable.
   String? _lastLoadedUrl;
+  final _liveSearchHistory = LiveSearchHistoryRecorder(HistoryStore.record);
+  String? _historyPageUrl;
   WebViewController? dialogController;
   late final DialogAppLifecycleBridge _dialogAppLifecycle;
   final TextEditingController _urlController = TextEditingController(text: 'https://google.com');
@@ -560,6 +562,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   void dispose() {
     if (Platform.isAndroid) _androidBrowserChannel.setMethodCallHandler(null);
     _appBarTimer?.cancel();
+    _liveSearchHistory.flush();
     _studyCallHistoryBridge.dispose();
     if (!_profileInitComplete.isCompleted) _profileInitComplete.complete();
     ProfileService.active.removeListener(_onProfileChanged);
@@ -639,6 +642,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.hidden) _liveSearchHistory.flush();
     if (state == AppLifecycleState.hidden && _nativeRecordingIsSpeakOver) {
       _stopNativeRecordingIfAny();
     }
@@ -880,7 +884,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         ..addJavaScriptChannel('LocalSubtitles',
             onMessageReceived: (msg) => _openLocalSubtitlesForPage(c, msg))
         ..addJavaScriptChannel('PdfIframeDetector', onMessageReceived: (msg) => _handlePdfIframe(msg.message))
-        ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) => _onSpaNavigation(msg.message))
+        ..addJavaScriptChannel('SpaNavigationDetector', onMessageReceived: (msg) {
+          if (mounted && identical(c, _controller)) _onSpaNavigation(msg.message);
+        })
         ..addJavaScriptChannel('AdHostDetector', onMessageReceived: (msg) => _onJsAdHostDetected(msg.message))
         ..addJavaScriptChannel('SelectionChannel', onMessageReceived: (_) {
           if (_autoHideAppBar && !_showAppBar) _showAppBarWithTimer();
@@ -941,6 +947,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 // and the usual recorder never runs — yet the document is
                 // about to fill the screen. Without this, history would hold
                 // different things on Android and macOS for the same reading.
+                _liveSearchHistory.flush();
                 HistoryStore.record(url);
                 if (mounted) setState(() {
                   _urlController.text = url;
@@ -964,6 +971,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         .timeout(const Duration(seconds: 5));
                     final ct = response.headers['content-type'] ?? '';
                     if (ct.contains('application/pdf') && mounted) {
+                      _liveSearchHistory.flush();
                       HistoryStore.record(url);
                       // The navigation started but is prevented here, so it
                       // never reports finishing.
@@ -1001,7 +1009,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               }
             },
             onPageStarted: (url) {
-              if (identical(c, _controller)) _pageLoading.started();
+              if (identical(c, _controller)) {
+                _liveSearchHistory.flush();
+                _pageLoading.started();
+              }
               // A page torn down mid-fullscreen never reports leaving it.
               if (Platform.isAndroid) _setVideoLandscape(false);
               _hideAndroidFullscreen?.call();
@@ -1091,6 +1102,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               // Where to come back to if the renderer dies and this WebView
               // has to be rebuilt from scratch.
               _lastLoadedUrl = url;
+              _historyPageUrl = url;
               _recordHistory(url);
               // Restore scroll position for this URL
               _restoreScrollPosition(url);
@@ -2226,11 +2238,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   void _onSpaNavigation(String url) async {
     setState(() => _urlController.text = url);
+    // Same-URL state updates still need the page hooks, but aren't new visits.
+    if (_historyPageUrl != url) {
+      _historyPageUrl = url;
+      if (!_liveSearchHistory.onNavigation(url)) _recordHistory(url);
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('lastUrl', url);
-    // A route change inside a single-page site is a page visit to the person
-    // using it, even though onPageFinished never fires again.
-    _recordHistory(url);
+    if (!mounted) return;
     _injectJs();
     _injectRemoteSnippet();
     _injectAdBlocker();
@@ -4663,6 +4678,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                         ),
                         trailing: const Icon(Icons.chevron_right),
                         onTap: () async {
+                          _liveSearchHistory.flush();
                           Navigator.of(ctx).pop();
                           final picked = await Navigator.of(context)
                               .push<String>(MaterialPageRoute<String>(
@@ -12037,9 +12053,19 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               onPressed: _isExtractingPdf ? null : _togglePdfTextView,
             ),
           IconButton(
+            icon: const Icon(Icons.bookmark_add_outlined),
+            tooltip: 'Bookmark this page (${_desktopShortcutLabel('D')})',
+            onPressed: _addBookmark,
+          ),
+          IconButton(
             icon: const Icon(Icons.bookmarks_outlined),
             tooltip: 'Bookmarks (${_desktopShortcutLabel('B')})',
             onPressed: _showBookmarks,
+          ),
+          IconButton(
+            icon: const Icon(Icons.menu_book_outlined),
+            tooltip: 'Open EPUB / DOCX',
+            onPressed: _showEpubSourcePicker,
           ),
           IconButton(
             icon: const Icon(Icons.tune_outlined),
@@ -12061,6 +12087,21 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             onPressed: () => menu.isOpen ? menu.close() : menu.open(),
           ),
           menuChildren: [
+            MenuItemButton(
+              leadingIcon: const Icon(Icons.bookmark_add_outlined),
+              onPressed: _addBookmark,
+              child: const Text('Bookmark this page'),
+            ),
+            MenuItemButton(
+              leadingIcon: const Icon(Icons.bookmarks_outlined),
+              onPressed: _showBookmarks,
+              child: const Text('Bookmarks'),
+            ),
+            MenuItemButton(
+              leadingIcon: const Icon(Icons.menu_book_outlined),
+              onPressed: _showEpubSourcePicker,
+              child: const Text('Open EPUB / DOCX'),
+            ),
             SubmenuButton(
               leadingIcon: const Icon(Icons.web),
               menuChildren: [
@@ -12077,11 +12118,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   ),
               ],
               child: const Text('Page'),
-            ),
-            MenuItemButton(
-              leadingIcon: const Icon(Icons.bookmarks_outlined),
-              onPressed: _showBookmarks,
-              child: const Text('Bookmarks'),
             ),
             MenuItemButton(
               leadingIcon: const Icon(Icons.tune_outlined),
