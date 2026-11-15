@@ -28,6 +28,7 @@ import 'native_recording_start.dart';
 import 'recording_urls.dart';
 import 'study_call_history_bridge.dart';
 import 'caption_capture.dart';
+import 'filmot_capture.dart';
 import 'video_note.dart';
 import 'lookup_video_hold.dart';
 import 'page_loading.dart';
@@ -5782,24 +5783,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       onPressed: () => menu.isOpen ? menu.close() : menu.open(),
                     ),
                     menuChildren: [
-                      if (Platform.isMacOS || Platform.isAndroid)
-                        MenuItemButton(
-                          leadingIcon: const Icon(Icons.open_in_browser),
-                          onPressed: () async {
-                            final current = await controller.currentUrl();
-                            if (!ctx.mounted) return;
-                            final opened = await _openCupitorBrowser(
-                              _isFilmotUrl(current) ? current! : url,
-                            );
-                            if (opened && ctx.mounted && ModalRoute.of(ctx)?.isCurrent == true) {
-                              _minimizedDialog2s.add(dialogId);
-                              _everMinimizedDialog2s.add(dialogId);
-                              Navigator.of(ctx).pop();
-                              _bumpMinimizedVersion();
-                            }
-                          },
-                          child: const Text('Open in Cupitor Browser'),
-                        ),
                       SubmenuButton(
                         leadingIcon: const Icon(Icons.bookmark_outline),
                         menuChildren: [
@@ -6012,29 +5995,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
 
   static const _androidBrowserChannel = MethodChannel('cupitor/browser');
 
-  Future<bool> _openCupitorBrowser([String? url]) async {
+  Future<void> _openCupitorBrowser() async {
     try {
       final opened = Platform.isAndroid
-          ? await _androidBrowserChannel.invokeMethod<bool>('openBrowser', url)
-          : await openMacBrowser(url ?? 'https://www.google.com/');
-      if (opened == true) return true;
+          ? await _androidBrowserChannel.invokeMethod<bool>('openBrowser')
+          : await openMacBrowser('https://www.google.com/');
+      if (opened == true) return;
     } catch (_) {
       // Surface native window creation failures in the app.
     }
-    if (mounted) _showCaptureError('Could not open Cupitor Browser', url ?? 'Try again from Tools.');
-    return false;
+    if (mounted) {
+      _showCaptureError('Could not open Cupitor Browser', 'Try again from Tools.');
+    }
   }
 
   void _receiveBrowserFilmotCapture(String json) {
     if (!mounted) return;
-    try {
-      final capture = jsonDecode(json);
-      if (capture is Map<String, dynamic>) {
-        _previewFilmotCapture(context, capture);
-        return;
-      }
-    } on FormatException {
-      // The capture action may race a page navigation.
+    final capture = decodeFilmotCapture(json);
+    if (capture != null) {
+      _previewFilmotCapture(context, capture);
+      return;
     }
     _showCaptureError('Capture failed', 'Could not read the Filmot subtitles.');
   }
@@ -7897,34 +7877,45 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// where the user can adjust before/after context, translate, and hand
   /// the result to dialog1 for word-level lookup.
   Future<void> _captureFilmotSubtitle(BuildContext ctx, WebViewController controller) async {
-    final js = await rootBundle.loadString('assets/js/filmot_capture.js');
-    if (!ctx.mounted) return;
-    // Retry the scrape a few times — when filmot navigates Next/Prev it
-    // does a full page load and its own subtitle population may finish
-    // slightly after onPageFinished. Without a retry the user often gets
-    // an empty result on the first tap right after navigation.
-    Map<String, dynamic>? data;
-    Object? lastErr;
-    for (var attempt = 0; attempt < 4; attempt++) {
-      try {
-        final raw = await controller.runJavaScriptReturningResult(js);
-        var s = raw.toString();
-        if (s.startsWith('"') && s.endsWith('"')) s = jsonDecode(s) as String;
-        final d = jsonDecode(s) as Map<String, dynamic>;
-        final lines = (d['lines'] as List?) ?? const [];
-        if (lines.isNotEmpty) { data = d; break; }
-        // Empty page DOM — keep the last seen `d` in case all retries miss.
-        data = d;
-      } catch (e) {
-        lastErr = e;
+    final String js;
+    try {
+      js = await rootBundle.loadString('assets/js/filmot_capture.js');
+    } catch (error) {
+      debugPrint('Could not load Filmot capture script: $error');
+      if (ctx.mounted) {
+        _showCaptureError('Capture failed', 'Could not load the subtitle reader.');
       }
-      if (attempt < 3) await Future.delayed(const Duration(milliseconds: 500));
-    }
-    if (data == null) {
-      _showCaptureError('Capture failed', 'Could not read the subtitle list.\n\n$lastErr');
       return;
     }
-    if (ctx.mounted) _previewFilmotCapture(ctx, data);
+
+    // Filmot can populate captions after a Next/Previous navigation finishes.
+    Map<String, dynamic>? data;
+    for (var attempt = 0; attempt < 4 && ctx.mounted; attempt++) {
+      try {
+        final raw = await controller.runJavaScriptReturningResult(js)
+            .timeout(const Duration(seconds: 2));
+        final capture = decodeFilmotCapture(raw);
+        if (capture != null) {
+          data = capture;
+          if ((capture['lines'] as List).isNotEmpty) break;
+        }
+      } catch (error) {
+        debugPrint('Filmot capture attempt failed: $error');
+      }
+      if (attempt < 3 && ctx.mounted) {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      }
+    }
+    if (!ctx.mounted) return;
+    if (data == null) {
+      _showCaptureError(
+        'Capture failed',
+        'Could not read the Filmot page. Open a video result with captions '
+            'and try again after it loads.',
+      );
+      return;
+    }
+    _previewFilmotCapture(ctx, data);
   }
 
   void _previewFilmotCapture(BuildContext ctx, Map<String, dynamic> data) {
