@@ -223,6 +223,50 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   final List<String> _languages = ['sv', 'es'];
   final Map<String, String> _languageParams = {'sv': 'swedish', 'es': 'spanish'};
   String _selectedLanguage = 'sv';
+  static const _familiarLanguagePref = 'familiarLanguage';
+  String? _familiarLanguage;
+  final _languageCodePattern = RegExp(r'^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$');
+
+  Future<void> _saveFamiliarLanguage(String language) async {
+    if (!_languageCodePattern.hasMatch(language) || _familiarLanguage == language) return;
+    _familiarLanguage = language;
+    final prefs = await SharedPreferences.getInstance();
+    if (_familiarLanguage != language) return;
+    await prefs.setString(_familiarLanguagePref, language);
+    if (!mounted || _familiarLanguage != language) return;
+    try {
+      await _controller.runJavaScript(
+          'window.__cupitorFamiliarLanguage = ${jsonEncode(language)};');
+    } catch (_) {}
+  }
+
+  Future<String> _nativeTranslationTarget(String source) async {
+    // Recover a preference already saved by the study page before this host
+    // supported the bridge. The page also reports changes as they happen.
+    if (_familiarLanguage == null && dialogController == null && mounted) {
+      _awaitDialog1StudyPage(show: false);
+      for (var i = 0; i < 15 && mounted && _dialog1Loading && _familiarLanguage == null; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+      }
+    }
+    if (_familiarLanguage == null && _dialog1Loaded && dialogController != null) {
+      try {
+        final result = await dialogController!.runJavaScriptReturningResult(
+          "document.getElementById('vocabularyLookupLanguage')?.value || ''",
+        ).timeout(const Duration(seconds: 2));
+        final language = result.toString().replaceAll('"', '');
+        if (_familiarLanguage == null && _languageCodePattern.hasMatch(language)) {
+          await _saveFamiliarLanguage(language);
+        }
+      } catch (_) {}
+    }
+    final familiar = _familiarLanguage ?? 'en';
+    return familiar.toLowerCase() == source.toLowerCase() ? 'en' : familiar;
+  }
+
+  String _translationLanguageName(String code) => _titleCase(
+      code == 'hi' ? 'Hindi' : code == 'en' ? 'English' : _languageParams[code] ?? code);
+
   bool _isControllerReady = false;
   List<String> _bookmarks = [];
   Map<String, String> _bookmarkNames = {};
@@ -803,6 +847,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       });
     });
     SharedPreferences.getInstance().then((prefs) {
+      _familiarLanguage ??= prefs.getString(_familiarLanguagePref);
       final savedUrl = prefs.getString('lastUrl') ?? _urlController.text;
       _urlController.text = savedUrl;
       // Load persisted scroll positions
@@ -908,7 +953,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         })
         ..addJavaScriptChannel('SnippetLogChannel',
             onMessageReceived: _onSnippetLogMessage)
-        ..addJavaScriptChannel('TranslateRequest', onMessageReceived: _handleTranslateRequest)
+        ..addJavaScriptChannel('TranslateRequest',
+            onMessageReceived: (msg) => _handleTranslateRequest(msg, c))
         // Sentence-tagging bridges. SentenceTagHandler carries 'capture'
         // (initial word-tap) and 'extend' (Prev/Next response) payloads.
         // SentenceFilterHandler is currently used only for an initial
@@ -3418,6 +3464,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     };
   }
   var console = { log: _s('log'), info: _s('info'), warn: _s('warn'), error: _s('error'), debug: _s('debug') };
+  window.__cupitorFamiliarLanguage = ${jsonEncode(_familiarLanguage ?? 'en')};
   $snippet
 })();
 ''';
@@ -3867,13 +3914,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // _languageParams maps language codes ('sv') to friendly names
     // ('swedish'); title-case them since they're going into a sentence.
     final study = _titleCase(_languageParams[_selectedLanguage] ?? _selectedLanguage);
-    // English is the other side of every pair in this app (cf. "Translation
-    // ($_selectedLanguage → en)" in the YouTube subtitle dialog). The page's
-    // toggle says which side the search term is IN — checked means the user
-    // is searching in English — so the prompt's direction follows it.
-    const english = 'English';
-    final src = toEnglish ? study : english;
-    final tgt = toEnglish ? english : study;
+    final familiar = await _nativeTranslationTarget(_selectedLanguage);
+    final src = toEnglish ? study : 'English';
+    final tgt = !toEnglish && familiar == 'en'
+        ? study
+        : _translationLanguageName(familiar);
     final prompt = renderAiPrompt(
       _aiPromptTemplate,
       word: word,
@@ -4941,7 +4986,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // pre-fill a "context" field.
         _openDialogWithWebview(word);
       },
-      onTranslate: (text) => _translateText(text, 'auto', 'en'),
+      onTranslate: (text) async =>
+          _translateText(text, 'auto', await _nativeTranslationTarget('auto')),
       onSendToPlaylist: ({required text, required title, required url}) =>
           _sendSentenceToWebappPlaylist(text: text, title: title, url: url),
     );
@@ -6940,14 +6986,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// falls back to on-device ML Kit (offline, slower first-use because of
   /// the ~30 MB per-language model download). Result is delivered to the
   /// page via window.__cupTranslated(id, result).
-  Future<void> _handleTranslateRequest(JavaScriptMessage msg) async {
+  Future<void> _handleTranslateRequest(JavaScriptMessage msg, WebViewController controller) async {
     Map<String, dynamic> req;
     try { req = jsonDecode(msg.message) as Map<String, dynamic>; } catch (_) { return; }
     final id = req['id'];
     final text = (req['text'] as String? ?? '').trim();
     final src = (req['source'] as String? ?? 'sv').trim();
     final tgt = (req['target'] as String? ?? 'en').trim();
-    if (id == null || text.isEmpty) return;
+    if (id is! int || text.isEmpty) return;
     // Opt-in, per request: a caller that doesn't ask gets exactly the reply it
     // has always got, down to the argument count. That is what keeps the four
     // existing call sites — playlist phrases, subtitle lines, the corresponding
@@ -6999,15 +7045,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             ? 'window.__cupTranslated && window.__cupTranslated($id, ${jsonEncode(result)}, null, ${jsonEncode(detail)});'
             : 'window.__cupTranslated && window.__cupTranslated($id, ${jsonEncode(result)});')
         : 'window.__cupTranslated && window.__cupTranslated($id, null, ${jsonEncode(errMsg ?? 'translate failed')});';
-    // TranslateRequest is registered on BOTH controllers (main _controller for
-    // snippet.js, dialogController for the study app), and a JavaScriptMessage
-    // doesn't say which one sent it. Deliver the reply to both — the guard plus
-    // each page's own pending-id map makes it a no-op on the page that didn't
-    // originate the request. Without this, a request from the dialog webview
-    // (the study page's 🌐 translate) got its reply run in the main webview and
-    // never arrived → translate-timeout.
-    try { _controller.runJavaScript(js); } catch (_) {}
-    try { dialogController?.runJavaScript(js); } catch (_) {}
+    // Each page has its own request counter. Reply only to the sender.
+    try { await controller.runJavaScript(js); } catch (_) {}
   }
 
   // Maps our ISO-639-1 codes to ML Kit's TranslateLanguage enum. Returns null
@@ -7480,7 +7519,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       return;
     }
 
-    _showFullSubtitleDialog(
+    await _showFullSubtitleDialog(
       ctx,
       lines: lines,
       sourceLang: baseLanguageCode(
@@ -7557,14 +7596,16 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// a Translate-all action and Send-to-lookup. Translation is batched
   /// (~30 cues per request) so a typical episode finishes in seconds rather
   /// than minutes, with a progress counter + Cancel.
-  void _showFullSubtitleDialog(
+  Future<void> _showFullSubtitleDialog(
     BuildContext ctx, {
     required List<Map<String, dynamic>> lines,
     required String sourceLang,
     required String videoUrl,
     required String videoId,
     required String videoTitle,
-  }) {
+  }) async {
+    final targetLang = await _nativeTranslationTarget(sourceLang);
+    if (!mounted || !ctx.mounted) return;
     final originals = lines.map((l) => (l['text'] as String)).toList();
     List<String> translation = List<String>.filled(lines.length, '');
     bool translating = false;
@@ -7592,7 +7633,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               final result = await _translateLinesBatched(
                 originals,
                 sourceLang,
-                'en',
+                targetLang,
                 onProgress: (done, total) {
                   if (!mounted) return;
                   setStateDialog(() {
@@ -7643,7 +7684,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                       Padding(
                         padding: const EdgeInsets.only(top: 4),
                         child: Text(
-                          '${originals.length} lines  ·  $sourceLang → en',
+                          '${originals.length} lines  ·  $sourceLang → $targetLang',
                           style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
                         ),
                       ),
@@ -7763,7 +7804,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     'sourceLang': sourceLang,
                     'matchIndex': 0,
                     'lines': outLines,
-                    ...captureTranslationFields(outLines, translation),
+                    ...captureTranslationFields(outLines, translation, targetLang: targetLang),
                     'videoUrl': videoUrl,
                     'videoId': videoId,
                     'videoTitle': videoTitle,
@@ -7977,7 +8018,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       }
     }
     if (!mounted) return;
-    _showSubtitleCaptureDialog(
+    await _showSubtitleCaptureDialog(
       ctx,
       query: query,
       allLines: allLines,
@@ -7990,7 +8031,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     );
   }
 
-  void _showSubtitleCaptureDialog(BuildContext ctx, {
+  Future<void> _showSubtitleCaptureDialog(BuildContext ctx, {
     required String query,
     required List<Map<String, dynamic>> allLines,
     required int matchIdx,
@@ -7999,7 +8040,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     required String videoId,
     required String videoTitle,
     String videoChannel = '',
-  }) {
+  }) async {
+    final sourceLang = _selectedLanguage;
+    final targetLang = await _nativeTranslationTarget(sourceLang);
+    if (!mounted || !ctx.mounted) return;
     // matchIdx is mutable — the user can change the anchor line manually
     // via the picker below.
     int currentMatchIdx = matchIdx;
@@ -8184,7 +8228,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     ),
                     if (translation.isNotEmpty) ...[
                       Text(
-                        'Translation ($_selectedLanguage → en)${translationSource != null ? "  ·  via $translationSource" : ""}',
+                        'Translation ($sourceLang → $targetLang)${translationSource != null ? "  ·  via $translationSource" : ""}',
                         style: Theme.of(dctx2).textTheme.titleSmall,
                       ),
                       Container(
@@ -8224,8 +8268,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   try {
                     final perLine = await _translateLines(
                       captured.map((l) => (l['text'] as String)).toList(),
-                      _selectedLanguage,
-                      'en',
+                      sourceLang,
+                      targetLang,
                       preferOnDevice: preferOnDevice,
                     );
                     setStateDialog(() {
@@ -8248,10 +8292,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   Navigator.of(dctx).pop();
                   _sendCapturedSubtitleToDialog1(<String, dynamic>{
                     'query': query,
-                    'sourceLang': _selectedLanguage,
+                    'sourceLang': sourceLang,
                     'matchIndex': currentMatchIdx - start,
                     'lines': captured,
-                    ...captureTranslationFields(captured, translation),
+                    ...captureTranslationFields(captured, translation, targetLang: targetLang),
                     'videoUrl': videoUrl,
                     'videoId': videoId,
                     'videoTitle': videoTitle,
@@ -8865,6 +8909,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     await ctrl.macConfigurationReady;
     if (!mounted || !identical(ctrl, dialogController) ||
         serial != _dialog1LoadSerial) return;
+    final study = Uri.parse(_dialogUrl);
+    final familiar = _familiarLanguage;
+    if (familiar != null && uri.scheme == study.scheme &&
+        uri.authority == study.authority && uri.path == study.path) {
+      uri = uri.replace(queryParameters: {...uri.queryParameters, 'vocabLookup': familiar});
+    }
     await ctrl.loadRequest(uri);
   }
 
@@ -8915,7 +8965,22 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // here too. The main _controller registers TranslateRequest as well,
         // but that controller isn't the one hosting the study app. The handler
         // (_handleTranslateRequest → window.__cupTranslated) is shared.
-        ..addJavaScriptChannel('TranslateRequest', onMessageReceived: _handleTranslateRequest)
+        ..addJavaScriptChannel('TranslateRequest',
+            onMessageReceived: (msg) => _handleTranslateRequest(msg, ctrl))
+        ..addJavaScriptChannel('FamiliarLanguageBridge', onMessageReceived: (msg) async {
+          if (!mounted || !identical(ctrl, dialogController)) return;
+          Uri? url;
+          try {
+            url = Uri.tryParse(await ctrl.currentUrl() ?? '');
+          } catch (_) {
+            return;
+          }
+          final studyUrl = Uri.parse(_dialogUrl);
+          if (!mounted || !identical(ctrl, dialogController) || url == null ||
+              url.scheme != studyUrl.scheme || url.authority != studyUrl.authority ||
+              url.path != studyUrl.path) return;
+          await _saveFamiliarLanguage(msg.message.trim());
+        })
         ..addJavaScriptChannel('LinkLongPress', onMessageReceived: (msg) => _handleLinkLongPress(msg.message))
         // Language-app ↔ Cupitor bridge for the playlist feature.
         //   { op: 'getPlaylists' } → Cupitor pushes the full playlists
@@ -11431,7 +11496,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// {
   ///   query:       "<the matched search word>",
   ///   sourceLang:  "sv" | "es" | ...,           // base code, no region/-orig
-  ///   targetLang:  "en",                         // only when translation is non-empty
+  ///   targetLang:  "<language code>",            // when translation is non-empty
   ///   matchIndex:  <int — index into `lines` of the matched line>,
   ///   lines:       [ { index, start, end, text }, ... ],
   ///   translation: [ { index, start, end, text }, ... ]   // translated lines only
