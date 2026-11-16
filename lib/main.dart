@@ -513,6 +513,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // Channels observed on the currently-loaded filmot page (in-memory only).
   // Keyed by dialog id so multiple filmot dialogs don't clobber each other.
   final Map<String, Set<String>> _filmotChannelsSeen = {};
+  final _pendingFilmotCaptures =
+      <String, ({int id, Completer<Map<String, dynamic>> reply})>{};
+  int _nextFilmotCaptureId = 0;
   // Per-dialog2 ScaffoldMessenger keys. Dialog2 routes are near-fullscreen
   // and sit above the root Scaffold, so a SnackBar shown via the root
   // ScaffoldMessenger renders behind them and the user never sees it. Each
@@ -5790,7 +5793,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   IconButton(
                     tooltip: 'Capture subtitle (with context, translate, send to lookup)',
                     icon: Icon(Icons.subtitles, size: 20),
-                    onPressed: () => _captureFilmotSubtitle(ctx, controller),
+                    onPressed: () => _captureFilmotSubtitle(dialogId, ctx, controller),
                   ),
                   MenuAnchor(
                     builder: (_, menu, __) => IconButton(
@@ -6781,7 +6784,14 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     Map<String, dynamic> msg;
     try { msg = jsonDecode(message) as Map<String, dynamic>; } catch (_) { return; }
     final action = msg['action']?.toString();
-    if (action == 'channelsSeen') {
+    if (action == 'subtitleCapture') {
+      final request = _pendingFilmotCaptures[dialogId];
+      if (request != null &&
+          request.id == msg['requestId'] &&
+          !request.reply.isCompleted) {
+        request.reply.complete(msg);
+      }
+    } else if (action == 'channelsSeen') {
       final list = (msg['channels'] as List?)?.map((e) => e.toString()).toSet() ?? <String>{};
       _filmotChannelsSeen[dialogId] = list;
     } else if (action == 'resolveVideos') {
@@ -7888,50 +7898,56 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     );
   }
 
-  /// Scrapes the open Filmot detail page's subtitle list (`#subtitlesIn`),
-  /// finds the line that matches the URL's search query, and opens a dialog
-  /// where the user can adjust before/after context, translate, and hand
-  /// the result to dialog1 for word-level lookup.
-  Future<void> _captureFilmotSubtitle(BuildContext ctx, WebViewController controller) async {
-    final String js;
-    try {
-      js = await rootBundle.loadString('assets/js/filmot_capture.js');
-    } catch (error) {
-      debugPrint('Could not load Filmot capture script: $error');
-      if (ctx.mounted) {
-        _showCaptureError('Capture failed', 'Could not load the subtitle reader.');
-      }
-      return;
-    }
+  /// Reads the current Filmot result and opens the subtitle preview.
+  Future<void> _captureFilmotSubtitle(
+    String dialogId,
+    BuildContext ctx,
+    WebViewController controller,
+  ) async {
+    if (_pendingFilmotCaptures.containsKey(dialogId)) return;
+    final request = (
+      id: ++_nextFilmotCaptureId,
+      reply: Completer<Map<String, dynamic>>(),
+    );
+    _pendingFilmotCaptures[dialogId] = request;
 
-    // Filmot can populate captions after a Next/Previous navigation finishes.
-    Map<String, dynamic>? data;
-    for (var attempt = 0; attempt < 4 && ctx.mounted; attempt++) {
-      try {
-        final raw = await controller.runJavaScriptReturningResult(js)
-            .timeout(const Duration(seconds: 2));
-        final capture = decodeFilmotCapture(raw);
-        if (capture != null) {
-          data = capture;
-          if ((capture['lines'] as List).isNotEmpty) break;
-        }
-      } catch (error) {
-        debugPrint('Filmot capture attempt failed: $error');
+    try {
+      final js = await rootBundle.loadString('assets/js/filmot_capture.js');
+      if (!ctx.mounted) return;
+      await controller.runJavaScript('''
+(function(cupitorFilmotCaptureRequestId) {
+$js
+})(${request.id});
+''').timeout(const Duration(seconds: 3));
+
+      final response = await request.reply.future.timeout(const Duration(seconds: 4));
+      if (!ctx.mounted) return;
+      final capture = decodeFilmotCapture(response['capture']);
+      if (capture != null) {
+        _previewFilmotCapture(ctx, capture);
+        return;
       }
-      if (attempt < 3 && ctx.mounted) {
-        await Future<void>.delayed(const Duration(milliseconds: 500));
-      }
-    }
-    if (!ctx.mounted) return;
-    if (data == null) {
+      final error = response['error'];
       _showCaptureError(
         'Capture failed',
-        'Could not read the Filmot page. Open a video result with captions '
-            'and try again after it loads.',
+        error is String
+            ? 'The subtitle reader failed.\n\n$error'
+            : 'Open a Filmot video result with captions and try again.',
       );
-      return;
+    } on TimeoutException {
+      if (ctx.mounted) {
+        _showCaptureError(
+          'Capture failed',
+          'The Filmot subtitle reader did not respond. Try again from the current result.',
+        );
+      }
+    } catch (error) {
+      if (ctx.mounted) {
+        _showCaptureError('Capture failed', 'Could not run the subtitle reader.\n\n$error');
+      }
+    } finally {
+      _pendingFilmotCaptures.remove(dialogId);
     }
-    _previewFilmotCapture(ctx, data);
   }
 
   void _previewFilmotCapture(BuildContext ctx, Map<String, dynamic> data) {
