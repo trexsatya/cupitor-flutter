@@ -50,11 +50,11 @@
       var call = (link.getAttribute('href') || '') + ' ' + (link.getAttribute('onclick') || '');
       var timing = call.match(/jtt\s*\(\s*['"]?\d+['"]?\s*,\s*['"]?(\d+(?:\.\d+)?)/);
       if (!timing) continue;
-      var row = link.closest('[id^="s"]');
-      while (row && row !== root && !/^s\d+/.test(row.id)) {
-        row = row.parentElement.closest('[id^="s"]');
+      var row = link;
+      while (row !== root && !/^s\d+/.test(row.id)) {
+        row = row.parentElement;
       }
-      if (!row || row === root) row = link.parentElement.closest('div, li, p, tr');
+      if (row === root) row = link.parentElement.closest('div, li, p, tr');
       if (!row || row === root || !root.contains(row)) row = link;
       if (seen.has(row)) continue;
       var clone = row.cloneNode(true);
