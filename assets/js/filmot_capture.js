@@ -1,4 +1,34 @@
-(function(){
+(function(capture) {
+  // The embedded lookup uses the same bridge as the other Filmot actions.
+  // Native browser windows still receive the result from evaluateJavaScript.
+  if (typeof cupitorFilmotCaptureRequestId !== 'number') {
+    var result = capture();
+    return result === null ? null : JSON.stringify(result);
+  }
+
+  var requestId = cupitorFilmotCaptureRequestId;
+  function read(attempt) {
+    var result;
+    try {
+      result = capture();
+    } catch (error) {
+      FilmotBridge.postMessage(JSON.stringify({
+        action: 'subtitleCapture', requestId: requestId, error: String(error)
+      }));
+      return;
+    }
+
+    // Filmot can populate captions after switching to a different result.
+    if ((!result || !result.lines.length) && attempt < 3) {
+      setTimeout(function() { read(attempt + 1); }, 500);
+      return;
+    }
+    FilmotBridge.postMessage(JSON.stringify({
+      action: 'subtitleCapture', requestId: requestId, capture: result
+    }));
+  }
+  read(0);
+})(function(){
   function isFilmotDocument(doc) {
     var loc = doc && doc.location;
     return !!loc && (loc.protocol === 'https:' || loc.protocol === 'http:') &&
@@ -20,8 +50,11 @@
       var call = (link.getAttribute('href') || '') + ' ' + (link.getAttribute('onclick') || '');
       var timing = call.match(/jtt\s*\(\s*['"]?\d+['"]?\s*,\s*['"]?(\d+(?:\.\d+)?)/);
       if (!timing) continue;
-      var row = link.closest('[id^="s"]');
-      if (!row || !/^s\d+/.test(row.id)) row = link.parentElement.closest('div, li, p, tr');
+      var row = link;
+      while (row !== root && !/^s\d+/.test(row.id)) {
+        row = row.parentElement;
+      }
+      if (row === root) row = link.parentElement.closest('div, li, p, tr');
       if (!row || row === root || !root.contains(row)) row = link;
       if (seen.has(row)) continue;
       var clone = row.cloneNode(true);
@@ -45,10 +78,14 @@
   for (var d = 0; d < docs.length; d++) {
     var doc = docs[d];
     var root = doc.getElementById('subtitlesIn');
-    if (root) {
-      lines = readLines(root);
-      if (lines.length) { page = doc; break; }
+    if (root) lines = readLines(root);
+    if (!lines.length) {
+      var panels = doc.querySelectorAll('.scroll-subtitles:not(#subtitlesIn)');
+      for (var r = 0; r < panels.length && !lines.length; r++) {
+        lines = readLines(panels[r]);
+      }
     }
+    if (lines.length) { page = doc; break; }
     var frames = doc.querySelectorAll('iframe, frame');
     for (var f = 0; f < frames.length; f++) {
       var child = frames[f].contentDocument;
@@ -87,10 +124,13 @@
     var ax = metadata('#divVideoDetails a[href*="watch?v="], #linktoyoutube a[href*="watch?v="]');
     if (ax) videoId = ytId(ax.href || ax.getAttribute('href') || '');
   }
-  if (!videoId) {
-    var pmSb = page.location.pathname.match(/\/sidebyside\/([A-Za-z0-9_-]{6,})/);
-    if (pmSb) videoId = pmSb[1];
+  function videoIdFromPath(doc) {
+    var path = doc.location.pathname;
+    var match = path.match(/^\/sidebyside\/([A-Za-z0-9_-]{6,})/) ||
+      path.match(/^\/search\/[^/]+\/([A-Za-z0-9_-]{11})\/[0-9]+(?:\/|$)/);
+    return match ? match[1] : null;
   }
+  if (!videoId) videoId = videoIdFromPath(page) || videoIdFromPath(document);
   var videoTitle = '';
   var titleEl = metadata('#divVideoDetails .col-6');
   if (titleEl) videoTitle = (titleEl.textContent || '').trim().split(/\s*[\r\n]+/)[0].slice(0, 200);
@@ -174,7 +214,7 @@
       if ((lines[fi].t || '').trim().length) { matchIdx = fi; matchReason = 'firstNonEmpty'; break; }
     }
   }
-  return JSON.stringify({
+  return {
     query: query,
     lines: lines,
     matchIdx: matchIdx,
@@ -183,5 +223,5 @@
     videoUrl: videoId ? ('https://www.youtube.com/watch?v=' + videoId) : '',
     videoTitle: videoTitle,
     videoChannel: videoChannel
-  });
-})();
+  };
+});

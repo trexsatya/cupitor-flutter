@@ -11,7 +11,8 @@ void main() {
     ],
   };
 
-  test('reads both native JS return formats', () {
+  test('reads the dialog bridge payload and both native JS return formats', () {
+    expect(decodeFilmotCapture(capture), capture);
     expect(decodeFilmotCapture(jsonEncode(capture)), capture);
     expect(decodeFilmotCapture(jsonEncode(jsonEncode(capture))), capture);
   });
