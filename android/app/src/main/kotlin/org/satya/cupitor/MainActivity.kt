@@ -198,10 +198,13 @@ class MainActivity : FlutterActivity() {
             } else {
                 val browser = cupitorBrowser ?: CupitorBrowser(
                     this,
-                    captureScript = {
-                        val key = io.flutter.FlutterInjector.instance().flutterLoader()
-                            .getLookupKeyForAsset("assets/js/filmot_capture.js")
-                        assets.open(key).bufferedReader().use { it.readText() }
+                    loadCaptureScript = { loaded ->
+                        browserChannel.invokeMethod("loadFilmotCaptureScript", null,
+                            object : MethodChannel.Result {
+                                override fun success(result: Any?) = loaded(result as? String)
+                                override fun error(code: String, message: String?, details: Any?) = loaded(null)
+                                override fun notImplemented() = loaded(null)
+                            })
                     },
                     onCapture = { browserChannel.invokeMethod("filmotCapture", it) },
                 ).also { cupitorBrowser = it }

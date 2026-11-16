@@ -5,8 +5,7 @@ import WebKit
 @MainActor
 final class BrowserWindows {
   private var tabs: [ObjectIdentifier: BrowserTab] = [:]
-  lazy var captureScript: String? = Bundle.main.url(forResource: "filmot_capture", withExtension: "js")
-    .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+  var loadCaptureScript: ((@escaping (String?) -> Void) -> Void)?
   var onFilmotCapture: ((String) -> Void)?
 
   @discardableResult
@@ -231,22 +230,33 @@ final class BrowserTab: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDe
   @objc private func captureFilmot() {
     guard let pageURL = webView.url, Self.isFilmot(pageURL),
           !webView.isLoading, !captureInProgress else { return }
-    guard let script = browser?.captureScript else {
-      showMessage("The Filmot capture script could not be loaded.")
-      return
-    }
+    guard let loadScript = browser?.loadCaptureScript else { return }
     captureInProgress = true
     updateControls()
-    webView.evaluateJavaScript(script) { [weak self] value, error in
+    loadScript { [weak self] script in
       guard let self else { return }
-      self.captureInProgress = false
-      self.updateControls()
-      guard self.webView.url == pageURL, !self.webView.isLoading else { return }
-      guard error == nil, let payload = value as? String else {
-        self.showMessage("Could not read the Filmot subtitles.")
+      guard self.webView.url == pageURL, !self.webView.isLoading else {
+        self.captureInProgress = false
+        self.updateControls()
         return
       }
-      self.browser?.onFilmotCapture?(payload)
+      guard let script else {
+        self.captureInProgress = false
+        self.updateControls()
+        self.showMessage("Could not load the Filmot subtitle reader from Cupitor.")
+        return
+      }
+      self.webView.evaluateJavaScript(script) { [weak self] value, error in
+        guard let self else { return }
+        self.captureInProgress = false
+        self.updateControls()
+        guard self.webView.url == pageURL, !self.webView.isLoading else { return }
+        guard error == nil, let payload = value as? String else {
+          self.showMessage("Could not read the Filmot subtitles.")
+          return
+        }
+        self.browser?.onFilmotCapture?(payload)
+      }
     }
   }
 

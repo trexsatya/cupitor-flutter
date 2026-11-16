@@ -171,6 +171,15 @@ class MainFlutterWindow: NSWindow {
   private let frameScripts = FrameScriptInstaller()
   private lazy var browserWindows: BrowserWindows = {
     let browser = BrowserWindows()
+    browser.loadCaptureScript = { [weak self] completion in
+      guard let channel = self?.webviewChannel else {
+        completion(nil)
+        return
+      }
+      channel.invokeMethod("loadFilmotCaptureScript", arguments: nil) { result in
+        completion(result as? String)
+      }
+    }
     browser.onFilmotCapture = { [weak self] payload in
       guard let self else { return }
       self.makeKeyAndOrderFront(nil)
