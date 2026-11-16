@@ -1,7 +1,7 @@
 import 'dart:convert';
 
-/// Filmot returns JSON text. Android WebView can wrap that text in another
-/// JSON string and can return JSON null while a document is navigating.
+/// Accepts the dialog bridge's object and the native browsers' JSON text.
+/// Android can wrap the text in a second JSON string.
 Map<String, dynamic>? decodeFilmotCapture(Object? raw) {
   var value = raw;
   try {
