@@ -6075,7 +6075,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     if (!mounted) return;
     final capture = decodeFilmotCapture(json);
     if (capture != null) {
-      _previewFilmotCapture(context, capture);
+      unawaited(_previewFilmotCapture(context, capture));
       return;
     }
     _showCaptureError('Capture failed', 'Could not read the Filmot subtitles.');
@@ -7972,10 +7972,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       );
       return;
     }
-    _previewFilmotCapture(ctx, data);
+    await _previewFilmotCapture(ctx, data);
   }
 
-  void _previewFilmotCapture(BuildContext ctx, Map<String, dynamic> data) {
+  Future<void> _previewFilmotCapture(
+    BuildContext ctx, Map<String, dynamic> data,
+  ) async {
     final linesRaw = (data['lines'] as List?) ?? const [];
     final query = (data['query'] ?? '').toString();
     final suggestedMatch = (data['matchIdx'] as num?)?.toInt() ?? -1;
