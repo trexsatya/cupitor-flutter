@@ -6371,10 +6371,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// the dialog WebView and re-runs the annotator. Safe to call before the
   /// page has finished loading.
   void _pushFilmotConfig(WebViewController controller) {
-    controller.runJavaScript(
-      '${_filmotConfigJs()}'
-      'if (window.__cupitorFilmotApply) window.__cupitorFilmotApply();',
-    );
+    controller.runJavaScript(filmotLookupJavaScript(
+      'window.__cupitorFilmotApply?.()',
+      setup: _filmotConfigJs(),
+    ));
   }
 
   String _filmotConfigJs() {
@@ -6441,8 +6441,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   Future<void> _injectFilmotHelper(WebViewController controller) async {
     try {
       final js = await _filmotScripts.load(FilmotScript.annotator);
-      if (!mounted || !_isFilmotUrl(await controller.currentUrl())) return;
-      await controller.runJavaScript('${_filmotConfigJs()}\n$js');
+      if (!mounted) return;
+      await controller.runJavaScript(
+        filmotLookupJavaScript(js, setup: _filmotConfigJs()),
+      );
     } catch (error) {
       debugPrint('Could not install Filmot channel controls: $error');
     }
@@ -7562,18 +7564,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   ) async {
     if (!_pendingFilmotCaptures.add(dialogId)) return;
     final id = ++_nextFilmotCaptureId;
-    String? currentUrl;
+    final lookupUrl = _dialog2Urls[dialogId];
 
     try {
       final js = await _filmotScripts.load(FilmotScript.capture);
       if (!ctx.mounted) return;
-      currentUrl = await controller.currentUrl();
-      if (!_isFilmotUrl(currentUrl)) {
-        if (ctx.mounted) {
-          _showCaptureError('Capture failed', 'Open a Filmot video result and try again.');
-        }
-        return;
-      }
+      final snapshotJs = filmotLookupJavaScript(js, captureId: id);
 
       Map<String, dynamic>? summary;
       for (var attempt = 0; attempt < 4 && ctx.mounted; attempt++) {
@@ -7581,21 +7577,29 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           await Future<void>.delayed(const Duration(milliseconds: 400));
           if (!ctx.mounted) return;
         }
-        summary = decodeFilmotReply(await controller.runJavaScriptReturningResult('''
-(function(cupitorFilmotCaptureId) {
-return $js
-})($id);
-''').timeout(const Duration(seconds: 3)));
+        summary = decodeFilmotReply(await controller
+            .runJavaScriptReturningResult(snapshotJs)
+            .timeout(const Duration(seconds: 3)));
+        if (summary?['outsideFilmot'] == true) break;
         if ((summary?['cues'] as int? ?? 0) > 0) break;
       }
       if (!ctx.mounted) return;
+      if (summary?['outsideFilmot'] == true) {
+        _showCaptureError(
+          'Capture failed',
+          'The lookup is currently on a different page. Open a Filmot result '
+              'and try again.\n\nPage: ${summary?['page'] ?? 'Unavailable'}',
+        );
+        return;
+      }
       final length = summary?['length'];
       if (length is! int || length <= 0 || (summary?['cues'] as int? ?? 0) == 0) {
         final diagnostics = summary?['diagnostics'];
         _showCaptureError(
           'No timed captions found',
           'Cupitor could not find timed rows in the current Filmot result.\n\n'
-              'Page: $currentUrl\nReader: ${diagnostics ?? 'No snapshot returned'}',
+              'Lookup: ${lookupUrl ?? 'Unavailable'}\n'
+              'Reader: ${diagnostics ?? 'No snapshot returned'}',
         );
         return;
       }
@@ -7603,9 +7607,9 @@ return $js
       final transcript = StringBuffer();
       while (transcript.length < length && ctx.mounted) {
         final chunk = decodeFilmotReply(await controller
-            .runJavaScriptReturningResult(
-              'window.__cupitorReadFilmotCapture?.($id, ${transcript.length}) ?? null',
-            )
+            .runJavaScriptReturningResult(filmotLookupJavaScript(
+              'window.__cupitorReadFilmotCapture?.($id, ${transcript.length}) ?? "null"',
+            ))
             .timeout(const Duration(seconds: 3)))?['chunk'];
         if (chunk is! String || chunk.isEmpty) {
           throw StateError('The transcript changed before Cupitor could read it.');
@@ -7622,7 +7626,8 @@ return $js
       if (ctx.mounted) {
         _showCaptureError(
           'Capture failed',
-          'Could not read the Filmot result.\n\nPage: ${currentUrl ?? 'Unavailable'}\n$error',
+          'Could not read the Filmot result.\n\n'
+              'Lookup: ${lookupUrl ?? 'Unavailable'}\n$error',
         );
       }
     } finally {
@@ -8114,8 +8119,9 @@ return $js
   Future<void> _saveCurrentFilmotVideo(String dialogId, WebViewController controller) async {
     try {
       final js = await _filmotScripts.load(FilmotScript.saveVideo);
-      if (!_isFilmotUrl(await controller.currentUrl())) return;
-      final data = decodeFilmotReply(await controller.runJavaScriptReturningResult(js));
+      final data = decodeFilmotReply(await controller.runJavaScriptReturningResult(
+        filmotLookupJavaScript(js),
+      ));
       final url = data?['url']?.toString() ?? '';
       if (url.isEmpty) {
         _showDialog2SnackBar(dialogId, 'No video URL found on screen');

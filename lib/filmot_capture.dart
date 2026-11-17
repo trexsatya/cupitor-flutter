@@ -61,6 +61,26 @@ class FilmotScripts {
       source.trimLeft().startsWith('(function') && source.trimRight().endsWith('})();');
 }
 
+/// Checks the document that will actually run the script. The native URL
+/// reported by the controller can disagree with the loaded lookup page.
+String filmotLookupJavaScript(
+  String script, {
+  String setup = '',
+  int? captureId,
+}) =>
+    '''
+(function(cupitorFilmotCaptureId) {
+  const page = window.location;
+  const host = page.hostname;
+  if ((page.protocol !== 'https:' && page.protocol !== 'http:') ||
+      (host !== 'filmot.com' && !host.endsWith('.filmot.com'))) {
+    return JSON.stringify({ outsideFilmot: true, page: page.href });
+  }
+  $setup
+  return ${script.trimLeft()}
+})(${captureId ?? 'undefined'});
+''';
+
 /// Android can wrap JavaScript JSON text in a second JSON string.
 Map<String, dynamic>? decodeFilmotReply(Object? raw) {
   var value = raw;
