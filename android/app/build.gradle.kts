@@ -1,4 +1,5 @@
 import java.util.Properties
+import org.gradle.api.tasks.testing.Test
 
 plugins {
     id("com.android.application")
@@ -114,6 +115,11 @@ android {
 
 flutter {
     source = "../.."
+}
+
+tasks.withType<Test>().configureEach {
+    // Use the same Maven Central endpoint as Gradle for Robolectric's SDK downloads.
+    systemProperty("robolectric.dependency.repo.url", "https://repo.maven.apache.org/maven2")
 }
 
 dependencies {
