@@ -64,9 +64,13 @@ void onMacWindowExitedFullscreen(
   VoidCallback? onFindShortcut,
   ValueChanged<String>? onBrowserShortcut,
   ValueChanged<String>? onFilmotCapture,
+  Future<String> Function()? loadFilmotCaptureScript,
 }) {
   if (!Platform.isMacOS) return;
   _channel.setMethodCallHandler((call) async {
+    if (call.method == 'loadFilmotCaptureScript') {
+      return loadFilmotCaptureScript?.call();
+    }
     if (call.method == 'windowExitedFullscreen') onExit();
     if (call.method == 'findShortcut') onFindShortcut?.call();
     final capture = call.arguments;
