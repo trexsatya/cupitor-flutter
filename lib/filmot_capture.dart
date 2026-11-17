@@ -61,6 +61,18 @@ class FilmotScripts {
       source.trimLeft().startsWith('(function') && source.trimRight().endsWith('})();');
 }
 
+const _filmotDomains = ['filmot.com', 'filmot.org'];
+
+bool isFilmotUrl(String? url) {
+  final uri = Uri.tryParse(url ?? '');
+  if (uri == null || (uri.scheme != 'https' && uri.scheme != 'http')) {
+    return false;
+  }
+  return _filmotDomains.any(
+    (domain) => uri.host == domain || uri.host.endsWith('.$domain'),
+  );
+}
+
 /// Checks the document that will actually run the script. The native URL
 /// reported by the controller can disagree with the loaded lookup page.
 String filmotLookupJavaScript(
@@ -73,7 +85,7 @@ String filmotLookupJavaScript(
   const page = window.location;
   const host = page.hostname;
   if ((page.protocol !== 'https:' && page.protocol !== 'http:') ||
-      (host !== 'filmot.com' && !host.endsWith('.filmot.com'))) {
+      !${jsonEncode(_filmotDomains)}.some(domain => host === domain || host.endsWith('.' + domain))) {
     return JSON.stringify({ outsideFilmot: true, page: page.href });
   }
   $setup

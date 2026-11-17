@@ -75,8 +75,10 @@ class RunnerTests: XCTestCase {
   func testBrowserCaptureIsScopedToFilmot() {
     XCTAssertTrue(BrowserTab.isFilmot(URL(string: "https://filmot.com/search/word")))
     XCTAssertTrue(BrowserTab.isFilmot(URL(string: "https://beta.filmot.com/")))
+    XCTAssertTrue(BrowserTab.isFilmot(URL(string: "https://filmot.org/search/word")))
     XCTAssertFalse(BrowserTab.isFilmot(URL(string: "https://notfilmot.com/")))
     XCTAssertFalse(BrowserTab.isFilmot(URL(string: "https://filmot.com.example.org/")))
+    XCTAssertFalse(BrowserTab.isFilmot(URL(string: "https://filmot.org.example.org/")))
     XCTAssertFalse(BrowserTab.canOpen(URL(string: "file:///tmp/test.html")!))
   }
 }

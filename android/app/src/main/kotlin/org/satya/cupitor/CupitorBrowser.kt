@@ -361,7 +361,8 @@ internal class CupitorBrowser(
         fun isFilmotUrl(value: String?): Boolean {
             if (!isWebUrl(value)) return false
             val host = Uri.parse(value).host?.lowercase() ?: return false
-            return host == "filmot.com" || host.endsWith(".filmot.com")
+            return host == "filmot.com" || host.endsWith(".filmot.com") ||
+                host == "filmot.org" || host.endsWith(".filmot.org")
         }
     }
 }
