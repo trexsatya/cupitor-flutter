@@ -25,6 +25,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:speech_to_text/speech_recognition_error.dart' as stt;
 import 'speech_hub.dart';
 import 'native_recording_start.dart';
+import 'tools_timer.dart';
 import 'recording_urls.dart';
 import 'study_call_history_bridge.dart';
 import 'caption_capture.dart';
@@ -202,6 +203,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   String? _historyPageUrl;
   WebViewController? dialogController;
   late final DialogAppLifecycleBridge _dialogAppLifecycle;
+  late final _toolsTimer = ToolsTimer(onFinish: () {
+    _toolsTimerAlertPending = true;
+    _showToolsTimerAlert();
+  });
+  bool _toolsTimerAlertPending = false;
   final TextEditingController _urlController = TextEditingController(text: 'https://google.com');
   /// Owned here rather than left to the TextField, because
   /// [RawAutocomplete] needs the same node to know when to show and hide
@@ -616,6 +622,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     ProfileService.active.removeListener(_onProfileChanged);
     WidgetsBinding.instance.removeObserver(this);
     _dialogAppLifecycle.dispose();
+    _toolsTimer.dispose();
     SpeechHub.release(_speechHubListener);
     _videoNotePoller.dispose();
     HardwareKeyboard.instance.removeHandler(_onFindPageKey);
@@ -695,6 +702,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _stopNativeRecordingIfAny();
     }
     if (state == AppLifecycleState.resumed) {
+      _toolsTimer.refresh();
+      _showToolsTimerAlert();
       WakelockPlus.enable();
       if (_pendingVoiceResumeDialog) {
         _pendingVoiceResumeDialog = false;
@@ -4570,12 +4579,39 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
   }
 
+  void _showToolsTimerAlert() {
+    if (!_toolsTimerAlertPending || !mounted ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    _toolsTimerAlertPending = false;
+    if (_toolsTimer.state != ToolsTimerState.finished) return;
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Time’s up'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _showToolsDrawer() {
+    var timerOpen = false;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setModalState) => DraggableScrollableSheet(
+        builder: (ctx, setModalState) => timerOpen
+            ? ToolsTimerSheet(
+                timer: _toolsTimer,
+                onBack: () => setModalState(() => timerOpen = false),
+              )
+            : DraggableScrollableSheet(
           initialChildSize: 0.5,
           minChildSize: 0.3,
           maxChildSize: 0.9,
@@ -4606,6 +4642,20 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 child: ListView(
                   controller: scrollController,
                   children: [
+                    ListenableBuilder(
+                      listenable: _toolsTimer,
+                      builder: (_, _) => ListTile(
+                        leading: const Icon(Icons.timer_outlined),
+                        title: const Text('Timer'),
+                        trailing: switch (_toolsTimer.state) {
+                          ToolsTimerState.ready => const Icon(Icons.chevron_right),
+                          ToolsTimerState.finished => const Text('Time’s up'),
+                          ToolsTimerState.running => Text(ToolsTimer.format(_toolsTimer.remaining)),
+                          ToolsTimerState.paused => Text('${ToolsTimer.format(_toolsTimer.remaining)} · Paused'),
+                        },
+                        onTap: () => setModalState(() => timerOpen = true),
+                      ),
+                    ),
                     _toolsSubmenu('Reading & content', Icons.bookmarks_outlined, [
                       ListTile(
                         leading: const Icon(Icons.bookmarks_outlined),
