@@ -4,6 +4,15 @@ import 'package:cupitor/filmot_capture.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('recognizes both Filmot domains and rejects lookalike hosts', () {
+    expect(isFilmotUrl('https://filmot.org/search/villosp%C3%A5r/1'), isTrue);
+    expect(isFilmotUrl('https://beta.filmot.com/video/123'), isTrue);
+    expect(isFilmotUrl('https://beta.filmot.org/video/123'), isTrue);
+    expect(isFilmotUrl('https://filmot.org.example.com/'), isFalse);
+    expect(isFilmotUrl('https://notfilmot.org/'), isFalse);
+    expect(isFilmotUrl('ftp://filmot.org/'), isFalse);
+  });
+
   const capture = {
     'query': 'smälek',
     'lines': [

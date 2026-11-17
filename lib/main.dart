@@ -5608,7 +5608,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           // Auto-unmute any YouTube/HTML5 media that autoplayed muted.
           dialog2Controller.runJavaScript(_autoUnmuteYouTubeJs);
           _injectScrollDiag(dialog2Controller, 'dialog2:$dialogIdForBridge');
-          if (_isFilmotUrl(finishedUrl)) {
+          if (isFilmotUrl(finishedUrl)) {
             unawaited(_injectFilmotHelper(dialog2Controller));
           }
           if (_isWiktionaryUrl(finishedUrl)) {
@@ -5839,7 +5839,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                     ),
                   ),
                 ],
-                if (_isFilmotUrl(url)) ...[
+                if (isFilmotUrl(url)) ...[
                   IconButton(
                     tooltip: 'Capture subtitle (with context, translate, send to lookup)',
                     icon: Icon(Icons.subtitles, size: 20),
@@ -6055,12 +6055,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   // ---------- Filmot helpers ----------
-
-  bool _isFilmotUrl(String? url) {
-    final uri = Uri.tryParse(url ?? '');
-    return uri != null && (uri.scheme == 'https' || uri.scheme == 'http') &&
-        (uri.host == 'filmot.com' || uri.host.endsWith('.filmot.com'));
-  }
 
   static const _androidBrowserChannel = MethodChannel('cupitor/browser');
 
@@ -6431,7 +6425,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // Push partial results so the UI updates progressively.
       if (anyResolved) {
         for (final entry in _dialog2Controllers.entries) {
-          if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+          if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
         }
       }
     }
@@ -6471,7 +6465,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // Push updated config back to every active filmot dialog so all open
       // dialogs immediately hide rows from this channel.
       for (final entry in _dialog2Controllers.entries) {
-        if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+        if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
       }
       _showDialog2SnackBar(dialogId, 'Blacklisted: $channel');
     } else if (action == 'saveVideo') {
@@ -6522,7 +6516,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                           setState(() => _filmotBlacklistDisabled = v);
                           setStateDialog(() {});
                           for (final entry in _dialog2Controllers.entries) {
-                            if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                            if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
                           }
                         },
                       ),
@@ -6556,7 +6550,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                             _saveFilmotBlacklist();
                             setStateDialog(() {});
                             for (final entry in _dialog2Controllers.entries) {
-                              if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                              if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
                             }
                           },
                         );
@@ -6570,7 +6564,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                   _saveFilmotBlacklist();
                   setStateDialog(() {});
                   for (final entry in _dialog2Controllers.entries) {
-                    if (_isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
+                    if (isFilmotUrl(_dialog2Urls[entry.key])) _pushFilmotConfig(entry.value);
                   }
                 },
                 child: Text('Clear all'),

@@ -100,7 +100,7 @@ final class BrowserTab: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDe
 
   static func isFilmot(_ url: URL?) -> Bool {
     guard let url, canOpen(url), let host = url.host?.lowercased() else { return false }
-    return host == "filmot.com" || host.hasSuffix(".filmot.com")
+    return ["filmot.com", "filmot.org"].contains { host == $0 || host.hasSuffix("." + $0) }
   }
 
   private func buildContent() {

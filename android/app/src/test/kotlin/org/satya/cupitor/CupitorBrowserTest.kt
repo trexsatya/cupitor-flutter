@@ -14,10 +14,12 @@ class CupitorBrowserTest {
     fun captureIsAvailableOnlyOnFilmotPages() {
         assertTrue(CupitorBrowser.isFilmotUrl("https://filmot.com/search/test"))
         assertTrue(CupitorBrowser.isFilmotUrl("https://beta.filmot.com/video/123"))
+        assertTrue(CupitorBrowser.isFilmotUrl("https://filmot.org/search/test"))
         for (url in listOf(
             null,
             "https://notfilmot.com/",
             "https://filmot.com.example.org/",
+            "https://filmot.org.example.org/",
             "https://filmot.com@example.org/",
             "https://example.org/?next=https://filmot.com/",
             "https://accounts.google.com/",
