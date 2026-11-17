@@ -27,12 +27,11 @@ import android.widget.Toast
 import org.json.JSONException
 import org.json.JSONObject
 import org.json.JSONTokener
-import java.io.IOException
 
 /** A native browser surface with its own chrome and no page-to-app JS bridge. */
 internal class CupitorBrowser(
     private val activity: Activity,
-    private val captureScript: () -> String,
+    private val loadCaptureScript: ((String?) -> Unit) -> Unit,
     private val onCapture: (String) -> Unit,
 ) {
     private class Tab(val view: WebView) {
@@ -44,6 +43,7 @@ internal class CupitorBrowser(
     private val tabs = mutableListOf<Tab>()
     private var active: Tab? = null
     private var capturing: Tab? = null
+    private var captureRequest = 0
     private val dialog = object : Dialog(activity, android.R.style.Theme_Material_Light_NoActionBar) {
         @Deprecated("Handles the browser's history before returning to the study surface")
         override fun onBackPressed() {
@@ -299,30 +299,44 @@ internal class CupitorBrowser(
         val url = tab.committedUrl
         if (!tab.loaded || !isFilmotUrl(url) || tab.view.url != url || capturing != null) return
         val navigation = tab.navigation
-        val script = try {
-            captureScript()
-        } catch (_: IOException) {
-            toast("The Filmot capture script could not be loaded.")
-            return
-        }
         capturing = tab
+        val request = ++captureRequest
         updateChrome()
-        tab.view.evaluateJavascript(script) { encoded ->
-            if (capturing !== tab) return@evaluateJavascript
+
+        fun isCurrent() = request == captureRequest && capturing === tab &&
+            active === tab && dialog.isShowing && tab.loaded &&
+            tab.navigation == navigation && tab.committedUrl == url && tab.view.url == url
+
+        fun finish() {
+            if (request != captureRequest || capturing !== tab) return
             capturing = null
             updateChrome()
-            if (active !== tab || !dialog.isShowing || !tab.loaded ||
-                tab.navigation != navigation || tab.committedUrl != url || tab.view.url != url
-            ) return@evaluateJavascript
-            val payload = try {
-                (JSONTokener(encoded ?: "null").nextValue() as? String)?.let(::JSONObject)
-            } catch (_: JSONException) { null }
-            if (payload == null || (payload.optJSONArray("lines")?.length() ?: 0) == 0) {
-                toast("No Filmot subtitles yet. Open a video with captions and try again.")
-                return@evaluateJavascript
+        }
+
+        loadCaptureScript loaded@{ script ->
+            if (!isCurrent()) {
+                finish()
+                return@loaded
             }
-            hideForStudy()
-            onCapture(payload.toString())
+            if (script == null) {
+                finish()
+                toast("Could not load the Filmot subtitle reader from Cupitor.")
+                return@loaded
+            }
+            tab.view.evaluateJavascript(script) { encoded ->
+                val current = isCurrent()
+                finish()
+                if (!current) return@evaluateJavascript
+                val payload = try {
+                    (JSONTokener(encoded ?: "null").nextValue() as? String)?.let(::JSONObject)
+                } catch (_: JSONException) { null }
+                if (payload == null || (payload.optJSONArray("lines")?.length() ?: 0) == 0) {
+                    toast("No timed captions found in this Filmot result.")
+                    return@evaluateJavascript
+                }
+                hideForStudy()
+                onCapture(payload.toString())
+            }
         }
     }
 

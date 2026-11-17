@@ -11,10 +11,17 @@ void main() {
     ],
   };
 
-  test('reads the dialog bridge payload and both native JS return formats', () {
+  test('reads decoded payloads and both native JS return formats', () {
     expect(decodeFilmotCapture(capture), capture);
     expect(decodeFilmotCapture(jsonEncode(capture)), capture);
     expect(decodeFilmotCapture(jsonEncode(jsonEncode(capture))), capture);
+  });
+
+  test('reads a WebView snapshot chunk with exact Unicode text', () {
+    const chunk = {'chunk': 'svenska 💬'};
+    expect(decodeFilmotReply(jsonEncode(chunk)), chunk);
+    expect(decodeFilmotReply(jsonEncode(jsonEncode(chunk))), chunk);
+    expect(decodeFilmotReply(false), isNull);
   });
 
   test('handles null, malformed, and incomplete replies without casting', () {
