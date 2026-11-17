@@ -251,6 +251,13 @@ void main() {
       final f = captureTranslationFields([{'start': 0, 'end': 1}], ['x']);
       expect((f['translation'] as List).single['index'], 0);
     });
+    test('preserves the selected translation language and cue timing', () {
+      final f = captureTranslationFields(lines, ['पीना'], targetLang: 'hi');
+      expect(f['targetLang'], 'hi');
+      expect(f['translation'], [
+        {'index': 5, 'start': 1.0, 'end': 2.0, 'text': 'पीना'},
+      ]);
+    });
   });
 
   group('parseKnownVideosAnswer', () {
