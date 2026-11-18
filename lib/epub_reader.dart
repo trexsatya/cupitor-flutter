@@ -419,6 +419,7 @@ class EpubBook {
     final name = File(filePath).uri.pathSegments.last;
     return EpubBook(
       title: name.substring(0, name.lastIndexOf('.')),
+      author: null,
       chapters: chapters,
       toc: [
         for (var i = 0; i < chapters.length; i++)
