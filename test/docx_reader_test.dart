@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
@@ -122,18 +123,61 @@ void main() {
   );
 
   test(
-    'device picker offers both formats and keeps original DOCX bytes',
+    'device picker offers all book formats and keeps original DOCX bytes',
     () async {
       final picker = _Picker(
         PlatformFile(name: 'Picked.docx', size: bytes.length, bytes: bytes),
       );
       FilePicker.platform = picker;
       final file = await pickEpubFromDevice();
-      expect(picker.extensions, containsAll(['epub', 'docx']));
+      expect(picker.extensions, ['epub', 'docx', 'txt', 'rtf', 'pdf']);
       expect(file!.path, endsWith('.docx'));
       expect(await file.readAsBytes(), bytes);
     },
   );
+
+  test('imports TXT as escaped, searchable book chapters', () async {
+    final text = Uint8List.fromList(
+      utf8.encode('Försåt <script>\n\nUppsåt & avsikt'),
+    );
+    final file = await cacheEpubFromBytes(text, suggestedName: 'Notes.TXT');
+    final book = await EpubBook.openFile(file);
+    expect(book.title, 'Notes');
+    expect(book.key, sha1.convert(text).toString());
+    expect(
+      book.chapters.single.html,
+      '<p>Försåt &lt;script&gt;</p><p>Uppsåt &amp; avsikt</p>',
+    );
+    final library = await EpubLibrary.load();
+    await library.touch(
+      EpubLibraryEntry(key: book.key, path: file.path, title: book.title),
+    );
+    final hits = await collectAllHits('uppsåt');
+    expect(hits.single.bookKey, book.key);
+  });
+
+  test(
+    'detects RTF without an extension and decodes Swedish and Hindi',
+    () async {
+      final rtf = Uint8List.fromList(
+        latin1.encode(
+          r"{\rtf1\ansi{\fonttbl{\f0 Arial;}}F\'f6rs\u229?t\par \u2361?\u2367?}",
+        ),
+      );
+      final file = await cacheEpubFromBytes(rtf, suggestedName: 'download');
+      final book = await EpubBook.openFile(file);
+      expect(file.path, endsWith('/download.rtf'));
+      expect(book.chapters.single.html, '<p>Försåt<br/>हि</p>');
+      expect(await file.readAsBytes(), rtf);
+    },
+  );
+
+  test('PDF header takes precedence over the download name', () async {
+    final pdf = Uint8List.fromList(ascii.encode('%PDF-1.7'));
+    final file = await cacheEpubFromBytes(pdf, suggestedName: 'download.txt');
+    expect(file.path, endsWith('/download.pdf'));
+    expect(await file.readAsBytes(), pdf);
+  });
 
   test('global library search includes DOCX chapters', () async {
     final file = await cacheEpubFromBytes(bytes, suggestedName: 'Search.docx');
