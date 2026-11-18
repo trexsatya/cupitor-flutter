@@ -38,6 +38,38 @@ class RunnerTests: XCTestCase {
       ["window.FlutterChannel = true", "window.newAgent = true"])
   }
 
+  func testWordMapsBridgeIsInstalledBeforeTheStudyPageLoads() throws {
+    let study = WKWebView()
+    let browser = WKWebView()
+    let page = try XCTUnwrap(URL(string: "https://trexsatya.github.io/language.html"))
+    WordMapsFileBridge.install(on: study, page: page)
+
+    let scripts = study.configuration.userContentController.userScripts
+    XCTAssertEqual(scripts.count, 1)
+    let bridge = try XCTUnwrap(scripts.first)
+    XCTAssertTrue(bridge.source.contains("window.WordMapsHost"))
+    XCTAssertEqual(bridge.injectionTime, .atDocumentStart)
+    XCTAssertTrue(bridge.isForMainFrameOnly)
+    XCTAssertTrue(browser.configuration.userContentController.userScripts.isEmpty)
+  }
+
+  func testWordMapImportReadsUTF8WithOrWithoutBOMAndChecksSize() throws {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID()).json")
+    defer { try? FileManager.default.removeItem(at: file) }
+    let json = #"{"name":"Försåt — मंशा","nodes":[],"edges":[]}"#
+    try Data(json.utf8).write(to: file)
+    XCTAssertEqual(try WordMapsFileBridge.readMap(at: file), json)
+    try Data(("\u{FEFF}" + json).utf8).write(to: file)
+    XCTAssertEqual(try WordMapsFileBridge.readMap(at: file), json)
+
+    try Data([0xFF]).write(to: file)
+    XCTAssertThrowsError(try WordMapsFileBridge.readMap(at: file))
+    try Data(repeating: 0x20, count: 2_000_001).write(to: file)
+    XCTAssertThrowsError(try WordMapsFileBridge.readMap(at: file)) { error in
+      XCTAssertEqual((error as? CocoaError)?.code, .fileReadTooLarge)
+    }
+  }
+
   func testBrowserPopupKeepsTheOpenerAndItsDataStore() {
     let browser = BrowserWindows()
     let configuration = WKWebViewConfiguration()

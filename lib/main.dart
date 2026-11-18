@@ -8587,7 +8587,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       // been replaced (page reclaim): its late events must not touch the new one.
       late final WebViewController ctrl;
       ctrl = dialogController = WebViewController()
-        ..configureForMac()
+        ..configureForMac(wordMapsPage: _dialogUrl)
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setUserAgent(_userAgent)
         ..addJavaScriptChannel('GitHubProxy', onMessageReceived: _handleGitHubProxyRequest)

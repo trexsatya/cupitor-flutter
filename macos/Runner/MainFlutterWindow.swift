@@ -1,5 +1,6 @@
 import Cocoa
 import FlutterMacOS
+import UniformTypeIdentifiers
 import WebKit
 import webview_flutter_wkwebview
 
@@ -116,6 +117,10 @@ class MainFlutterWindow: NSWindow {
         webView.configuration.preferences.isElementFullscreenEnabled = true
       }
       JSPanelUIDelegate.install(on: webView)
+      if let address = arguments["wordMapsPage"] as? String,
+        let page = URL(string: address) {
+        WordMapsFileBridge.install(on: webView, page: page)
+      }
       self?.frameScripts.configure(webView)
       self?.adBlocker.configure(webView) { error in
         if let error = error {
@@ -389,6 +394,111 @@ final class FrameScriptInstaller {
     }
     content.addUserScript(WKUserScript(source: script,
       injectionTime: .atDocumentStart, forMainFrameOnly: false))
+  }
+}
+
+/// Adapts the study page's existing WordMapsHost bridge to macOS file panels.
+@MainActor
+final class WordMapsFileBridge: NSObject, WKScriptMessageHandlerWithReply {
+  private static let channel = "WordMapsHost"
+  private static let maxImportBytes = 2_000_000
+  private let page: URL
+
+  private init(page: URL) {
+    self.page = page
+  }
+
+  static func install(on webView: WKWebView, page: URL) {
+    let content = webView.configuration.userContentController
+    content.addScriptMessageHandler(Self(page: page), contentWorld: .page, name: channel)
+    // The reply stays in the originating document even if the study view navigates.
+    content.addUserScript(WKUserScript(source: #"""
+      window.WordMapsHost = {
+        async postMessage(message) {
+          const { id, type } = JSON.parse(message);
+          try {
+            const text = await window.webkit.messageHandlers.WordMapsHost.postMessage(message);
+            window.wordMapsHostReply?.(id, text);
+          } catch (error) {
+            window.wordMapsHostReply?.(id, null);
+            window.alert(`Could not ${type} the word map. ${error.message}`);
+          }
+        },
+      };
+      """#, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+  }
+
+  func userContentController(
+    _ userContentController: WKUserContentController,
+    didReceive message: WKScriptMessage,
+    replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void
+  ) {
+    guard message.frameInfo.isMainFrame, let source = message.frameInfo.request.url,
+      source.scheme == page.scheme, source.host == page.host, source.port == page.port,
+      source.path == page.path, let window = message.webView?.window else {
+      replyHandler(nil, "The Word Maps page must be open.")
+      return
+    }
+    guard window.attachedSheet == nil else {
+      replyHandler(NSNull(), nil)
+      return
+    }
+    guard let body = message.body as? String,
+      let request = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any],
+      let action = request["type"] as? String else {
+      replyHandler(nil, "Invalid word map request.")
+      return
+    }
+
+    let panel: NSSavePanel
+    let exportData: Data?
+    switch action {
+    case "import":
+      panel = NSOpenPanel()
+      panel.title = "Import Word Map"
+      exportData = nil
+    case "export":
+      guard let name = request["name"] as? String, let text = request["text"] as? String else {
+        replyHandler(nil, "The word map filename or content is missing.")
+        return
+      }
+      panel = NSSavePanel()
+      panel.title = "Export Word Map"
+      panel.nameFieldStringValue = URL(fileURLWithPath: name).lastPathComponent
+      exportData = Data(text.utf8)
+    default:
+      replyHandler(nil, "Invalid word map action.")
+      return
+    }
+    panel.allowedContentTypes = [.json]
+    panel.beginSheetModal(for: window) { result in
+      guard result == .OK, let url = panel.url else {
+        replyHandler(NSNull(), nil)
+        return
+      }
+      do {
+        if let exportData = exportData {
+          try exportData.write(to: url)
+          replyHandler(NSNull(), nil)
+        } else {
+          replyHandler(try Self.readMap(at: url), nil)
+        }
+      } catch {
+        replyHandler(nil, error.localizedDescription)
+      }
+    }
+  }
+
+  static func readMap(at url: URL) throws -> String {
+    let file = try FileHandle(forReadingFrom: url)
+    defer { try? file.close() }
+    let data = try file.read(upToCount: maxImportBytes + 1) ?? Data()
+    guard data.count <= maxImportBytes else { throw CocoaError(.fileReadTooLarge) }
+    guard var text = String(data: data, encoding: .utf8) else {
+      throw CocoaError(.fileReadInapplicableStringEncoding)
+    }
+    if text.unicodeScalars.first?.value == 0xFEFF { text.unicodeScalars.removeFirst() }
+    return text
   }
 }
 
