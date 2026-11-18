@@ -1,4 +1,4 @@
-// EPUB and DOCX reader for Cupitor.
+// Book reader for Cupitor.
 //
 // Why this file exists separately from main.dart: main.dart is already huge
 // and the reader is a self-contained feature with its own parser, model, and
@@ -26,6 +26,7 @@ import 'package:flutter/services.dart' show Clipboard, ClipboardData, MethodChan
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:pdfrx/pdfrx.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
@@ -51,6 +52,7 @@ import 'mac_webview.dart';
 import 'page_cursor.dart';
 import 'reader_selection_menu.dart';
 import 'epub_reference.dart';
+import 'reader_text_document.dart';
 import 'epub_speech.dart';
 
 // WebKit on macOS does not register cupitor-epub:// as a loadable URL
@@ -376,13 +378,82 @@ class EpubBook {
     final bytes = await file.readAsBytes();
     final key = sha1.convert(bytes).toString();
     final path = file.path;
+    if (readerBookExtension(path) == 'pdf') {
+      return _readPdf(bytes, key, path);
+    }
     // ZipDecoder and XML/HTML rewriting are CPU-intensive and previously ran
     // synchronously on the Flutter UI isolate despite _parse being async.
     // Large books could freeze the Mac window before the reader appeared.
     return Isolate.run(() => _parse(bytes, key, path));
   }
 
+  static Future<EpubBook> _readPdf(
+      Uint8List bytes, String key, String filePath) async {
+    final document = await PdfDocument.openData(bytes, sourceName: filePath);
+    try {
+      final chapters = <EpubChapter>[];
+      for (final page in document.pages) {
+        final text = (await page.loadText()).fullText;
+        if (text.trim().isEmpty) continue;
+        final number = page.pageNumber;
+        chapters.add(EpubChapter(
+          id: 'pdf-$number',
+          href: 'pdf-$number.xhtml',
+          title: 'Page $number',
+          html: readerTextHtml(text),
+        ));
+      }
+      if (chapters.isEmpty) {
+        throw const FormatException(
+          'This PDF has no selectable text. Run OCR before opening it here.',
+        );
+      }
+      return _textBook(chapters, key, filePath);
+    } finally {
+      await document.dispose();
+    }
+  }
+
+  static EpubBook _textBook(
+      List<EpubChapter> chapters, String key, String filePath) {
+    final name = File(filePath).uri.pathSegments.last;
+    return EpubBook(
+      title: name.substring(0, name.lastIndexOf('.')),
+      author: null,
+      chapters: chapters,
+      toc: [
+        for (var i = 0; i < chapters.length; i++)
+          EpubTocEntry(title: chapters[i].title, chapterIdx: i),
+      ],
+      resources: const {},
+      cssText: 'p { tab-size: 4; white-space: pre-wrap; overflow-wrap: anywhere; }',
+      basePathInZip: '',
+      key: key,
+      filePath: filePath,
+    );
+  }
+
   static Future<EpubBook> _parse(Uint8List bytes, String key, String filePath) async {
+    final extension = readerBookExtension(filePath);
+    if (extension == 'txt' || extension == 'rtf') {
+      final text = extension == 'rtf'
+          ? decodeReaderRtf(bytes)
+          : decodeReaderText(bytes);
+      if (text.trim().isEmpty) {
+        throw const FormatException('This document has no readable text');
+      }
+      final chapters = <EpubChapter>[];
+      for (final section in readerTextSections(text.trim())) {
+        final number = chapters.length + 1;
+        chapters.add(EpubChapter(
+          id: '$extension-$number',
+          href: '$extension-$number.xhtml',
+          title: 'Section $number',
+          html: readerTextHtml(section),
+        ));
+      }
+      return _textBook(chapters, key, filePath);
+    }
     final archive = ZipDecoder().decodeBytes(bytes);
     final files = <String, ArchiveFile>{};
     for (final f in archive) {
@@ -824,10 +895,33 @@ Future<Directory> _epubCacheDir() async {
   return dir;
 }
 
-Future<File> cacheEpubFromBytes(Uint8List bytes, {String? suggestedName}) async {
+Future<File> cacheEpubFromBytes(
+  Uint8List bytes, {
+  String? suggestedName,
+  String? contentType,
+}) async {
   final hash = sha1.convert(bytes).toString();
-  final extension = DocxDocument.isDocx(ZipDecoder().decodeBytes(bytes))
-      ? '.docx' : '.epub';
+  final namedExtension = readerBookExtension(suggestedName ?? '');
+  final header = latin1.decode(bytes.take(1024).toList());
+  final mime = contentType?.split(';').first.trim().toLowerCase();
+  final String extension;
+  if (header.startsWith('%PDF-') ||
+      mime == 'application/pdf' ||
+      namedExtension == 'pdf') {
+    extension = '.pdf';
+  } else if (hasReaderRtfHeader(header) ||
+      mime == 'application/rtf' ||
+      mime == 'text/rtf' ||
+      namedExtension == 'rtf') {
+    extension = '.rtf';
+  } else if (namedExtension == 'txt' ||
+      (namedExtension == null && mime == 'text/plain')) {
+    extension = '.txt';
+  } else {
+    extension = DocxDocument.isDocx(ZipDecoder().decodeBytes(bytes))
+        ? '.docx'
+        : '.epub';
+  }
   final name = (suggestedName == null || suggestedName.isEmpty)
       ? '$hash$extension'
       : _safeFileName(suggestedName, extension);
@@ -853,19 +947,22 @@ String _safeFileName(String name, String extension) {
   // Strip directory separators and anything weird. Keep the extension if
   // it matches the actual package contents, otherwise replace/append it.
   var n = name.replaceAll(RegExp(r'[\\/]+'), '_').replaceAll(RegExp(r'[^A-Za-z0-9._\- ]'), '_');
-  n = n.replaceFirst(RegExp(r'\.(epub|docx)$', caseSensitive: false), '');
+  final oldExtension = readerBookExtension(n);
+  if (oldExtension != null) {
+    n = n.substring(0, n.length - oldExtension.length - 1);
+  }
   n = '$n$extension';
   if (n.length > 80) n = n.substring(n.length - 80);
   return n;
 }
 
 /// Public sourcing helpers — called from main.dart's Tools sheet entries
-/// and from the .epub/.docx URL interceptor.
+/// and from the book URL interceptor.
 
 Future<File?> pickEpubFromDevice() async {
   final res = await FilePicker.platform.pickFiles(
     type: FileType.custom,
-    allowedExtensions: ['epub', 'docx'],
+    allowedExtensions: readerBookExtensions,
     withData: true,
   );
   if (res == null || res.files.isEmpty) return null;
@@ -878,29 +975,33 @@ Future<File?> pickEpubFromDevice() async {
 Future<File?> downloadEpubFromUrl(String url, {void Function(double)? onProgress}) async {
   final uri = Uri.tryParse(url);
   if (uri == null) throw FormatException('Bad URL: $url');
-  final req = http.Request('GET', uri);
-  final res = await http.Client().send(req);
-  if (res.statusCode >= 400) {
-    throw HttpException('HTTP ${res.statusCode}', uri: uri);
+  final client = http.Client();
+  try {
+    final res = await client.send(http.Request('GET', uri));
+    if (res.statusCode >= 400) {
+      throw HttpException('HTTP ${res.statusCode}', uri: uri);
+    }
+    final total = res.contentLength ?? 0;
+    final builder = BytesBuilder(copy: false);
+    var got = 0;
+    await for (final chunk in res.stream) {
+      builder.add(chunk);
+      got += chunk.length;
+      if (total > 0) onProgress?.call(got / total);
+    }
+    return await cacheEpubFromBytes(
+      builder.toBytes(),
+      suggestedName: uri.pathSegments.lastOrNull,
+      contentType: res.headers['content-type'],
+    );
+  } finally {
+    client.close();
   }
-  final total = res.contentLength ?? 0;
-  final builder = BytesBuilder(copy: false);
-  var got = 0;
-  await for (final chunk in res.stream) {
-    builder.add(chunk);
-    got += chunk.length;
-    if (total > 0) onProgress?.call(got / total);
-  }
-  final bytes = builder.toBytes();
-  // Suggested name from last path segment.
-  final segs = uri.pathSegments;
-  final name = segs.isNotEmpty ? Uri.decodeComponent(segs.last) : 'remote.epub';
-  return cacheEpubFromBytes(bytes, suggestedName: name);
 }
 
 // ─── Public entry point: opens the reader screen ─────────────────────────
 
-/// Open an EPUB or DOCX in the reader. The caller supplies an `onLookup` callback that
+/// Open a book in the reader. The caller supplies an `onLookup` callback that
 /// receives a tapped/selected word plus a short surrounding context — the
 /// host wires this into its existing dictionary-lookup flow (typically
 /// opening dialog1).

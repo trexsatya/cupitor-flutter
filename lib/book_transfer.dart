@@ -11,8 +11,9 @@ import 'package:sqflite/sqflite.dart';
 import 'db.dart';
 import 'epub_reader.dart' show EpubLibrary, EpubLibraryEntry;
 import 'media_store.dart';
+import 'reader_text_document.dart';
 
-/// Bundle an EPUB or DOCX with everything Cupitor knows about it — the book
+/// Bundle a book with everything Cupitor knows about it — the book
 /// file, reading state, every profile's tags/sentences/media rows,
 /// playlists — into a portable `.cupitor.zip`. The other side
 /// ([BookImporter]) restores it into a fresh install or a different
@@ -20,7 +21,7 @@ import 'media_store.dart';
 /// per-profile split.
 ///
 /// Layout of the zip:
-///   book.epub / book.docx # untouched bytes of the original file
+///   book.<extension> # untouched bytes of the original file
 ///   manifest.json        # everything else, versioned
 ///   media/[sha1].[ext]   # every referenced local media attachment
 class BookExporter {
@@ -46,8 +47,8 @@ class BookExporter {
 
     // 1. Book file itself. Zipped as-is — no re-parse.
     final epubBytes = await epubFile.readAsBytes();
-    final bookName = epubFile.path.toLowerCase().endsWith('.docx')
-        ? 'book.docx' : 'book.epub';
+    final extension = readerBookExtension(epubFile.path) ?? 'epub';
+    final bookName = 'book.$extension';
     archive.addFile(ArchiveFile(bookName, epubBytes.length, epubBytes));
 
     // 2. Prefs (reading state + mask locale).
@@ -277,11 +278,14 @@ class BookImporter {
       );
     }
 
-    // 2. Book file — extract to app_docs/imported_epubs/<sha>.<epub|docx>.
+    // 2. Book file — extract to app_docs/imported_epubs/<sha>.<extension>.
     //    Recompute the SHA so we don't trust the exporter's claim.
-    final bookFile = archive.findFile('book.epub') ?? archive.findFile('book.docx');
+    final bookFile = readerBookExtensions
+        .map((extension) => archive.findFile('book.$extension'))
+        .whereType<ArchiveFile>()
+        .firstOrNull;
     if (bookFile == null) {
-      throw const FormatException('book.epub or book.docx missing from bundle');
+      throw const FormatException('Book file missing from bundle');
     }
     final bookBytes = Uint8List.fromList(bookFile.content as List<int>);
     final freshKey = sha1.convert(bookBytes).toString();
@@ -309,7 +313,7 @@ class BookImporter {
     if (!await booksDir.exists()) {
       await booksDir.create(recursive: true);
     }
-    final extension = bookFile.name.endsWith('.docx') ? 'docx' : 'epub';
+    final extension = readerBookExtension(bookFile.name)!;
     final epubDest = File('${booksDir.path}/$freshKey.$extension');
     await epubDest.writeAsBytes(bookBytes, flush: true);
 
@@ -527,7 +531,7 @@ class BookImporter {
         await db.addPlaylistItem(
           playlistId: playlistId,
           sentenceText: (it['sentence_text'] as String?) ?? '',
-          // Retarget to the freshly-imported book so "Open EPUB" from
+          // Retarget to the freshly-imported book so "Open Book" from
           // the language app resolves via this device's library.
           bookKey: freshKey,
           bookTitle: bookMeta['title'] as String?,

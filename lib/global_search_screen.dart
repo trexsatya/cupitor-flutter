@@ -198,7 +198,7 @@ class _GlobalSearchScreenState extends State<GlobalSearchScreen> {
           _running || _query.text.trim().isEmpty
               ? _running
                   ? 'Scanning your library…'
-                  : 'Type a phrase to search all EPUB and DOCX books. Use `|` for OR:\n'
+                  : 'Type a phrase to search your book library. Use `|` for OR:\n'
                       '  cat|dog\n  apple pie|orange juice'
               : 'No matches in the library.',
           textAlign: TextAlign.center,
