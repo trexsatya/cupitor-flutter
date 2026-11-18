@@ -20,7 +20,7 @@ Future<void> installMacFrameScript(String script) async {
 /// right after creating it (`WebViewController()..configureForMac()`); a no-op
 /// on other platforms.
 extension MacWebView on WebViewController {
-  void configureForMac({bool browserShortcuts = false}) {
+  void configureForMac({bool browserShortcuts = false, String? wordMapsPage}) {
     if (!Platform.isMacOS) return;
     final platform = this.platform;
     if (platform is! WebKitWebViewController) return;
@@ -28,6 +28,7 @@ extension MacWebView on WebViewController {
         .invokeMethod<bool>('configureWebView', {
           'id': platform.webViewIdentifier,
           'browserShortcuts': browserShortcuts,
+          if (wordMapsPage != null) 'wordMapsPage': wordMapsPage,
         })
         .then((ok) {
           if (ok != true) debugPrint('configureMacWebView: WebView not found');
