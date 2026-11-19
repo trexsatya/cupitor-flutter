@@ -1,6 +1,8 @@
 package org.satya.cupitor
 
+import android.app.Activity
 import android.app.AlarmManager
+import android.app.AlertDialog
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -11,6 +13,7 @@ import android.net.Uri
 import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
+import java.lang.ref.WeakReference
 import java.util.Calendar
 import java.util.Locale
 
@@ -23,6 +26,37 @@ object PracticeReminders {
     private val timePattern = Regex("([01][0-9]|2[0-3]):[0-5][0-9]")
     private val goalId = Regex("[a-f0-9-]{36}")
     private val datePattern = Regex("[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+    // The receiver and the activity lifecycle callbacks run on the main thread.
+    private var foregroundHost: WeakReference<Activity>? = null
+    private var foregroundDialog: AlertDialog? = null
+
+    fun attachForegroundHost(activity: Activity) {
+        foregroundHost = WeakReference(activity)
+    }
+
+    fun detachForegroundHost(activity: Activity) {
+        if (foregroundHost?.get() !== activity) return
+        foregroundHost = null
+        foregroundDialog?.dismiss()
+        foregroundDialog = null
+    }
+
+    internal fun showForegroundReminder(message: String, onOpen: () -> Unit) {
+        val activity = foregroundHost?.get() ?: return
+        if (activity.isFinishing || activity.isDestroyed || foregroundDialog?.isShowing == true) return
+        val dialog = AlertDialog.Builder(activity)
+            .setTitle("Practice Log")
+            .setMessage(message)
+            .setNegativeButton("Dismiss", null)
+            .setPositiveButton("Update progress") { _, _ -> onOpen() }
+            .create()
+        foregroundDialog = dialog
+        dialog.setOnDismissListener {
+            if (foregroundDialog === dialog) foregroundDialog = null
+        }
+        dialog.show()
+    }
 
     private fun store(context: Context) =
         context.getSharedPreferences("practice_log_reminders", Context.MODE_PRIVATE)
@@ -128,8 +162,7 @@ object PracticeReminders {
         val scheduled = Calendar.getInstance().apply { timeInMillis = timestamp }
         arm(context, key, config)
         val today = localDate(now)
-        if (timestamp <= 0 || timestamp > now.timeInMillis || localDate(scheduled) != today ||
-            StudyCalls.permission(context) != "granted") return
+        if (timestamp <= 0 || timestamp > now.timeInMillis || localDate(scheduled) != today) return
 
         val goals = config.getJSONArray("goals")
         val due = (0 until goals.length()).map(goals::getJSONObject)
@@ -139,9 +172,18 @@ object PracticeReminders {
         val goal = due.singleOrNull()
         val target = JSONObject().put("profile_id", profile.toInt())
             .put("id", "$TARGET_PREFIX$language:${goal?.getString("id").orEmpty()}")
-        val tap = PendingIntent.getActivity(context, 0, StudyCallHistory.intent(context, target),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val openIntent = StudyCallHistory.intent(context, target)
         val notifications = requireNotNull(context.getSystemService(NotificationManager::class.java))
+        val message = if (goal != null) "Time to update ${goal.getString("title")}."
+            else "Time to update ${due.size} practice goals."
+        showForegroundReminder(message) {
+            notifications.cancel(key, 1)
+            context.startActivity(openIntent)
+        }
+        if (StudyCalls.permission(context) != "granted") return
+
+        val tap = PendingIntent.getActivity(context, 0, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val builder = if (Build.VERSION.SDK_INT >= 26) {
             notifications.createNotificationChannel(NotificationChannel(
                 CHANNEL, "Practice Log reminders", NotificationManager.IMPORTANCE_DEFAULT,
@@ -150,8 +192,6 @@ object PracticeReminders {
         } else {
             Notification.Builder(context).setDefaults(Notification.DEFAULT_ALL)
         }
-        val message = if (goal != null) "Time to update ${goal.getString("title")}."
-            else "Time to update ${due.size} practice goals."
         notifications.notify(key, 1, builder
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("Practice Log").setContentText(message)

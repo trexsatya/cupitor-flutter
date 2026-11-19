@@ -1195,10 +1195,12 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
+        PracticeReminders.attachForegroundHost(this)
         cupitorBrowser?.resume()
     }
 
     override fun onPause() {
+        PracticeReminders.detachForegroundHost(this)
         cupitorBrowser?.pause()
         super.onPause()
     }
