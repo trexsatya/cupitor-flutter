@@ -1,4 +1,5 @@
 import java.util.Properties
+import org.gradle.api.tasks.Sync
 import org.gradle.api.tasks.testing.Test
 
 plugins {
@@ -117,9 +118,27 @@ flutter {
     source = "../.."
 }
 
+// These SDKs cover the @Config declarations in the Android unit tests.
+val robolectricSdkVersions = listOf(
+    "7.0.0_r1-robolectric-r1-i7", // API 24
+    "14-robolectric-10818077-i7", // API 34
+    "15-robolectric-12650502-i7", // API 35
+)
+val robolectricSdkDirectory = layout.buildDirectory.dir("robolectric-sdks")
+val prepareRobolectricSdks by tasks.registering(Sync::class) {
+    // Resolve each version separately so Gradle keeps all three jars.
+    for (version in robolectricSdkVersions) {
+        val sdk = configurations.detachedConfiguration(
+            dependencies.create("org.robolectric:android-all-instrumented:$version")
+        ).apply { isTransitive = false }
+        from(sdk)
+    }
+    into(robolectricSdkDirectory)
+}
+
 tasks.withType<Test>().configureEach {
-    // Use the same Maven Central endpoint as Gradle for Robolectric's SDK downloads.
-    systemProperty("robolectric.dependency.repo.url", "https://repo.maven.apache.org/maven2")
+    dependsOn(prepareRobolectricSdks)
+    systemProperty("robolectric.dependency.dir", robolectricSdkDirectory.get().asFile.absolutePath)
 }
 
 dependencies {
