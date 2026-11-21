@@ -11777,8 +11777,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           ),
           IconButton(
             icon: const Icon(Icons.menu_book_outlined),
-            tooltip: 'Open Book',
-            onPressed: _showEpubSourcePicker,
+            tooltip: 'Book Library',
+            onPressed: _showEpubLibrary,
           ),
           IconButton(
             icon: const Icon(Icons.tune_outlined),
@@ -11812,8 +11812,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             ),
             MenuItemButton(
               leadingIcon: const Icon(Icons.menu_book_outlined),
-              onPressed: _showEpubSourcePicker,
-              child: const Text('Open Book'),
+              onPressed: _showEpubLibrary,
+              child: const Text('Book Library'),
             ),
             SubmenuButton(
               leadingIcon: const Icon(Icons.web),
