@@ -87,6 +87,7 @@ import 'tag_capture.dart';
 import 'tag_filter.dart';
 import 'tag_settings.dart';
 import 'text_transform.dart';
+import 'language_catalog.dart';
 
 /// WorkManager entry point (Android periodic safety net, spec §Delivery:
 /// re-arms the window and sweeps missed fires ~every 30 min even if alarms
@@ -227,8 +228,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// suggestion doesn't then also load the field text on top of it.
   bool _urlSuggestionPicked = false;
   String _dialogUrl = 'https://trexsatya.github.io/language.html';
-  final List<String> _languages = ['sv', 'es'];
-  final Map<String, String> _languageParams = {'sv': 'swedish', 'es': 'spanish'};
+  CupitorLanguageCatalog? _languageCatalog;
+  String _studyLanguageName = 'swedish';
   String _selectedLanguage = 'sv';
   static const _familiarLanguagePref = 'familiarLanguage';
   String? _familiarLanguage;
@@ -272,7 +273,9 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   String _translationLanguageName(String code) => _titleCase(
-      code == 'hi' ? 'Hindi' : code == 'en' ? 'English' : _languageParams[code] ?? code);
+      _languageCatalog?.find(code)?.label ??
+      (code == 'hi' ? 'Hindi' : code == 'en' ? 'English' :
+      code == _selectedLanguage ? _studyLanguageName : code));
 
   bool _isControllerReady = false;
   List<String> _bookmarks = [];
@@ -3928,9 +3931,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       );
       return;
     }
-    // _languageParams maps language codes ('sv') to friendly names
-    // ('swedish'); title-case them since they're going into a sentence.
-    final study = _titleCase(_languageParams[_selectedLanguage] ?? _selectedLanguage);
+    final study = _translationLanguageName(_selectedLanguage);
     final familiar = await _nativeTranslationTarget(_selectedLanguage);
     final src = toEnglish ? study : 'English';
     final tgt = !toEnglish && familiar == 'en'
@@ -4648,26 +4649,19 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 child: ListView(
                   controller: scrollController,
                   children: [
-                    ListTile(
-                      leading: const Icon(Icons.language),
-                      title: const Text('Language'),
-                      trailing: DropdownButton<String>(
-                        value: _selectedLanguage,
-                        items: _languages
-                            .map((l) => DropdownMenuItem(value: l, child: Text(l)))
-                            .toList(),
-                        onChanged: (val) {
-                          setState(() {
-                            _selectedLanguage = val!;
-                            if (dialogController != null) {
-                              _loadDialog1Page(
-                                  Uri.parse(getUrlForLanguage(_selectedLanguage)));
-                            }
-                          });
-                          setModalState(() {});
-                        },
-                        underline: const SizedBox(),
-                      ),
+                    CupitorLanguagePicker(
+                      selectedCode: _selectedLanguage,
+                      onCatalog: (catalog) => _languageCatalog = catalog,
+                      onSelected: (language) {
+                        setState(() {
+                          _selectedLanguage = language.code;
+                          _studyLanguageName = language.name;
+                        });
+                        if (dialogController != null) {
+                          _loadDialog1Page(Uri.parse(getUrlForLanguage(language.code)));
+                        }
+                        setModalState(() {});
+                      },
                     ),
                     ListenableBuilder(
                       listenable: _toolsTimer,
@@ -8481,7 +8475,12 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   // ---------- end Filmot helpers ----------
 
   String getUrlForLanguage(String lang) {
-    return _dialogUrl + '?lang=' + (_languageParams[lang] ?? lang);
+    final uri = Uri.parse(_dialogUrl);
+    return uri.replace(queryParameters: {
+      ...uri.queryParameters,
+      'lang': _languageCatalog?.find(lang)?.name ??
+          (lang == _selectedLanguage ? _studyLanguageName : lang),
+    }).toString();
   }
 
   /// Handles a GitHub API proxy request from the JS channel.
@@ -9087,7 +9086,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     );
   }
 
-  String _speechLocale() => speechBcp47(_selectedLanguage) ?? 'en-US';
+  String _speechLocale() => _languageCatalog?.find(_selectedLanguage)?.locale ??
+      speechBcp47(_selectedLanguage) ?? 'en-US';
 
   Future<bool> _ensureSpeechInit() => SpeechHub.ensureInitialized();
 
