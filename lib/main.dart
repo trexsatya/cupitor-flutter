@@ -4221,6 +4221,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         };
         } // end of the prune install
 
+        // The shared document-start agent also handles embeds. Keep its Skip
+        // button usable if an ad survives pruning, and avoid two observers
+        // clicking the same button or hiding it behind these older styles.
+        if (window._ytAdFallbackInstalled) return;
+
         // ---- 2. Defensive CSS + skip-button click observer ----
         // Runs after DOMContentLoaded so we don't fail when injected at
         // document-start (no document.head yet).
