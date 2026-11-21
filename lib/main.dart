@@ -4648,6 +4648,27 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 child: ListView(
                   controller: scrollController,
                   children: [
+                    ListTile(
+                      leading: const Icon(Icons.language),
+                      title: const Text('Language'),
+                      trailing: DropdownButton<String>(
+                        value: _selectedLanguage,
+                        items: _languages
+                            .map((l) => DropdownMenuItem(value: l, child: Text(l)))
+                            .toList(),
+                        onChanged: (val) {
+                          setState(() {
+                            _selectedLanguage = val!;
+                            if (dialogController != null) {
+                              _loadDialog1Page(
+                                  Uri.parse(getUrlForLanguage(_selectedLanguage)));
+                            }
+                          });
+                          setModalState(() {});
+                        },
+                        underline: const SizedBox(),
+                      ),
+                    ),
                     ListenableBuilder(
                       listenable: _toolsTimer,
                       builder: (_, _) => ListTile(
@@ -4797,27 +4818,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                           _urlController.text = picked;
                           _loadUrl();
                         },
-                      ),
-                      ListTile(
-                        leading: const Icon(Icons.language),
-                        title: const Text('Language'),
-                        trailing: DropdownButton<String>(
-                          value: _selectedLanguage,
-                          items: _languages
-                              .map((l) => DropdownMenuItem(value: l, child: Text(l)))
-                              .toList(),
-                          onChanged: (val) {
-                            setState(() {
-                              _selectedLanguage = val!;
-                              if (dialogController != null) {
-                                _loadDialog1Page(
-                                    Uri.parse(getUrlForLanguage(_selectedLanguage)));
-                              }
-                            });
-                            setModalState(() {});
-                          },
-                          underline: const SizedBox(),
-                        ),
                       ),
                       ListTile(
                         leading: const Icon(Icons.smart_display_outlined),
