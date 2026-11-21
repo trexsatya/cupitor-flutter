@@ -11815,23 +11815,17 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
               onPressed: _showEpubLibrary,
               child: const Text('Book Library'),
             ),
-            SubmenuButton(
-              leadingIcon: const Icon(Icons.web),
-              menuChildren: [
-                MenuItemButton(
-                  leadingIcon: Icon(_findOverlay != null ? Icons.search_off : Icons.search),
-                  onPressed: _toggleMainPageFind,
-                  child: Text(_findOverlay != null ? 'Close find' : 'Find in page'),
-                ),
-                if (_currentPdfUrl != null)
-                  MenuItemButton(
-                    leadingIcon: Icon(_isTextView ? Icons.picture_as_pdf : Icons.text_snippet_outlined),
-                    onPressed: _isExtractingPdf ? null : _togglePdfTextView,
-                    child: Text(_isTextView ? 'Switch to PDF view' : 'Switch to text view'),
-                  ),
-              ],
-              child: const Text('Page'),
+            MenuItemButton(
+              leadingIcon: Icon(_findOverlay != null ? Icons.search_off : Icons.search),
+              onPressed: _toggleMainPageFind,
+              child: Text(_findOverlay != null ? 'Close find' : 'Find In Page'),
             ),
+            if (_currentPdfUrl != null)
+              MenuItemButton(
+                leadingIcon: Icon(_isTextView ? Icons.picture_as_pdf : Icons.text_snippet_outlined),
+                onPressed: _isExtractingPdf ? null : _togglePdfTextView,
+                child: Text(_isTextView ? 'Switch to PDF view' : 'Switch to text view'),
+              ),
             MenuItemButton(
               leadingIcon: const Icon(Icons.tune_outlined),
               onPressed: _showToolsDrawer,
