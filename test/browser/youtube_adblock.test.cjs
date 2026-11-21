@@ -75,7 +75,7 @@ const hostScript = mainDart.split('void _injectYouTubeAdBlocker(')[1].match(/con
 test('late host injection skips existing, nested and countdown-enabled ad buttons', async () => {
   await fixture(async page => {
     await page.evaluate(() => {
-      document.body.innerHTML = '<div class="html5-video-player"><button class="ytp-ad-skip-button">Skip</button><button id="play">Play</button></div>';
+      document.body.innerHTML = '<div class="html5-video-player ad-showing"><button class="ytp-ad-skip-button">Skip</button><button id="play">Play</button></div>';
       window.skipClicks = 0;
       window.playClicks = 0;
       document.querySelector('.ytp-ad-skip-button').onclick = () => window.skipClicks++;

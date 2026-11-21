@@ -60,8 +60,89 @@
     try { window.__cupFrameBootDiag.push(msg); } catch (_) {}
   }
 
+  function youtubeOrigin(value) {
+    try {
+      var url = new URL(value);
+      return url.protocol === 'https:' && url.port === '' && [
+        'youtube.com', 'www.youtube.com', 'm.youtube.com',
+        'youtube-nocookie.com', 'www.youtube-nocookie.com',
+      ].indexOf(url.hostname) >= 0;
+    } catch (_) { return false; }
+  }
+
+  // The study page cannot inspect a cross-origin player's ad state. Keep it
+  // on the parent before its modules load, including an ad already showing.
+  // A state is accepted only from a current, directly embedded YouTube frame.
+  function installYouTubeAdFallback() {
+    var messageType = 'cupitor:youtube-ad-state';
+    if (window.top === window && !window.CupitorYouTubeAds) {
+      var states = new WeakMap();
+      window.addEventListener('message', function (event) {
+        if (!event.data || event.data.type !== messageType ||
+            typeof event.data.playing !== 'boolean' || !youtubeOrigin(event.origin)) return;
+        var frames = document.querySelectorAll('iframe');
+        for (var i = 0; i < frames.length; i++) {
+          var frame = frames[i];
+          if (frame.contentWindow === event.source && youtubeOrigin(frame.src) &&
+              new URL(frame.src).origin === event.origin) {
+            states.set(frame.contentWindow, {origin: event.origin, playing: event.data.playing});
+            return;
+          }
+        }
+      });
+      window.CupitorYouTubeAds = Object.freeze({
+        isPlaying: function (frame) {
+          if (!frame || !frame.isConnected || !youtubeOrigin(frame.src)) return false;
+          var state = states.get(frame.contentWindow);
+          return !!(state && state.playing && state.origin === new URL(frame.src).origin);
+        },
+      });
+    }
+    if (!youtubeOrigin(location.href)) return;
+    window._ytAdFallbackInstalled = 1;
+    var lastState, lastSkipButton = null;
+    function update() {
+      var player = document.querySelector('.html5-video-player');
+      var playing = !!(player && (player.classList.contains('ad-showing') ||
+        player.classList.contains('ad-interrupting')));
+      if (playing !== lastState) {
+        lastState = playing;
+        lastSkipButton = null;
+        if (window.parent !== window) {
+          window.parent.postMessage({type: messageType, playing: playing}, '*');
+        }
+      }
+      if (!playing) return;
+      // Leave the ad and its Skip button usable if config pruning missed it.
+      // Never seek, speed up, pause or reload an ad as a fallback.
+      var buttons = player.querySelectorAll(
+        '.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-skip-ad-button-modern, ' +
+        '.ytp-ad-skip-button-modern, .ytp-ad-skip-button-slot button, ' +
+        '.ytp-ad-skip-button-container button, .ytp-ad-overlay-close-button');
+      var eligible = null;
+      for (var i = 0; i < buttons.length; i++) {
+        var button = buttons[i];
+        var style = getComputedStyle(button);
+        if (!button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
+            button.getClientRects().length && style.visibility !== 'hidden') {
+          eligible = button;
+          break;
+        }
+      }
+      if (eligible !== lastSkipButton) {
+        lastSkipButton = eligible;
+        if (eligible) eligible.click();
+      }
+    }
+    new MutationObserver(update).observe(document, {
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: ['class', 'style', 'disabled', 'aria-disabled', 'hidden'],
+    });
+    update();
+  }
+
   function installYouTubeAdPrune() {
-    if (!location.hostname || location.hostname.indexOf('youtube.com') < 0) {
+    if (!youtubeOrigin(location.href)) {
       note('prune skipped: host=' + location.hostname);
       return;
     }
@@ -89,7 +170,8 @@
     // walking the whole tree: the payload is large, and deleting anything
     // called adSlots wherever it appears risks taking a part of the page with
     // it. get_watch wraps both of these, which /player does not.
-    var AD_CONTAINERS = ['playerResponse', 'response'];
+    var AD_CONTAINERS = ['playerResponse', 'response', 'PLAYER_CONFIG', 'args',
+      'raw_player_response', 'player_response'];
 
     function prune(obj, depth) {
       if (!obj || typeof obj !== 'object') return;
@@ -105,7 +187,14 @@
       }
       for (var c = 0; c < AD_CONTAINERS.length; c++) {
         var inner = obj[AD_CONTAINERS[c]];
-        if (inner && inner !== obj) prune(inner, (depth || 0) + 1);
+        if (typeof inner === 'string' && (AD_CONTAINERS[c] === 'player_response' ||
+            AD_CONTAINERS[c] === 'raw_player_response')) {
+          try {
+            var parsed = JSON.parse(inner);
+            prune(parsed, (depth || 0) + 1);
+            obj[AD_CONTAINERS[c]] = JSON.stringify(parsed);
+          } catch (_) {} // Preserve an unfamiliar/invalid config unchanged.
+        } else if (inner && inner !== obj) prune(inner, (depth || 0) + 1);
       }
     }
 
@@ -246,6 +335,51 @@
       });
     } catch (_) { /* may already be non-configurable */ }
 
+    // Embeds can bootstrap from ytplayer.config or ytcfg.set(PLAYER_CONFIG)
+    // without assigning ytInitialPlayerResponse or making a player request.
+    // Hook only those named config properties; unrelated JSON stays intact.
+    function watchConfig(object, key, transform) {
+      if (!object || typeof object !== 'object') return;
+      try {
+        var descriptor = Object.getOwnPropertyDescriptor(object, key);
+        if (descriptor && (!descriptor.configurable || descriptor.get || descriptor.set)) {
+          transform(object[key]);
+          return;
+        }
+        function prepare(value) {
+          try { return transform(value); } catch (_) { return value; }
+        }
+        var value = prepare(object[key]);
+        Object.defineProperty(object, key, {
+          configurable: true, enumerable: descriptor ? descriptor.enumerable : true,
+          get: function () { return value; },
+          set: function (next) { value = prepare(next); },
+        });
+      } catch (_) {}
+    }
+    var seenPlayer = new WeakSet(), seenConfig = new WeakSet();
+    watchConfig(window, 'ytplayer', function (player) {
+      if (player && typeof player === 'object' && !seenPlayer.has(player)) {
+        seenPlayer.add(player);
+        watchConfig(player, 'config', function (config) { prune(config); return config; });
+      }
+      return player;
+    });
+    watchConfig(window, 'ytcfg', function (config) {
+      if (config && typeof config === 'object' && !seenConfig.has(config)) {
+        seenConfig.add(config);
+        watchConfig(config, 'data_', function (data) { prune(data); return data; });
+        watchConfig(config, 'set', function (set) {
+          if (typeof set !== 'function') return set;
+          return function () {
+            try { prune(arguments[0]); } catch (_) {}
+            return set.apply(this, arguments);
+          };
+        });
+      }
+      return config;
+    });
+
     // ---- XMLHttpRequest ----------------------------------------------------
     //
     // m.youtube.com fetches its player config over XHR, not fetch: on the
@@ -378,6 +512,8 @@
         'warn|[yt] prune install failed: ' + ((e && e.message) || e));
     } catch (_) {}
   }
+  // Failure in config pruning must not disable the independent Skip fallback.
+  try { installYouTubeAdFallback(); } catch (_) {}
 
   // The top document gets snippet.js the ordinary way; this agent exists only
   // for frames, and doing both would install two of everything.
