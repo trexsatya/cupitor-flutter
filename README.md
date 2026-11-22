@@ -32,6 +32,10 @@ style fidelity are not reproduced. Internal bookmark links work within a
 chapter. Encrypted/password-protected documents and legacy `.doc` files are
 not supported.
 
+In the reader's **Playlists** screen, use the trash button beside a playlist's
+name to delete it and its captured sentences after confirmation. Long-press
+a playlist to rename it or open its actions.
+
 Run the document reader tests with:
 
 ```sh

@@ -7,8 +7,8 @@ import 'playlist_service.dart';
 ///
 /// Lists every user-created playlist across the top (chip row), plus
 /// the active playlist's items below with reorder / delete. New
-/// playlists are created via the app-bar `+`; renaming happens via
-/// long-press on a chip.
+/// playlists are created via the app-bar `+`; each chip has a delete
+/// button, and renaming happens via long-press on a chip.
 ///
 /// The screen is intentionally self-contained — it doesn't know about
 /// the EPUB reader or the language WebView. Mutations flow through
@@ -166,10 +166,14 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                 padding: const EdgeInsets.only(right: 6),
                 child: GestureDetector(
                   onLongPress: () => _showChipMenu(p),
-                  child: ChoiceChip(
+                  child: InputChip(
                     label: Text(p.name),
                     selected: p.id == active,
                     onSelected: (_) => PlaylistService.setActive(p.id),
+                    deleteIcon: const Icon(Icons.delete_outline, size: 18),
+                    deleteIconColor: theme.colorScheme.error,
+                    deleteButtonTooltipMessage: 'Delete "${p.name}"',
+                    onDeleted: () => _confirmDeletePlaylist(p),
                   ),
                 ),
               ),
@@ -200,6 +204,7 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
         ),
       ),
     );
+    if (!mounted) return;
     if (action == 'rename') await _renamePlaylist(p);
     if (action == 'delete') await _confirmDeletePlaylist(p);
   }
