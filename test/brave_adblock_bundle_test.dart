@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
+import 'package:cupitor/brave_adblock_bundle.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -14,9 +15,7 @@ void main() {
       final encoded = await File(
         'assets/adblock/bundle.json.gz.b64',
       ).readAsString();
-      final bytes = gzip.decode(
-        base64Decode(encoded.replaceAll(RegExp(r'\s'), '')),
-      );
+      final bytes = BraveBundleUpdater.decode(encoded, manifest);
       expect(sha256.convert(bytes).toString(), manifest['sha256']);
       final bundle = jsonDecode(utf8.decode(bytes));
       expect(bundle['version'], manifest['version']);

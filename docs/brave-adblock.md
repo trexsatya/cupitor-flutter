@@ -23,11 +23,19 @@ replacing Android WebView or WKWebView with the Brave browser.
   fallback continues to work within the hosting browser's restrictions.
 
 The app ships a verified compressed snapshot of 12 maintained lists and 224
-scriptlet/redirect resources. It starts offline, checks trusted upstream HTTPS
-sources at most once a day, resolves list includes, and retains the last good
-bundle if download, parsing or native activation fails. The bundled snapshot
-wins over data cached by an older app version. Source commits, hashes and
-licenses are under `assets/adblock/`.
+scriptlet/redirect resources for the first launch and offline use. At most once
+a day, it checks `assets/adblock/manifest.json` on this repository's `main`
+branch via `raw.githubusercontent.com`. When the version increases, it fetches
+the prebuilt `bundle.json.gz.b64` from the same directory. Devices no longer
+download individual upstream lists or assemble scriptlets themselves.
+
+Downloads have size, decompression, SHA-256, schema and engine-version checks.
+Unchanged versions need only the manifest request. The native engine must
+accept an update before it is cached for subsequent offline launches. Failed
+downloads, a manifest/bundle race on GitHub, invalid data and failed activation
+retain the last working copy. Older remote versions cannot downgrade the cache.
+The bundled snapshot wins over data cached by an older app version. Source
+commits, hashes and licenses remain under `assets/adblock/`.
 
 ## Building
 
@@ -54,4 +62,15 @@ node --test test/browser/brave_adblock.test.cjs
 To rebuild the offline snapshot, clone the four upstream repositories into a
 directory named with `brave-engine`, `brave-resources`, `ublock-assets` and
 `brave-lists`, check out the reviewed commits, then run
-`python3 scripts/update-brave-bundle.py /path/to/checkouts`.
+`python3 scripts/update-brave-bundle.py /path/to/checkouts`. The bundle version
+defaults to the UTC build timestamp; use `--version` to reproduce a specific
+version. Every content change needs a higher version, since WebKit caches rules
+by version. Commit the regenerated bundle and manifest together to `main` to
+publish filter updates without rebuilding the app. The native Rust engine is
+still compiled into each app; only filter/scriptlet data is fetched at runtime.
+
+Test downloads, cache promotion, rollback and offline handling with:
+
+```sh
+flutter test test/brave_adblock_update_test.dart test/brave_adblock_bundle_test.dart
+```

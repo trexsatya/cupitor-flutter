@@ -2,10 +2,11 @@
 """Rebuild the offline Brave bundle from reviewed upstream checkouts.
 
 Pass a directory containing brave-engine, brave-resources, ublock-assets and
-brave-lists. Runtime refresh URLs remain in the shipped manifest; this command
-pins exact input commits and hashes for a reproducible app release.
+brave-lists. Commit the output to main to make it available to installed apps.
+The manifest records exact upstream commits and hashes for reproducibility.
 """
 import argparse
+from datetime import datetime, timezone
 import base64
 import gzip
 import hashlib
@@ -19,7 +20,12 @@ import textwrap
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('checkouts', type=Path)
+    parser.add_argument('--version', type=int,
+                        default=int(datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')),
+                        help='Increasing bundle version; defaults to the UTC build timestamp')
     args = parser.parse_args()
+    if args.version <= 0:
+        parser.error('--version must be positive')
     output = Path(__file__).resolve().parents[1] / 'assets/adblock'
     output.mkdir(parents=True, exist_ok=True)
     roots = args.checkouts
@@ -69,7 +75,7 @@ def main():
             resources[resource['name']] = resource
         resource_descriptors.append({'url': f'https://raw.githubusercontent.com/{repo_names[repo]}/master/{path}',
                                      'commit': commits[repo], 'sha256': hashlib.sha256(raw).hexdigest()})
-    version = 2026112201
+    version = args.version
     bundle = {'schema': 1, 'engine_version': '0.13.6', 'version': version,
               'lists': lists, 'resources': list(resources.values())}
     raw = json.dumps(bundle, ensure_ascii=False, separators=(',', ':')).encode()
