@@ -6,6 +6,7 @@
 
 // The application's name. By default this is also the title of the Flutter window.
 PRODUCT_NAME = cupitor
+SWIFT_OBJC_BRIDGING_HEADER = $(PROJECT_DIR)/Runner/CupitorAdblock.h
 
 // The application's bundle identifier
 PRODUCT_BUNDLE_IDENTIFIER = org.satya.cupitor

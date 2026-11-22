@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 
 const script = readFileSync(process.env.CUPITOR_FRAME_BOOT_TEST_FILE || new URL('../../assets/js/frame_boot.js', import.meta.url), 'utf8');
 
-function page(host = 'www.youtube.com') {
+function page(host = 'www.youtube.com', nativeStatus) {
   const frames = [], listeners = new Map(), observers = [], polls = [];
   let clock = 0;
   const context = vm.createContext({
@@ -18,6 +18,7 @@ function page(host = 'www.youtube.com') {
     addEventListener: (event, callback) => listeners.set(event, callback),
   });
   context.window = context; context.top = context; context.parent = context;
+  if (nativeStatus) context.CupitorBraveNative = {query:() => JSON.stringify(nativeStatus)};
   vm.runInContext(script, context);
   return {context, frames, listeners, mutate: () => observers.forEach(callback => callback()),
     poll: (elapsed = 500) => { clock += elapsed; polls.forEach(callback => callback()); },
@@ -99,6 +100,19 @@ test('lookalike hosts do not receive config hooks or ad fallback', () => {
   p.run(`window.ytInitialPlayerResponse = ${response};`);
   assert.deepEqual(clean(p.context.ytInitialPlayerResponse.adSlots), [3]);
   assert.equal(p.context._ytAdFallbackInstalled, undefined);
+});
+
+test('Brave manages JSON hooks while the ad-state and Skip fallback remain installed', () => {
+  const p = page('www.youtube.com', {ready:true, managed:true});
+  p.run(`window.ytInitialPlayerResponse = ${response};`);
+  assert.deepEqual(clean(p.context.ytInitialPlayerResponse.adSlots), [3], 'no second JSON-pruning layer');
+  assert.equal(p.context._ytAdFallbackInstalled, 1);
+});
+
+test('native network support without document-start scriptlets keeps the JSON fallback', () => {
+  const p = page('www.youtube.com', {ready:true, managed:false});
+  p.run(`window.ytInitialPlayerResponse = ${response};`);
+  assert.deepEqual(clean(p.context.ytInitialPlayerResponse), expected);
 });
 
 test('fallback waits for an enabled, visible Skip and does not repeatedly click the same button', () => {

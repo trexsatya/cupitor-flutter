@@ -18,6 +18,13 @@ jobs:
           channel: stable
           cache: true
       - run: flutter pub get --enforce-lockfile
+      - name: Set up and test the shared Brave engine
+        env:
+          CUPITOR_BRAVE_WEBKIT_FIXTURE: ${{ github.workspace }}/native/adblock/target/brave-webkit.json
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup default 1.100.0
+          cargo test --manifest-path native/adblock/Cargo.toml --locked
       - name: Verify macOS SQLite tagging backend
         run: flutter test test/mac_sqlite_test.dart
       - run: flutter build macos --debug

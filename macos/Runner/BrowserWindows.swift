@@ -7,6 +7,7 @@ final class BrowserWindows {
   private var tabs: [ObjectIdentifier: BrowserTab] = [:]
   var loadCaptureScript: ((@escaping (String?) -> Void) -> Void)?
   var onFilmotCapture: ((String) -> Void)?
+  var configureView: ((WKWebView) -> Void)?
 
   @discardableResult
   func open(_ url: URL, beside window: NSWindow? = nil) -> Bool {
@@ -82,6 +83,7 @@ final class BrowserTab: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDe
     window.center()
     webView.navigationDelegate = self
     JSPanelUIDelegate.install(on: webView, forwardingTo: self)
+    browser.configureView?(webView)
     buildContent()
     observations = [
       webView.observe(\.url, options: [.new]) { [weak self] _, _ in self?.updateControls() },

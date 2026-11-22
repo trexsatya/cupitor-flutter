@@ -1,4 +1,9 @@
 # R8 keep rules for youtubedl-android and friends.
+# JNI symbols contain this class name; preserve it if shrinking is enabled.
+-keep class org.satya.cupitor.BraveNative { *; }
+-keepclassmembers class org.satya.cupitor.BraveAdblock$PageBridge {
+    @android.webkit.JavascriptInterface <methods>;
+}
 #
 # Symptom this file fixes:
 #   PlatformException(INIT_FAILED, ExceptionInInitializerError →

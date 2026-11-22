@@ -39,6 +39,7 @@ import 'ai_prompt.dart';
 import 'youtube_urls.dart';
 import 'youtube_controls.dart';
 import 'frame_script.dart';
+import 'brave_adblock.dart';
 import 'youtube_sidebar_subtitles.dart';
 import 'local_subtitles.dart';
 import 'stable_dialog_chrome.dart';
@@ -3291,6 +3292,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
     _awaitFrameScript().then((_) async {
       await c.macConfigurationReady;
+      await BraveAdblock.install(c);
       if (!mounted) return;
       try {
         c.loadRequest(target);
@@ -3307,6 +3309,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// that loads without the agent.
   Future<void> _awaitFrameScript() async {
     if (!Platform.isAndroid && !Platform.isMacOS) return;
+    await BraveAdblock.initialize();
     try {
       await _frameScriptReady.future.timeout(const Duration(seconds: 3));
     } catch (_) {}
@@ -4137,6 +4140,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _injectFrameAgentIntoMainFrame(ctrl);
     const js = r'''
       (function() {
+        if (window.__cupitorBraveManaged || window.CupitorBraveNative) return;
         if (!location.hostname.includes('youtube.com')) return;
         if (window._ytAdBlockerInjected) return;
         window._ytAdBlockerInjected = true;
@@ -8572,6 +8576,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     // view tree. Refresh per navigation so fetched frame-agent updates also
     // reach this registration instead of losing to an older installed copy.
     await installYouTubeControls(ctrl, frameScript: _frameScriptSource);
+    await BraveAdblock.install(ctrl);
     if (!mounted || !identical(ctrl, dialogController) ||
         serial != _dialog1LoadSerial) return;
     final study = Uri.parse(_dialogUrl);

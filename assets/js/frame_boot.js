@@ -41,7 +41,7 @@
 
   if (window.__cupFrameBoot) return;
   window.__cupFrameBoot = 1;
-  window.__cupFrameBootVersion = 2026112201;
+  window.__cupFrameBootVersion = 2026112202;
 
   // ---- YouTube ad pruning -------------------------------------------------
   //
@@ -158,6 +158,13 @@
   }
 
   function installYouTubeAdPrune() {
+    // Brave owns response/scriptlet filtering when available. Do not stack
+    // the older custom JSON wrappers on top of its maintained scriptlets.
+    if (window.__cupitorBraveManaged) return;
+    try {
+      if (window.CupitorBraveNative && JSON.parse(window.CupitorBraveNative.query(
+          JSON.stringify({op: 'status', url: location.href}))).managed) return;
+    } catch (_) {}
     if (!youtubeOrigin(location.href)) {
       note('prune skipped: host=' + location.hostname);
       return;

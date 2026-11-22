@@ -204,6 +204,7 @@ internal class CupitorBrowser(
             override fun onCloseWindow(window: WebView) = close(tab)
         }
         tabs.add(tab)
+        BraveAdblock.install(view)
         select(tab)
         if (url != null) view.loadUrl(url)
         return tab

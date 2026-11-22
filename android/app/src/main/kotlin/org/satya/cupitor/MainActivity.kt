@@ -258,6 +258,22 @@ class MainActivity : FlutterActivity() {
                 }
             }
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cupitor/brave_adblock")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "initialize" -> {
+                        val directory = call.argument<String>("directory")
+                        if (directory.isNullOrBlank()) result.error("BAD_ARG", "Missing Brave data", null)
+                        else BraveAdblock.initialize(directory) { result.success(it) }
+                    }
+                    "install" -> {
+                        val id = call.argument<Number>("webViewId")?.toLong()
+                        val view = id?.let { WebViewFlutterAndroidExternalApi.getWebView(flutterEngine, it) }
+                        result.success(view != null && BraveAdblock.install(view))
+                    }
+                    else -> result.notImplemented()
+                }
+            }
         adBlockChannel = channel
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
@@ -284,6 +300,7 @@ class MainActivity : FlutterActivity() {
                 "setEnabled" -> {
                     val enabled = call.argument<Boolean>("enabled") ?: true
                     adBlockEnabled = enabled
+                    BraveAdblock.enabled = enabled
                     result.success(null)
                 }
                 "flushCookies" -> {
@@ -791,10 +808,6 @@ class MainActivity : FlutterActivity() {
     // forever: AB(RG(AB(RG(plugin)))) after two navigations, deeper after
     // every one that follows. Exposing the delegate link makes the question
     // answerable about the whole chain instead of just its top.
-    private interface ChainedWebViewClient {
-        val innerClient: WebViewClient
-    }
-
     private fun chainHas(client: WebViewClient?, cls: Class<*>): Boolean {
         var c: WebViewClient? = client
         // Bounded rather than while(true): a cycle here would hang the UI
@@ -1689,7 +1702,8 @@ class MainActivity : FlutterActivity() {
             val host = try {
                 Uri.parse(url).host?.lowercase() ?: return false
             } catch (_: Exception) { return false }
-            return adHosts.any { blocked -> host == blocked || host.endsWith(".$blocked") }
+            val hosts = if (BraveAdblock.ready) adHosts - BUILTIN_AD_HOSTS else adHosts
+            return hosts.any { blocked -> host == blocked || host.endsWith(".$blocked") }
         }
 
         private fun emptyResponse() =
@@ -1772,6 +1786,9 @@ class MainActivity : FlutterActivity() {
             if (!adBlockEnabled) return delegate.shouldInterceptRequest(view, request)
             val urlStr = request.url.toString()
             if (isAdHost(urlStr)) return emptyResponse()
+            // Brave's maintained exceptions must win over the old built-in
+            // hostname/path heuristics. Explicit user hosts still apply above.
+            if (BraveAdblock.ready) return delegate.shouldInterceptRequest(view, request)
 
             // Block YouTube ad-reporting endpoints (path-based, not host-based)
             if (matchYouTubeAdPath(request.url)) return emptyJsonResponse()

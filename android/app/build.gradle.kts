@@ -118,6 +118,16 @@ flutter {
     source = "../.."
 }
 
+val buildBraveEngine by tasks.registering(Exec::class) {
+    val source = rootProject.file("../native/adblock")
+    inputs.files(fileTree(source) { include("src/**", "Cargo.toml", "Cargo.lock") })
+    inputs.file(rootProject.file("../assets/js/brave_adblock.js"))
+    inputs.file(rootProject.file("../scripts/build-brave-engine.sh"))
+    outputs.dir(file("src/main/jniLibs"))
+    commandLine("bash", rootProject.file("../scripts/build-brave-engine.sh").absolutePath, "android")
+}
+tasks.named("preBuild").configure { dependsOn(buildBraveEngine) }
+
 // These SDKs cover the @Config declarations in the Android unit tests.
 val robolectricSdkVersions = listOf(
     "7.0.0_r1-robolectric-r1-i7", // API 24

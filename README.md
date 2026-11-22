@@ -185,6 +185,10 @@ increase the base build number in `pubspec.yaml` if needed.
 
 ## Getting Started
 
+Android and macOS embed Brave's native ad-blocking engine. See
+[the integration and build notes](docs/brave-adblock.md) for supported behavior,
+offline filters, updates, native build prerequisites and tests.
+
 This project is a starting point for a Flutter application.
 
 A few resources to get you started if this is your first Flutter project:
