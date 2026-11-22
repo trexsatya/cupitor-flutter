@@ -65,6 +65,22 @@ class MainFlutterWindow: NSWindow {
       self?.adBlocker.handle(call, result: result)
     }
     self.adBlockChannel = adBlockChannel
+    let braveChannel = FlutterMethodChannel(name: "cupitor/brave_adblock", binaryMessenger: flutterViewController.engine.binaryMessenger)
+    braveChannel.setMethodCallHandler { [weak self] call, result in
+      guard call.method == "initialize", let args = call.arguments as? [String: Any],
+        let directory = args["directory"] as? String else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      BraveMacAdblock.shared.initialize(directory: directory) { status in
+        if status["ready"] as? Bool == true, let self {
+          self.adBlocker.activateBrave { error in
+            if let error { result(["ready": false, "error": error.localizedDescription]) }
+            else { result(status) }
+          }
+        } else { result(status) }
+      }
+    }
 
     // Dart passes a WebView's identifier (lib/mac_webview.dart) and we patch
     // the native WKWebView for what webview_flutter can't configure.
@@ -122,6 +138,7 @@ class MainFlutterWindow: NSWindow {
         WordMapsFileBridge.install(on: webView, page: page)
       }
       self?.frameScripts.configure(webView)
+      BraveMacAdblock.shared.configure(webView)
       self?.adBlocker.configure(webView) { error in
         if let error = error {
           result(FlutterError(code: "adblock_rules", message: error.localizedDescription, details: nil))
@@ -176,6 +193,11 @@ class MainFlutterWindow: NSWindow {
   private let frameScripts = FrameScriptInstaller()
   private lazy var browserWindows: BrowserWindows = {
     let browser = BrowserWindows()
+    browser.configureView = { [weak self] view in
+      self?.frameScripts.configure(view)
+      BraveMacAdblock.shared.configure(view)
+      self?.adBlocker.configure(view) { _ in }
+    }
     browser.loadCaptureScript = { [weak self] completion in
       guard let channel = self?.webviewChannel else {
         completion(nil)
@@ -245,6 +267,8 @@ final class MacAdBlocker {
   private var enabled = true
   private var rules: WKContentRuleList?
   private var compiling = false
+  private var initialized = false
+  private var braveActive = false
   private var revision = 0
   private var ready: [(Error?) -> Void] = []
   private static let hostsKey = "cupitor.adblock.customHosts"
@@ -282,7 +306,7 @@ final class MacAdBlocker {
 
   func configure(_ webView: WKWebView, completion: @escaping (Error?) -> Void) {
     views.add(webView)
-    if rules != nil {
+    if initialized {
       apply(to: webView)
       completion(nil)
     } else {
@@ -302,7 +326,18 @@ final class MacAdBlocker {
     guard !compiling else { return }
     compiling = true
     let current = revision
-    let json = Self.encodedRules(hosts: Self.builtInHosts.union(customHosts))
+    let hosts = braveActive ? customHosts : Self.builtInHosts.union(customHosts)
+    if hosts.isEmpty {
+      if let rules { for view in views.allObjects { view.configuration.userContentController.remove(rules) } }
+      rules = nil
+      initialized = true
+      compiling = false
+      let callbacks = ready
+      ready.removeAll()
+      for callback in callbacks { callback(nil) }
+      return
+    }
+    let json = Self.encodedRules(hosts: hosts)
     store.compileContentRuleList(forIdentifier: identifier, encodedContentRuleList: json) {
       [weak self] compiled, error in
       guard let self = self else { return }
@@ -315,6 +350,7 @@ final class MacAdBlocker {
           if let old = self.rules { view.configuration.userContentController.remove(old) }
         }
         self.rules = compiled
+        self.initialized = true
         for view in self.views.allObjects { self.apply(to: view) }
       }
       let callbacks = self.ready
@@ -329,6 +365,7 @@ final class MacAdBlocker {
     case "getCustomHosts": result(customHosts.sorted())
     case "setEnabled":
       enabled = args["enabled"] as? Bool ?? true
+      BraveMacAdblock.shared.setEnabled(enabled)
       for view in views.allObjects { apply(to: view) }
       result(nil)
     case "addHost", "removeHost":
@@ -352,7 +389,7 @@ final class MacAdBlocker {
       }
       compile()
     case "attach":
-      if rules != nil { result(nil) } else {
+      if initialized { result(nil) } else {
         ready.append { error in
           if let error = error {
             result(FlutterError(code: "adblock_rules", message: error.localizedDescription, details: nil))
@@ -362,6 +399,15 @@ final class MacAdBlocker {
       }
     default: result(FlutterMethodNotImplemented)
     }
+  }
+
+  func activateBrave(completion: @escaping (Error?) -> Void) {
+    // Keep explicit user hosts, but let Brave's maintained network exceptions
+    // supersede the legacy built-in host list.
+    braveActive = true
+    revision += 1
+    ready.append(completion)
+    compile()
   }
 }
 
@@ -560,6 +606,10 @@ final class JSPanelUIDelegate: NSObject, WKUIDelegate {
     defaultText: String?, initiatedByFrame frame: WKFrameInfo,
     completionHandler: @escaping (String?) -> Void
   ) {
+    if prompt == "__cupitor_brave_v1__" {
+      completionHandler(BraveMacAdblock.shared.pageQuery(defaultText, frame: frame))
+      return
+    }
     let alert = NSAlert()
     alert.messageText = prompt
     alert.addButton(withTitle: "OK")

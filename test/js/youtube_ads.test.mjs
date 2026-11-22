@@ -3,20 +3,25 @@ import vm from 'node:vm';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const script = readFileSync(new URL('../../assets/js/frame_boot.js', import.meta.url), 'utf8');
+const script = readFileSync(process.env.CUPITOR_FRAME_BOOT_TEST_FILE || new URL('../../assets/js/frame_boot.js', import.meta.url), 'utf8');
 
-function page(host = 'www.youtube.com') {
-  const frames = [], listeners = new Map(), observers = [];
+function page(host = 'www.youtube.com', nativeStatus) {
+  const frames = [], listeners = new Map(), observers = [], polls = [];
+  let clock = 0;
   const context = vm.createContext({
     URL, WeakMap, WeakSet, location: new URL(`https://${host}/embed/content`),
     document: {querySelector: () => null, querySelectorAll: () => frames},
     MutationObserver: class { constructor(callback) { observers.push(callback); } observe() {} },
+    setInterval: callback => { polls.push(callback); return polls.length; },
+    Date: class extends Date { static now() { return clock; } },
     fetch: async () => new Response('{}'), Response,
     addEventListener: (event, callback) => listeners.set(event, callback),
   });
   context.window = context; context.top = context; context.parent = context;
+  if (nativeStatus) context.CupitorBraveNative = {query:() => JSON.stringify(nativeStatus)};
   vm.runInContext(script, context);
   return {context, frames, listeners, mutate: () => observers.forEach(callback => callback()),
+    poll: (elapsed = 500) => { clock += elapsed; polls.forEach(callback => callback()); },
     run: code => vm.runInContext(code, context)};
 }
 
@@ -97,6 +102,19 @@ test('lookalike hosts do not receive config hooks or ad fallback', () => {
   assert.equal(p.context._ytAdFallbackInstalled, undefined);
 });
 
+test('Brave manages JSON hooks while the ad-state and Skip fallback remain installed', () => {
+  const p = page('www.youtube.com', {ready:true, managed:true});
+  p.run(`window.ytInitialPlayerResponse = ${response};`);
+  assert.deepEqual(clean(p.context.ytInitialPlayerResponse.adSlots), [3], 'no second JSON-pruning layer');
+  assert.equal(p.context._ytAdFallbackInstalled, 1);
+});
+
+test('native network support without document-start scriptlets keeps the JSON fallback', () => {
+  const p = page('www.youtube.com', {ready:true, managed:false});
+  p.run(`window.ytInitialPlayerResponse = ${response};`);
+  assert.deepEqual(clean(p.context.ytInitialPlayerResponse), expected);
+});
+
 test('fallback waits for an enabled, visible Skip and does not repeatedly click the same button', () => {
   const p = page(), messages = [];
   const classes = new Set(['ad-showing']);
@@ -125,4 +143,36 @@ test('fallback waits for an enabled, visible Skip and does not repeatedly click 
   classes.clear();
   p.mutate();
   assert.equal(messages.at(-1).playing, false);
+});
+
+test('an ignored Skip click is retried by polling and stops as soon as the ad ends', () => {
+  const p = page();
+  let ad = true, clicks = 0;
+  const button = {disabled:false, getAttribute:()=>null, getClientRects:()=>[{}], click:()=>clicks++};
+  p.context.document.querySelector = () => ({
+    classList:{contains:()=>ad}, querySelectorAll:()=>[button],
+  });
+  p.context.getComputedStyle = () => ({visibility:'visible'});
+  p.mutate();
+  assert.equal(clicks, 1);
+  p.poll();
+  assert.equal(clicks, 1, 'retry is rate limited');
+  p.poll();
+  assert.equal(clicks, 2, 'same button is retried without a DOM mutation');
+  ad = false;
+  p.poll(2000);
+  assert.equal(clicks, 2);
+});
+
+test('hiding Cupitor controls does not disable an enabled Skip button', () => {
+  const p = page();
+  let clicks = 0;
+  const button = {disabled:false, getAttribute:()=>null, getClientRects:()=>[{}], click:()=>clicks++};
+  p.context.document.querySelector = () => ({classList:{contains:()=>true}, querySelectorAll:()=>[button]});
+  p.context.document.documentElement = {
+    classList:{contains:name=>name === 'cupitor-youtube-controls-hidden'},
+  };
+  p.context.getComputedStyle = () => ({visibility:'hidden'});
+  p.mutate();
+  assert.equal(clicks, 1);
 });

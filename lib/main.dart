@@ -38,6 +38,8 @@ import 'translate_detail.dart';
 import 'ai_prompt.dart';
 import 'youtube_urls.dart';
 import 'youtube_controls.dart';
+import 'frame_script.dart';
+import 'brave_adblock.dart';
 import 'youtube_sidebar_subtitles.dart';
 import 'local_subtitles.dart';
 import 'stable_dialog_chrome.dart';
@@ -3175,9 +3177,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     } catch (_) {}
     // A first launch/offline restore still needs the hook before player code.
     // The remote copy can update it on subsequent navigations.
-    if (cached == null || cached.trim().isEmpty) {
-      cached = await rootBundle.loadString('assets/js/frame_boot.js');
-    }
+    final bundled = await rootBundle.loadString('assets/js/frame_boot.js');
+    cached = preferFrameScript(bundled, cached);
     _frameScriptSource = cached;
     _reportFrameAgent('stored/bundled copy -> ${await _registerFrameScript(cached)}');
 
@@ -3186,7 +3187,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       _reportFrameAgent('remote refresh unavailable; using stored/bundled copy');
       return;
     }
-    if (fresh == cached) return; // registered above, and unchanged
+    if (preferFrameScript(cached, fresh) == cached) return;
     _frameScriptSource = fresh;
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -3291,6 +3292,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     }
     _awaitFrameScript().then((_) async {
       await c.macConfigurationReady;
+      await BraveAdblock.install(c);
       if (!mounted) return;
       try {
         c.loadRequest(target);
@@ -3307,6 +3309,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// that loads without the agent.
   Future<void> _awaitFrameScript() async {
     if (!Platform.isAndroid && !Platform.isMacOS) return;
+    await BraveAdblock.initialize();
     try {
       await _frameScriptReady.future.timeout(const Duration(seconds: 3));
     } catch (_) {}
@@ -4137,6 +4140,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _injectFrameAgentIntoMainFrame(ctrl);
     const js = r'''
       (function() {
+        if (window.__cupitorBraveManaged || window.CupitorBraveNative) return;
         if (!location.hostname.includes('youtube.com')) return;
         if (window._ytAdBlockerInjected) return;
         window._ytAdBlockerInjected = true;
@@ -8556,7 +8560,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     dialogController?.runJavaScript(js);
   }
 
-  Future<bool> _dialog1YouTubeControlsReady = Future.value(false);
   int _dialog1LoadSerial = 0;
 
   /// Every navigation waits for document-start injection. If a notification
@@ -8565,9 +8568,15 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final ctrl = dialogController;
     if (ctrl == null) return;
     final serial = ++_dialog1LoadSerial;
-    await _dialog1YouTubeControlsReady;
     await _awaitFrameScript();
     await ctrl.macConfigurationReady;
+    if (!mounted || !identical(ctrl, dialogController) ||
+        serial != _dialog1LoadSerial) return;
+    // Register on this exact controller, even before it has a widget in the
+    // view tree. Refresh per navigation so fetched frame-agent updates also
+    // reach this registration instead of losing to an older installed copy.
+    await installYouTubeControls(ctrl, frameScript: _frameScriptSource);
+    await BraveAdblock.install(ctrl);
     if (!mounted || !identical(ctrl, dialogController) ||
         serial != _dialog1LoadSerial) return;
     final study = Uri.parse(_dialogUrl);
@@ -8784,7 +8793,6 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
             },
           ),
         );
-      _dialog1YouTubeControlsReady = installYouTubeControls(ctrl);
       _loadDialog1Page(Uri.parse(getUrlForLanguage(_selectedLanguage)));
       _enableThirdPartyCookies(dialogController!);
     }

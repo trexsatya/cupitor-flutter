@@ -216,6 +216,60 @@ final class MacAdBlockerTests: XCTestCase {
   }
 }
 
+@MainActor
+final class BraveAdblockTests: XCTestCase {
+  func testShippedBraveNetworkRulesCompileInRealWebKit() throws {
+    let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+      .deletingLastPathComponent().deletingLastPathComponent()
+    let fixture = root.appendingPathComponent("native/adblock/target/brave-webkit.json")
+    let json = try String(contentsOf: fixture, encoding: .utf8)
+    let done = expectation(description: "Brave rules compile in WebKit")
+    WKContentRuleListStore.default().compileContentRuleList(
+      forIdentifier: "cupitor-brave-full-test", encodedContentRuleList: json) { list, error in
+      XCTAssertNil(error)
+      XCTAssertNotNil(list)
+      done.fulfill()
+    }
+    wait(for: [done], timeout: 120)
+  }
+
+  func testNativeInitializationOrdersScriptsPreservesChannelsAndHonorsToggle() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let version = Int(Date().timeIntervalSince1970 * 1000)
+    let bundle: [String: Any] = ["schema": 1, "engine_version": "0.13.6", "version": version,
+      "lists": [["text": "||ads.example^\n@@||ads.example/needed.js$script"]], "resources": []]
+    try JSONSerialization.data(withJSONObject: bundle).write(to: directory.appendingPathComponent("bundle.json"))
+    let manager = BraveMacAdblock()
+    let view = WKWebView()
+    let content = view.configuration.userContentController
+    content.addUserScript(WKUserScript(source: "window.FlutterChannel=true",
+      injectionTime: .atDocumentStart, forMainFrameOnly: false))
+    manager.configure(view)
+    let done = expectation(description: "native engine and WebKit rules ready")
+    manager.initialize(directory: directory.path) { status in
+      XCTAssertEqual(status["ready"] as? Bool, true, "\(status)")
+      done.fulfill()
+    }
+    wait(for: [done], timeout: 30)
+    manager.configure(view)
+    XCTAssertEqual(content.userScripts.count, 2)
+    XCTAssertTrue(content.userScripts[0].source.contains("enabled:true"))
+    XCTAssertEqual(content.userScripts[0].injectionTime, .atDocumentStart)
+    XCTAssertFalse(content.userScripts[0].isForMainFrameOnly)
+    XCTAssertEqual(content.userScripts[1].source, "window.FlutterChannel=true")
+    let decision = BraveMacAdblock.nativeQuery(#"{"op":"network","url":"https://ads.example/ad.js","source":"https://site.example/","type":"script"}"#)
+    XCTAssertEqual(decision["blocked"] as? Bool, true)
+    manager.setEnabled(false)
+    XCTAssertEqual(content.userScripts.count, 2)
+    XCTAssertTrue(content.userScripts[0].source.contains("enabled:false"))
+    manager.setEnabled(true)
+    XCTAssertEqual(content.userScripts.count, 2)
+    XCTAssertTrue(content.userScripts[0].source.contains("enabled:true"))
+  }
+}
+
 private final class StubRecordingDevice: RecordingDevice {
   let url: URL
   var prepares = true

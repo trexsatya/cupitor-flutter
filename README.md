@@ -32,6 +32,10 @@ style fidelity are not reproduced. Internal bookmark links work within a
 chapter. Encrypted/password-protected documents and legacy `.doc` files are
 not supported.
 
+In the reader's **Playlists** screen, use the trash button beside a playlist's
+name to delete it and its captured sentences after confirmation. Long-press
+a playlist to rename it or open its actions.
+
 Run the document reader tests with:
 
 ```sh
@@ -184,6 +188,10 @@ uploading to Play, this number must exceed the app's last uploaded version code;
 increase the base build number in `pubspec.yaml` if needed.
 
 ## Getting Started
+
+Android and macOS embed Brave's native ad-blocking engine. See
+[the integration and build notes](docs/brave-adblock.md) for supported behavior,
+offline filters, updates, native build prerequisites and tests.
 
 This project is a starting point for a Flutter application.
 

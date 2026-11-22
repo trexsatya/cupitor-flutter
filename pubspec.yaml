@@ -133,6 +133,8 @@ flutter:
 
   # To add assets to your application, add an assets section, like this:
   assets:
+    - assets/adblock/
+    - assets/js/brave_adblock.js
     - assets/js/utils.js
     - assets/js/sentence_tag.js
     - assets/js/page_export.js

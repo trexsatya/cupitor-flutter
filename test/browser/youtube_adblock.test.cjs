@@ -78,7 +78,10 @@ test('late host injection skips existing, nested and countdown-enabled ad button
       document.body.innerHTML = '<div class="html5-video-player ad-showing"><button class="ytp-ad-skip-button">Skip</button><button id="play">Play</button></div>';
       window.skipClicks = 0;
       window.playClicks = 0;
-      document.querySelector('.ytp-ad-skip-button').onclick = () => window.skipClicks++;
+      document.querySelector('.ytp-ad-skip-button').onclick = () => {
+        window.skipClicks++;
+        document.querySelector('.html5-video-player').classList.remove('ad-showing');
+      };
       document.querySelector('#play').onclick = () => window.playClicks++;
     });
     await page.evaluate(hostScript);
@@ -87,7 +90,11 @@ test('late host injection skips existing, nested and countdown-enabled ad button
       document.querySelector('.ytp-ad-skip-button').remove();
       const wrapper = document.createElement('div');
       wrapper.innerHTML = '<div class="ytp-ad-skip-button-container"><button disabled>Skip</button></div>';
-      wrapper.querySelector('button').onclick = () => window.skipClicks++;
+      wrapper.querySelector('button').onclick = () => {
+        window.skipClicks++;
+        document.querySelector('.html5-video-player').classList.remove('ad-showing');
+      };
+      document.querySelector('.html5-video-player').classList.add('ad-showing');
       document.querySelector('.html5-video-player').appendChild(wrapper);
     });
     assert.equal(await page.evaluate(() => window.skipClicks), 1, 'disabled countdown is not clicked');
@@ -98,7 +105,11 @@ test('late host injection skips existing, nested and countdown-enabled ad button
       document.querySelector('.ytp-ad-skip-button-container').remove();
       const wrapper = document.createElement('div');
       wrapper.innerHTML = '<div><button class="ytp-skip-ad-button">Skip</button></div>';
-      wrapper.querySelector('button').onclick = () => window.skipClicks++;
+      wrapper.querySelector('button').onclick = () => {
+        window.skipClicks++;
+        document.querySelector('.html5-video-player').classList.remove('ad-showing');
+      };
+      document.querySelector('.html5-video-player').classList.add('ad-showing');
       document.querySelector('.html5-video-player').appendChild(wrapper);
     });
     await page.waitForFunction(() => window.skipClicks === 3);

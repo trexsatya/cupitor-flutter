@@ -4,6 +4,7 @@ const path = require('node:path');
 const {test, before, after} = require('node:test');
 const {chromium} = require('playwright-core');
 const script = fs.readFileSync(path.join(__dirname, '../../assets/js/frame_boot.js'), 'utf8');
+const controls = fs.readFileSync(path.join(__dirname, '../../assets/js/youtube_controls.js'), 'utf8');
 let browser;
 before(async () => { browser = await chromium.launch({
   executablePath: process.env.CUPITOR_CHROME_PATH, headless: true, args: ['--no-sandbox'],
@@ -13,7 +14,7 @@ after(async () => { await browser?.close(); });
 async function fixture(run, host = 'www.youtube.com') {
   const context = await browser.newContext();
   try {
-    await context.addInitScript({content: script});
+    await context.addInitScript({content: script + '\n' + controls});
     const page = await context.newPage();
     await page.route('**/*', route => route.fulfill({contentType: 'text/html', body:
       new URL(route.request().url()).pathname.startsWith('/embed/') ? `<!doctype html>
@@ -22,7 +23,7 @@ async function fixture(run, host = 'www.youtube.com') {
           window.skipClicks = 0;
         </script>
         <div class="html5-video-player ad-showing">
-          <video></video><button class="ytp-skip-ad-button" disabled>Skip ad</button>
+          <video></video><div class="ytp-chrome-bottom"><button class="ytp-skip-ad-button" disabled>Skip ad</button></div>
         </div>` : `<!doctype html><iframe id="player" src="https://${host}/embed/content"></iframe>`
     }));
     await page.goto('https://study.example/language.html');
@@ -94,5 +95,32 @@ test('replacing the player updates the ad state without reinjecting the script',
     await page.waitForFunction(() => !window.CupitorYouTubeAds.isPlaying(document.querySelector('iframe')));
     await frame.evaluate(() => { document.querySelector('.html5-video-player').classList.add('ad-showing'); });
     await page.waitForFunction(() => window.CupitorYouTubeAds.isPlaying(document.querySelector('iframe')));
+  });
+});
+
+test('an ignored click is retried without a button replacement or DOM mutation', async () => {
+  await fixture(async (page, frame) => {
+    await frame.evaluate(() => {
+      const button = document.querySelector('button');
+      button.onclick = () => {
+        if (++window.skipClicks >= 2) document.querySelector('.html5-video-player').classList.remove('ad-showing');
+      };
+      button.disabled = false;
+    });
+    await page.waitForFunction(() => !window.CupitorYouTubeAds.isPlaying(document.querySelector('iframe')));
+    assert.equal(await frame.evaluate(() => window.skipClicks), 2);
+  });
+});
+
+test('Cupitor control hiding cannot suppress auto-skip inside a cross-origin iframe', async () => {
+  await fixture(async (page, frame) => {
+    await page.evaluate(() => window.CupitorYouTubeControls?.setVisible(false));
+    await frame.evaluate(() => {
+      if (!window.__cupitorYouTubeControlsInstalled) document.documentElement.classList.add('cupitor-youtube-controls-hidden');
+      document.querySelector('button').parentElement.style.visibility = 'hidden';
+      document.querySelector('button').disabled = false;
+    });
+    await page.waitForFunction(() => !window.CupitorYouTubeAds.isPlaying(document.querySelector('iframe')));
+    assert.equal(await frame.evaluate(() => window.skipClicks), 1);
   });
 });

@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "engine_version": "0.13.6",
+  "version": 2026112201,
+  "sha256": "0d8a0d84a2ea5696f9600765c9a1bc3a020b77aa4cd1fce5de7e20b551f242b6",
+  "lists": [
+    {
+      "name": "easylist",
+      "url": "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/thirdparties/easylist/easylist.txt",
+      "permission": 1,
+      "sha256": "9d908c7b52fa8b8025d3ca49e7b1ae1b7cc69a01e2796e3860626fc8aa9601fb",
+      "commit": "a21816ca2ebafbc46cfe5191f2fccaeb5286fb2e",
+      "platforms": []
+    },
+    {
+      "name": "easyprivacy",
+      "url": "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/thirdparties/easylist/easyprivacy.txt",
+      "permission": 1,
+      "sha256": "8406fdef77319f410b24e7195cc5de47e07c63e971e20fbee75039ef9b003ccb",
+      "commit": "a21816ca2ebafbc46cfe5191f2fccaeb5286fb2e",
+      "platforms": []
+    },
+    {
+      "name": "ublock-filters",
+      "url": "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt",
+      "permission": 1,
+      "sha256": "2558cc4252a019ecf930973fd856bec08d8a515199a8e1f8c849e4fc4e95f4e3",
+      "commit": "a21816ca2ebafbc46cfe5191f2fccaeb5286fb2e",
+      "platforms": []
+    },
+    {
+      "name": "ublock-unbreak",
+      "url": "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt",
+      "permission": 1,
+      "sha256": "9bc8651f25592d9f978a536ec09fef85f09de4c352b09f4ca7d7b504d80a6936",
+      "commit": "a21816ca2ebafbc46cfe5191f2fccaeb5286fb2e",
+      "platforms": []
+    },
+    {
+      "name": "ublock-quick-fixes",
+      "url": "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/quick-fixes.txt",
+      "permission": 1,
+      "sha256": "da973d405e6f68d870d370167adf74d603a7e21bbfb0863943f2914e25ad28fb",
+      "commit": "a21816ca2ebafbc46cfe5191f2fccaeb5286fb2e",
+      "platforms": []
+    },
+    {
+      "name": "ublock-privacy",
+      "url": "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt",
+      "permission": 1,
+      "sha256": "f8bada527f45b67fa6d08400992083c40617c0b8c2953a4c5b66d3ad19140024",
+      "commit": "a21816ca2ebafbc46cfe5191f2fccaeb5286fb2e",
+      "platforms": []
+    },
+    {
+      "name": "ublock-badware",
+      "url": "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt",
+      "permission": 1,
+      "sha256": "cf895e130f087c088db8d76404d6adf29d6697322b4ac866b67137543991477b",
+      "commit": "a21816ca2ebafbc46cfe5191f2fccaeb5286fb2e",
+      "platforms": []
+    },
+    {
+      "name": "ublock-resource-abuse",
+      "url": "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/resource-abuse.txt",
+      "permission": 1,
+      "sha256": "1eb1cad657f4dea835f2ccbfaefeaf780b3b3bd218c271e12435fed3fe1a7d64",
+      "commit": "a21816ca2ebafbc46cfe5191f2fccaeb5286fb2e",
+      "platforms": []
+    },
+    {
+      "name": "brave-unbreak",
+      "url": "https://raw.githubusercontent.com/brave/adblock-lists/master/brave-unbreak.txt",
+      "permission": 1,
+      "sha256": "b765ef9c8948c7df0bd3c3ad63de18d7c4e2dcd677416c246fbc96d6b6266264",
+      "commit": "ee162640cf8c99386c872385a3bac18c1f996128",
+      "platforms": []
+    },
+    {
+      "name": "brave-lists-brave-specific",
+      "url": "https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-specific.txt",
+      "permission": 1,
+      "sha256": "23319535d351cfa85493cbd9a14b92864f12b593dc41bebfc092f072f169d661",
+      "commit": "ee162640cf8c99386c872385a3bac18c1f996128",
+      "platforms": []
+    },
+    {
+      "name": "brave-lists-brave-unbreak",
+      "url": "https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-unbreak.txt",
+      "permission": 1,
+      "sha256": "63a1fdc6aeebbb93b8c15602b6180c85f9aadfddfab200b7c8f4e0cc8ee76159",
+      "commit": "ee162640cf8c99386c872385a3bac18c1f996128",
+      "platforms": []
+    },
+    {
+      "name": "brave-lists-brave-android-specific",
+      "url": "https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-android-specific.txt",
+      "permission": 1,
+      "sha256": "2a12131a2b4b1f575e2336eef9f7273cff3312381c195cc6caaedc80d4668641",
+      "commit": "ee162640cf8c99386c872385a3bac18c1f996128",
+      "platforms": [
+        "android"
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "url": "https://raw.githubusercontent.com/brave/adblock-rust/master/data/brave/brave-resources.json",
+      "commit": "1108c61472dd5a29ae56388ee936048c4fe5a69f",
+      "sha256": "3c4f944e8a312f8fac8966532700658161e08245c6aa2eaa55f346cb94c595ce"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/brave/adblock-resources/master/dist/resources.json",
+      "commit": "b84ad0fd6663a88c1402bc06a4abd5ab8be8fb3c",
+      "sha256": "9e3aec41b6930add3fc217e772335200122bcd0e8476f48c3c9cab449956104a"
+    }
+  ]
+}
