@@ -3,7 +3,16 @@
 The Android host injects a small script into dialog1 and its YouTube embed
 frames **before the first navigation**. The language webapp can then hide or
 restore YouTube's overlays without recreating the `YT.Player`, changing the
-video, seeking, or interrupting playback:
+video, seeking, or interrupting playback.
+
+The same registration now includes the frame agent's ad protection. It is
+installed on the exact study controller before each navigation, including
+background-created WebViews that the general view-tree scanner cannot see.
+The newest versioned bundled/cached agent is selected, so an app update is not
+overridden by an older cached script. The Skip fallback retries an ignored
+click at most once a second and keeps working while study controls are hidden.
+
+For example:
 
 ```js
 // Check support: absent in regular browsers, other dialogs, and WebViews

@@ -41,6 +41,7 @@
 
   if (window.__cupFrameBoot) return;
   window.__cupFrameBoot = 1;
+  window.__cupFrameBootVersion = 2026112201;
 
   // ---- YouTube ad pruning -------------------------------------------------
   //
@@ -100,7 +101,7 @@
     }
     if (!youtubeOrigin(location.href)) return;
     window._ytAdFallbackInstalled = 1;
-    var lastState, lastSkipButton = null;
+    var lastState, lastSkipButton = null, lastSkipAt = -Infinity;
     function update() {
       var player = document.querySelector('.html5-video-player');
       var playing = !!(player && (player.classList.contains('ad-showing') ||
@@ -108,6 +109,7 @@
       if (playing !== lastState) {
         lastState = playing;
         lastSkipButton = null;
+        lastSkipAt = -Infinity;
         if (window.parent !== window) {
           window.parent.postMessage({type: messageType, playing: playing}, '*');
         }
@@ -120,24 +122,38 @@
         '.ytp-ad-skip-button-modern, .ytp-ad-skip-button-slot button, ' +
         '.ytp-ad-skip-button-container button, .ytp-ad-overlay-close-button');
       var eligible = null;
+      var root = document.documentElement;
+      var cupitorHidesControls = !!(root && root.classList.contains('cupitor-youtube-controls-hidden'));
       for (var i = 0; i < buttons.length; i++) {
         var button = buttons[i];
         var style = getComputedStyle(button);
         if (!button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
-            button.getClientRects().length && style.visibility !== 'hidden') {
+            button.getAttribute('aria-hidden') !== 'true' && !button.hidden &&
+            button.getClientRects().length && (style.visibility !== 'hidden' || cupitorHidesControls)) {
           eligible = button;
           break;
         }
       }
-      if (eligible !== lastSkipButton) {
+      // Cupitor can hide the native controls around an otherwise enabled
+      // Skip button. Its visibility must not disable automatic skipping.
+      // YouTube can also ignore a click while its player is still settling;
+      // retry the same button, with a rate limit, while the ad remains active.
+      if (eligible && (eligible !== lastSkipButton || Date.now() - lastSkipAt >= 1000)) {
         lastSkipButton = eligible;
-        if (eligible) eligible.click();
+        lastSkipAt = Date.now();
+        eligible.click();
+      } else if (!eligible) {
+        lastSkipButton = null;
+        lastSkipAt = -Infinity;
       }
     }
     new MutationObserver(update).observe(document, {
       childList: true, subtree: true, attributes: true,
       attributeFilter: ['class', 'style', 'disabled', 'aria-disabled', 'hidden'],
     });
+    // Countdown/CSSOM/player state changes do not always mutate the DOM.
+    // Poll only inside YouTube documents; no video or seek commands are used.
+    setInterval(update, 500);
     update();
   }
 
