@@ -947,6 +947,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
         // on their way to the language webapp as manual playlist item(s).
         // Contract: docs/superpowers/specs/2026-09-06-caption-capture-design.md
         ..addJavaScriptChannel('CaptionCollector', onMessageReceived: (msg) => _handleCaptionCollector(c, msg))
+        ..addJavaScriptChannel('MediaSubtitles',
+            onMessageReceived: (msg) => _downloadMediaSubtitlesForPage(c, msg))
         ..addJavaScriptChannel('YouTubeSubtitles',
             onMessageReceived: (msg) => _downloadYouTubeSubtitlesForPage(c, msg))
         ..addJavaScriptChannel('LocalSubtitles',
@@ -6897,6 +6899,95 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     return parseTranslateResponse(jsonDecode(resp.body));
   }
 
+  Future<void> _downloadMediaSubtitlesForPage(
+      WebViewController page, JavaScriptMessage message) async {
+    if (!mounted || !identical(page, _controller)) return;
+    String? requestId;
+    try {
+      final request = jsonDecode(message.message);
+      if (request is! Map) return;
+      if (request['op'] == 'save') {
+        final srt = request['srt'];
+        if (srt is String) await _saveSidebarSubtitles(page, srt);
+        return;
+      }
+      if (request['op'] != 'download' || request['requestId'] is! String) return;
+      requestId = request['requestId'] as String;
+      if (!RegExp(r'^[a-z0-9-]{1,80}$').hasMatch(requestId)) return;
+      if (_youtubeSidebarDownloadBusy) return;
+      _youtubeSidebarDownloadBusy = true;
+      try {
+        final url = await page.currentUrl() ?? '';
+        final uri = Uri.tryParse(url);
+        if (!mounted || !identical(page, _controller) || uri == null ||
+            !const ['http', 'https'].contains(uri.scheme) ||
+            uri.host.isEmpty || uri.userInfo.isNotEmpty) return;
+        // A page can call a WebView channel itself. Keep the target in the
+        // controller and require a native user action before running yt-dlp.
+        final proceed = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Download subtitles?'),
+            content: Text('Look for subtitle tracks on ${uri.host}?'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Find subtitles')),
+            ],
+          ),
+        );
+        if (proceed != true || !mounted || !identical(page, _controller) ||
+            await page.currentUrl() != url) return;
+        if (!mounted || !identical(page, _controller)) return;
+        await _startSubtitleDownload(context,
+            sidebarTarget: page, videoUrl: url, pageSubtitleRequest: requestId);
+      } finally {
+        _youtubeSidebarDownloadBusy = false;
+      }
+    } catch (error) {
+      if (mounted && identical(page, _controller)) {
+        _showCaptureError('Subtitle action failed', '$error');
+      }
+    } finally {
+      if (requestId != null && mounted && identical(page, _controller)) {
+        try {
+          await page.runJavaScriptReturningResult(localSubtitleResultJs({
+            'requestId': requestId, 'cancelled': true,
+          }));
+        } catch (_) {}
+      }
+    }
+  }
+
+  bool _sidebarSubtitleSaveBusy = false;
+
+  Future<void> _saveSidebarSubtitles(WebViewController page, String srt) async {
+    if (_sidebarSubtitleSaveBusy || srt.isEmpty ||
+        srt.length > maxLocalSubtitleBytes) return;
+    _sidebarSubtitleSaveBusy = true;
+    try {
+      final bytes = utf8.encode(srt);
+      if (bytes.length > maxLocalSubtitleBytes) {
+        throw const FormatException('The subtitle file is larger than 10 MB.');
+      }
+      final rawTitle = await page.getTitle() ?? '';
+      final title = rawTitle.replaceAll(RegExp(r'[^\p{L}\p{N} ._-]', unicode: true), '_').trim();
+      final name = String.fromCharCodes(title.runes.take(80)).replaceAll(RegExp(r'^[. ]+|[. ]+$'), '');
+      if (!mounted || !identical(page, _controller)) return;
+      final saved = await saveBytesToPickedFile(
+        dialogTitle: 'Save subtitles',
+        fileName: '${name.isEmpty ? 'captions' : name}.srt',
+        bytes: bytes,
+      );
+      if (saved != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Subtitles saved')),
+        );
+      }
+    } finally {
+      _sidebarSubtitleSaveBusy = false;
+    }
+  }
+
   // ---------- YouTube subtitle download ----------
 
   /// Pulls a YouTube video id out of any of the URL forms we support
@@ -6979,7 +7070,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
           !identical(page, _controller) || _youtubeSidebarDownloadBusy) return;
       _youtubeSidebarDownloadBusy = true;
       try {
-        await _startYouTubeSubtitleDownload(context, sidebarTarget: page);
+        await _startSubtitleDownload(context, sidebarTarget: page);
       } finally {
         _youtubeSidebarDownloadBusy = false;
       }
@@ -6994,13 +7085,11 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// `yt-dlp` subprocess (macOS). yt-dlp handles the PO-token wall on its
   /// side, so we don't see the 0-byte responses we got from every in-app
   /// HTTP/WebView attempt.
-  Future<Map<String, dynamic>> _fetchYouTubeCaptionTracks(String videoId) async {
+  Future<Map<String, dynamic>> _fetchCaptionTracks(String videoUrl) async {
     if (!await YtDlpService.isAvailable()) {
       throw YtDlpService.installHint();
     }
-    final result = await YtDlpService.listTracks(
-      'https://www.youtube.com/watch?v=$videoId',
-    );
+    final result = await YtDlpService.listTracks(videoUrl);
     return {
       'title': result.title,
       'tracks': result.tracks.map((t) => t.toMap()).toList(),
@@ -7008,16 +7097,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   }
 
   /// Downloads the chosen caption track via yt-dlp and parses it.
-  /// `baseUrl` is unused (only kept for signature compatibility with the
-  /// old WebView path); yt-dlp constructs whatever URL it needs internally.
-  Future<List<Map<String, dynamic>>> _fetchCaptionsJson3({
-    required String baseUrl,
-    required String videoId,
+  Future<List<Map<String, dynamic>>> _fetchSubtitleCues({
+    required String videoUrl,
     required String languageCode,
     required String kind,
   }) async {
     final sub = await YtDlpService.downloadSubtitle(
-      videoUrl: 'https://www.youtube.com/watch?v=$videoId',
+      videoUrl: videoUrl,
       languageCode: languageCode,
       kind: kind,
     );
@@ -7028,7 +7114,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     final List<Map<String, dynamic>> lines = switch (sub.format) {
       'json3' => await compute(_parseYtJson3Captions, sub.body),
       'vtt'   => await compute(_parseVttCaptions, sub.body),
-      _       => await compute(_parseYtJson3Captions, sub.body),
+      'srt'   => await compute(parseLocalSrt, sub.body),
+      _       => throw 'Unsupported subtitle format: ${sub.format}',
     };
     if (lines.isEmpty) {
       throw 'yt-dlp returned ${sub.body.length}B (${sub.format}) but parsed 0 lines';
@@ -7072,12 +7159,13 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     Navigator.of(ctx, rootNavigator: true).pop();
   }
 
-  /// Shared entry point for dialog1's CC button and the YouTube page sidebar.
-  /// The sidebar supplies its controller and uses that video's URL directly;
-  /// the standalone flow prompts for a URL and keeps its full-file dialog.
-  Future<void> _startYouTubeSubtitleDownload(BuildContext ctx, {
+  /// Shared entry point for caption selection and download.
+  /// Sidebar requests attach cues to their active page. The standalone
+  /// YouTube flow keeps its existing full-file dialog.
+  Future<void> _startSubtitleDownload(BuildContext ctx, {
     WebViewController? sidebarTarget,
     String? videoUrl,
+    String? pageSubtitleRequest,
   }) async {
     // Pre-fill from clipboard if it looks like a YouTube URL — common case
     // is the user just copied the link from the YouTube share sheet.
@@ -7115,17 +7203,18 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     urlCtrl.dispose();
     if (urlInput == null || urlInput.isEmpty) return;
     final videoId = _extractYouTubeVideoId(urlInput);
-    if (videoId == null) {
+    if (videoId == null && pageSubtitleRequest == null) {
       _showCaptureError('Not a YouTube URL',
           'Couldn\'t recognize a YouTube video id in:\n\n$urlInput');
       return;
     }
     if (!mounted) return;
 
+    final downloadUrl = videoId == null ? urlInput : 'https://www.youtube.com/watch?v=$videoId';
     _showBusyOverlay(ctx, 'Loading caption list…');
     Map<String, dynamic> meta;
     try {
-      meta = await _fetchYouTubeCaptionTracks(videoId);
+      meta = await _fetchCaptionTracks(downloadUrl);
     } catch (e) {
       _dismissBusyOverlay(ctx);
       _showCaptureError('Could not load captions', '$e');
@@ -7149,12 +7238,8 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     _showBusyOverlay(ctx, 'Downloading captions…');
     List<Map<String, dynamic>> lines;
     try {
-      lines = await _fetchCaptionsJson3(
-        // `baseUrl` is only set on the legacy macOS WebView path; the Android
-        // yt-dlp path never populates it (and `_fetchCaptionsJson3` doesn't
-        // read it). Default to empty so a missing field doesn't crash.
-        baseUrl: (picked['baseUrl'] as String?) ?? '',
-        videoId: videoId,
+      lines = await _fetchSubtitleCues(
+        videoUrl: downloadUrl,
         languageCode: (picked['languageCode'] as String?) ?? '',
         kind: (picked['kind'] as String?) ?? '',
       );
@@ -7176,23 +7261,28 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       if (!identical(sidebarTarget, _controller)) return;
       final currentUrl = await sidebarTarget.currentUrl() ?? '';
       if (!mounted || !identical(sidebarTarget, _controller)) return;
-      if (youtubeSubtitleVideoId(currentUrl) != videoId) {
+      final sameVideo = pageSubtitleRequest == null
+          ? youtubeSubtitleVideoId(currentUrl) == videoId
+          : currentUrl == urlInput;
+      if (!sameVideo) {
         _showCaptureError('Could not attach subtitles',
             'The video changed while downloading. Download subtitles again for the current video.');
         return;
       }
-      final payload = youtubeSidebarSubtitlePayload(
-        videoId: videoId,
-        language: baseLanguageCode((picked['languageCode'] as String?) ?? _selectedLanguage),
-        lines: lines,
-      );
-      final accepted = await sidebarTarget.runJavaScriptReturningResult(
-        youtubeSidebarSubtitleImportJs(payload),
-      );
+      final language = baseLanguageCode(
+          (picked['languageCode'] as String?) ?? _selectedLanguage);
+      final importJs = pageSubtitleRequest != null
+          ? localSubtitleResultJs({
+              'requestId': pageSubtitleRequest, 'lang': language, 'lines': lines,
+            })
+          : youtubeSidebarSubtitleImportJs(youtubeSidebarSubtitlePayload(
+              videoId: videoId!, language: language, lines: lines,
+            ));
+      final accepted = await sidebarTarget.runJavaScriptReturningResult(importJs);
       if (accepted.toString() != 'true') {
         _showCaptureError('Could not attach subtitles',
             'The video changed while downloading, or its subtitle sidebar is out of date. '
-            'Reload the YouTube page and try again.');
+            'Reload the video page and try again.');
       }
       return;
     }
@@ -7203,7 +7293,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
       sourceLang: baseLanguageCode(
           (picked['languageCode'] as String?) ?? _selectedLanguage),
       videoUrl: 'https://www.youtube.com/watch?v=$videoId',
-      videoId: videoId,
+      videoId: videoId!,
       videoTitle: (meta['title'] as String?) ?? '',
     );
   }
@@ -8266,11 +8356,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 toolMissing: () async => await YtDlpService.isAvailable()
                     ? null
                     : YtDlpService.installHint(),
-                listTracks: _fetchYouTubeCaptionTracks,
+                listTracks: (videoId) => _fetchCaptionTracks('https://www.youtube.com/watch?v=$videoId'),
                 pickIndex: _defaultCaptionTrackIndex,
-                download: (videoId, track) => _fetchCaptionsJson3(
-                  baseUrl: (track['baseUrl'] as String?) ?? '',
-                  videoId: videoId,
+                download: (videoId, track) => _fetchSubtitleCues(
+                  videoUrl: 'https://www.youtube.com/watch?v=$videoId',
                   languageCode: (track['languageCode'] as String?) ?? '',
                   kind: (track['kind'] as String?) ?? '',
                 ),
@@ -8974,7 +9063,7 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
                 IconButton(
                   tooltip: 'Download YouTube subtitles',
                   icon: const Icon(Icons.closed_caption_outlined, size: 20),
-                  onPressed: () => _startYouTubeSubtitleDownload(ctx),
+                  onPressed: () => _startSubtitleDownload(ctx),
                 ),
                 IconButton(
                   tooltip: 'Ask AI about this word',
@@ -12234,8 +12323,8 @@ String _decodeXmlEntities(String s) {
 List<Map<String, dynamic>> _parseVttCaptions(String body) {
   if (body.isEmpty) return const [];
   final tsRe = RegExp(
-    r'(\d{1,2}):(\d{2}):(\d{2})[\.,](\d{1,3})\s+-->\s+'
-    r'(\d{1,2}):(\d{2}):(\d{2})[\.,](\d{1,3})',
+    r'^\s*(?:(\d+):)?(\d{2}):(\d{2})[\.,](\d{1,3})\s+-->\s+'
+    r'(?:(\d+):)?(\d{2}):(\d{2})[\.,](\d{1,3})(?:\s|$)',
   );
   final tagRe = RegExp(r'<[^>]*>');
   final lines = body.split(RegExp(r'\r?\n'));
@@ -12247,11 +12336,11 @@ List<Map<String, dynamic>> _parseVttCaptions(String body) {
     double parseTs(int h, int mm, int s, int ms) =>
         h * 3600 + mm * 60 + s + ms / 1000.0;
     final start = parseTs(
-      int.parse(m.group(1)!), int.parse(m.group(2)!),
+      int.parse(m.group(1) ?? '0'), int.parse(m.group(2)!),
       int.parse(m.group(3)!), int.parse(m.group(4)!.padRight(3, '0')),
     );
     final end = parseTs(
-      int.parse(m.group(5)!), int.parse(m.group(6)!),
+      int.parse(m.group(5) ?? '0'), int.parse(m.group(6)!),
       int.parse(m.group(7)!), int.parse(m.group(8)!.padRight(3, '0')),
     );
     i++;
@@ -12268,7 +12357,8 @@ List<Map<String, dynamic>> _parseVttCaptions(String body) {
     if (text.isEmpty) continue;
     // De-dupe consecutive identical lines — YouTube's ASR VTT often repeats
     // each cue at finer granularity (rolling karaoke style).
-    if (out.isNotEmpty && (out.last['text'] as String) == text) {
+    if (out.isNotEmpty && out.last['text'] == text &&
+        start <= (out.last['end'] as num)) {
       out.last['end'] = end;
       continue;
     }

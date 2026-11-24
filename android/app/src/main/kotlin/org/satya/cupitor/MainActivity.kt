@@ -1301,6 +1301,8 @@ class MainActivity : FlutterActivity() {
                     try {
                         val req = YoutubeDLRequest(url).apply {
                             addOption("--skip-download")
+                            addOption("--no-playlist")
+                            addOption("--playlist-items", "1")
                             addOption("--write-info-json")
                             addOption("-o", "${outDir.absolutePath}/info")
                         }
@@ -1357,15 +1359,18 @@ class MainActivity : FlutterActivity() {
                     try {
                         val req = YoutubeDLRequest(url).apply {
                             addOption("--skip-download")
+                            addOption("--no-playlist")
+                            addOption("--playlist-items", "1")
                             if (kind == "asr") addOption("--write-auto-subs")
                             else addOption("--write-subs")
-                            addOption("--sub-langs", lang)
+                            addOption("--sub-langs", "^" + lang.replace(Regex("""[\.^$|?*+()\[\]{}]""")) { "\\" + it.value } + "$")
                             // yt-dlp picks the first available from this slash-list.
-                            addOption("--sub-format", "json3/vtt/best")
+                            addOption("--sub-format", "json3/vtt/srt")
                             addOption("-o", "${outDir.absolutePath}/sub")
                         }
                         YoutubeDL.execute(req)
-                        val files = outDir.listFiles { f -> f.name.startsWith("sub") }
+                        val files = outDir.listFiles { f -> f.name.startsWith("sub") &&
+                            f.extension in setOf("json3", "vtt", "srt") }
                             ?: emptyArray()
                         if (files.isEmpty()) {
                             throw RuntimeException("yt-dlp wrote no subtitle file " +
@@ -1380,7 +1385,7 @@ class MainActivity : FlutterActivity() {
                         val format = when {
                             file.name.endsWith(".json3") -> "json3"
                             file.name.endsWith(".vtt") -> "vtt"
-                            else -> "unknown"
+                            else -> "srt"
                         }
                         mapOf("body" to file.readText(), "format" to format)
                     } finally {
