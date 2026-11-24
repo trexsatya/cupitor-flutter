@@ -1,4 +1,4 @@
-// Platform-dispatching wrapper around yt-dlp for fetching YouTube caption
+// Platform-dispatching wrapper around yt-dlp for fetching video caption
 // tracks. Two execution paths:
 //
 //   * **Android**: youtubedl-android (yausername) bundles a Python interpreter
@@ -92,9 +92,7 @@ class YtDlpService {
     return 'yt-dlp not supported on this platform.';
   }
 
-  /// Lists available caption tracks for `videoUrl`. Pass a full
-  /// `https://www.youtube.com/watch?v=…` URL — yt-dlp accepts the same forms
-  /// the CLI does, so shorts/youtu.be/etc. work too.
+  /// Lists available caption tracks for a video page supported by yt-dlp.
   static Future<YtDlpListResult> listTracks(String videoUrl) async {
     await _ensureInit();
     final Map<String, dynamic> raw;
@@ -186,7 +184,8 @@ class YtDlpService {
   static Future<Map<String, dynamic>> _macListTracks(String url) async {
     final r = await Process.run(
       _macYtDlpPath!,
-      ['-j', '--skip-download', '--no-warnings', url],
+      ['-j', '--skip-download', '--no-warnings', '--no-playlist',
+        '--playlist-items', '1', '--', url],
     ).timeout(const Duration(seconds: 90));
     if (r.exitCode != 0) {
       throw 'yt-dlp exit ${r.exitCode}: ${r.stderr.toString().trim()}';
@@ -220,11 +219,13 @@ class YtDlpService {
       final args = <String>[
         '--skip-download',
         '--no-warnings',
+        '--no-playlist',
+        '--playlist-items', '1',
         if (kind == 'asr') '--write-auto-subs' else '--write-subs',
-        '--sub-langs', lang,
-        '--sub-format', 'json3/vtt/best',
+        '--sub-langs', '^' + RegExp.escape(lang) + r'$',
+        '--sub-format', 'json3/vtt/srt',
         '-o', '${tmp.path}/sub.%(ext)s',
-        url,
+        '--', url,
       ];
       final r = await Process.run(_macYtDlpPath!, args)
           .timeout(const Duration(minutes: 3));
@@ -253,7 +254,7 @@ class YtDlpService {
       final body = await file.readAsString();
       final format = file.path.endsWith('.json3')
           ? 'json3'
-          : (file.path.endsWith('.vtt') ? 'vtt' : 'unknown');
+          : (file.path.endsWith('.vtt') ? 'vtt' : 'srt');
       return YtDlpSubtitle(body: body, format: format);
     } finally {
       try {
