@@ -57,3 +57,8 @@ flutter test test/youtube_sidebar_subtitles_test.dart test/stable_dialog_chrome_
 
 The remote sidebar has separate integration coverage in
 `db/js/youtube-download.test.mjs`, plus the existing caption and link tests.
+
+
+On Android, the first subtitle request checks for a stable yt-dlp update.
+Successful checks are cached for seven days. If the update is unavailable,
+Cupitor uses the installed version and allows another check on a later request.

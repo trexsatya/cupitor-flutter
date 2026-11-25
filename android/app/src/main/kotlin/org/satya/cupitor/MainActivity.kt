@@ -1288,6 +1288,34 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    // Serialize the refresh and execution so the updater cannot replace
+    // the executable while another subtitle request is using it.
+    private val ytdlpExecutionLock = Any()
+    private var ytdlpRetryAfter = 0L
+
+    private fun executeSubtitleRequest(request: YoutubeDLRequest) {
+        synchronized(ytdlpExecutionLock) {
+            ensureYtdlpInit()
+            val prefs = getSharedPreferences("cupitor-ytdlp", MODE_PRIVATE)
+            val now = System.currentTimeMillis()
+            val lastCheck = prefs.getLong("last-stable-check", 0)
+            val retryNow = android.os.SystemClock.elapsedRealtime()
+            if ((now - lastCheck !in 0L until 7 * 24 * 60 * 60 * 1000L) &&
+                retryNow >= ytdlpRetryAfter) {
+                try {
+                    val status = YoutubeDL.updateYoutubeDL(application, YoutubeDL.UpdateChannel.STABLE)
+                    prefs.edit().putLong("last-stable-check", now).apply()
+                    android.util.Log.i("Cupitor/ytdlp", "Stable update: $status")
+                } catch (error: Exception) {
+                    // Offline requests can still use the installed extractor.
+                    ytdlpRetryAfter = android.os.SystemClock.elapsedRealtime() + 60_000L
+                    android.util.Log.w("Cupitor/ytdlp", "Could not refresh yt-dlp", error)
+                }
+            }
+            YoutubeDL.execute(request)
+        }
+    }
+
     /// Returns `{title, tracks: [{languageCode, name, kind}]}`. ASR tracks
     /// are tagged with `kind: "asr"`. We can't read subtitles off VideoInfo
     /// directly (the field is commented out in the upstream mapper), so we
@@ -1296,7 +1324,6 @@ class MainActivity : FlutterActivity() {
         ytdlpScope.launch {
             try {
                 val infoJson = withContext(Dispatchers.IO) {
-                    ensureYtdlpInit()
                     val outDir = File(cacheDir, "ytinfo-${System.currentTimeMillis()}").apply { mkdirs() }
                     try {
                         val req = YoutubeDLRequest(url).apply {
@@ -1306,7 +1333,7 @@ class MainActivity : FlutterActivity() {
                             addOption("--write-info-json")
                             addOption("-o", "${outDir.absolutePath}/info")
                         }
-                        YoutubeDL.execute(req)
+                        executeSubtitleRequest(req)
                         val jsonFile = outDir.listFiles { f -> f.name.endsWith(".info.json") }?.firstOrNull()
                             ?: throw RuntimeException("yt-dlp wrote no info.json")
                         jsonFile.readText()
@@ -1354,7 +1381,6 @@ class MainActivity : FlutterActivity() {
         ytdlpScope.launch {
             try {
                 val payload = withContext(Dispatchers.IO) {
-                    ensureYtdlpInit()
                     val outDir = File(cacheDir, "ytsub-${System.currentTimeMillis()}").apply { mkdirs() }
                     try {
                         val req = YoutubeDLRequest(url).apply {
@@ -1368,7 +1394,7 @@ class MainActivity : FlutterActivity() {
                             addOption("--sub-format", "json3/vtt/srt")
                             addOption("-o", "${outDir.absolutePath}/sub")
                         }
-                        YoutubeDL.execute(req)
+                        executeSubtitleRequest(req)
                         val files = outDir.listFiles { f -> f.name.startsWith("sub") &&
                             f.extension in setOf("json3", "vtt", "srt") }
                             ?: emptyArray()
