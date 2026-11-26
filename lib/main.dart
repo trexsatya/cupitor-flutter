@@ -1287,6 +1287,26 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
   /// clears it.
   Future<void> _setGithubToken(String? token) async {
     final t = (token ?? '').trim();
+    final changed = (_githubToken ?? '') != t;
+    // The retained study page must lose its old identity before the proxy
+    // starts using another credential. Repeating the reset before reload
+    // also discards any late response from the old sign-in check.
+    Future<void> resetStudy({bool reload = false}) async {
+      final study = dialogController;
+      if (!changed || study == null) return;
+      try {
+        await study.runJavaScript('''
+          document.documentElement.style.visibility = 'hidden';
+          localStorage.setItem('cupitor:account', JSON.stringify({login:null, repo:null, branch:null}));
+          window.dispatchEvent(new CustomEvent('cupitor:account-changed'));
+          ${reload ? 'location.reload();' : ''}
+        ''');
+      } catch (_) {
+        // A failed reset must not leave the previous account's page visible.
+        await study.loadRequest(Uri.parse('about:blank'));
+      }
+    }
+    await resetStudy();
     if (mounted) setState(() => _githubToken = t.isEmpty ? null : t);
     final prefs = await SharedPreferences.getInstance();
     if (t.isEmpty) {
@@ -1294,6 +1314,10 @@ class WebViewExampleState extends State<WebViewExample> with WidgetsBindingObser
     } else {
       await prefs.setString('githubToken', t);
     }
+    // Only the account selection is reset; every account's cached data is
+    // retained. GET /user confirms the new identity at boot. An unavailable
+    // identity (including offline sign-out) leaves the page a guest.
+    await resetStudy(reload: true);
   }
 
   /// Device-flow sign-in from the Tools sheet. The paste-token dialog stays
